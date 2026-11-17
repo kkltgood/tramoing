@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tm-core",
+    "crates/tm-sampler",
+    "crates/tm-macos",
+    "crates/tm-store",
+    "crates/tm-windows",
+    "crates/tm-spike-mac",
+    "crates/tray-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["guolongkang"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

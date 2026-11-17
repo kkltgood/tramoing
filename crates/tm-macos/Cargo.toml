@@ -1,0 +1,54 @@
+[package]
+name = "tm-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tm-core = { path = "../tm-core" }
+tm-sampler = { path = "../tm-sampler" }
+
+# 图标要走 AppKit 的 NSWorkspace；这几个 crate 本来就在 eframe/winit 的依赖树里，
+# 这里只是把版本对齐，不会额外拉新包。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# openpty / termios：让 nettop 的 stdout 变成行缓冲（见 pty.rs）
+libc = "0.2"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSGeometry",
+    "NSAttributedString",
+    "NSRange",
+    # 离屏渲染按钮快照（排查状态栏排版用）
+    "NSData",
+    "NSDictionary",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSWorkspace",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSGraphicsContext",
+    "NSGraphics",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSScreen",
+    # 菜单栏文字要分段上色，得自己拼 NSAttributedString
+    "NSAttributedString",
+    # 两行标题：换行由 NSCell 的 wraps 控制，行高由段落样式控制
+    "NSCell",
+    "NSParagraphStyle",
+    "NSText",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSColor",
+    "NSAppearance",
+    "objc2-core-foundation",
+] }

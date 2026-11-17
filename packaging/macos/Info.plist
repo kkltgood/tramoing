@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>TrafficMonitor</string>
+    <key>CFBundleDisplayName</key>
+    <string>Traffic Monitor</string>
+    <key>CFBundleIdentifier</key>
+    <!-- 必须和 tray-app/src/autostart.rs 里的 LABEL 一致，
+         否则「登录项与扩展」里会出现两个同名条目 -->
+    <string>dev.guolongkang.trafficmonitor</string>
+    <key>CFBundleExecutable</key>
+    <string>traffic-monitor</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <!-- 菜单栏程序：不出现在 Dock，也不参与 Cmd+Tab。
+         不加这一条，macOS 还会在后台启动时弹「App 后台活动」提示。 -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>

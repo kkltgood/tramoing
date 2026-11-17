@@ -1,0 +1,10 @@
+[package]
+name = "tm-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tm-core = { path = "../tm-core" }
+# bundled：把 SQLite 源码一起编进来，用户机器上不需要预装任何东西
+rusqlite = { version = "0.43", features = ["bundled"] }

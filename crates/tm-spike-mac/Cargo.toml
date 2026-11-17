@@ -1,0 +1,14 @@
+[package]
+name = "tm-spike-mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tm-spike-mac"
+path = "src/main.rs"
+
+[dependencies]
+tm-core = { path = "../tm-core" }
+tm-sampler = { path = "../tm-sampler" }
+tm-macos = { path = "../tm-macos" }

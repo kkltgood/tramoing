@@ -1,0 +1,28 @@
+[package]
+name = "tm-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tm-helper"
+path = "src/bin/tm_helper.rs"
+
+[dependencies]
+tm-core = { path = "../tm-core" }
+tm-sampler = { path = "../tm-sampler" }
+
+[target.'cfg(windows)'.dependencies]
+# 用 windows-sys 而不是 windows：ETW 是一堆裸 C 结构体，
+# windows-sys 就是 1:1 的 FFI 声明，没有 Result 包装和智能指针，写起来更直观；
+# 而且它已经是 winit 的依赖，本地有缓存，不用再下一坨几百 MB 的 crate。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
