@@ -85,7 +85,12 @@ impl Frame {
 
         for p in &self.procs {
             let name = p.name.as_bytes();
-            let len = name.len().min(MAX_NAME);
+            // 截断必须落在字符边界上：进程路径里有中文时，按字节硬切会把一个
+            // UTF-8 字符切成两半，对端 `from_utf8` 直接失败 —— 整帧作废。
+            let mut len = name.len().min(MAX_NAME);
+            while len > 0 && !p.name.is_char_boundary(len) {
+                len -= 1;
+            }
             out.extend_from_slice(&p.pid.to_le_bytes());
             out.extend_from_slice(&p.rx.to_le_bytes());
             out.extend_from_slice(&p.tx.to_le_bytes());
@@ -272,5 +277,25 @@ mod tests {
         let bytes = f.encode();
         let back = Frame::decode(&bytes).unwrap();
         assert_eq!(back.procs[0].name.len(), MAX_NAME);
+    }
+
+    #[test]
+    fn overlong_chinese_name_truncates_on_char_boundary() {
+        // 中文路径每个字 3 字节：按 512 字节硬切正好切在一个字中间，
+        // 对端会因为「不是合法 UTF-8」把整帧丢掉。
+        let long = "微".repeat(MAX_NAME);
+        let f = Frame::new(
+            1,
+            vec![ProcEntry {
+                pid: 1,
+                rx: 0,
+                tx: 0,
+                name: long,
+            }],
+        );
+        let bytes = f.encode();
+        let back = Frame::decode(&bytes).expect("截断后的名字必须是合法 UTF-8");
+        assert!(back.procs[0].name.len() <= MAX_NAME);
+        assert!(!back.procs[0].name.is_empty());
     }
 }

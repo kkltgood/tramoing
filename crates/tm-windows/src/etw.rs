@@ -87,6 +87,8 @@ pub enum EtwError {
     OpenTrace,
     /// 需要管理员权限
     NeedAdmin,
+    /// 已经有别的助手在跑（同名 ETW 会话被占用，且管道是通的）
+    AlreadyRunning,
 }
 
 impl std::fmt::Display for EtwError {
@@ -99,6 +101,7 @@ impl std::fmt::Display for EtwError {
                 f,
                 "需要管理员权限：Windows 只允许提权进程读取「每进程流量」"
             ),
+            Self::AlreadyRunning => write!(f, "已有采集助手在运行（ETW 会话与管道都被占用）"),
         }
     }
 }
@@ -149,13 +152,43 @@ impl EtwSession {
 
         let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
         // SAFETY: 指针指向我们持有到会话结束的缓冲区
-        let rc = unsafe {
+        let mut rc = unsafe {
             windows_sys::Win32::System::Diagnostics::Etw::StartTraceW(
                 &mut handle,
                 logger_name.as_ptr(),
                 base as *mut EVENT_TRACE_PROPERTIES,
             )
         };
+
+        // 183 = ERROR_ALREADY_EXISTS：同名会话已经存在。两种可能，处理方式相反：
+        //   - 管道能连上 → 真有一个助手在跑，本进程没有存在的意义；
+        //   - 管道连不上 → 上一个助手被强杀留下的僵尸会话，按名字停掉再重试一次。
+        // 以前这里一律当成「启动失败」，日志还提示「请确认管理员权限」，
+        // 于是残留会话会让助手永远起不来，用户只能手动 --uninstall。
+        const ERROR_ALREADY_EXISTS: u32 = 183;
+        if rc == ERROR_ALREADY_EXISTS {
+            if crate::pipe::PipeClient::connect(200).is_ok() {
+                return Err(EtwError::AlreadyRunning);
+            }
+            // SAFETY: 按名字停会话时 ControlHandle 传 0，名字以 NUL 结尾
+            unsafe {
+                ControlTraceW(
+                    CONTROLTRACE_HANDLE { Value: 0 },
+                    logger_name.as_ptr(),
+                    props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                    EVENT_TRACE_CONTROL_STOP,
+                );
+            }
+            // SAFETY: 同上面的 StartTraceW
+            rc = unsafe {
+                windows_sys::Win32::System::Diagnostics::Etw::StartTraceW(
+                    &mut handle,
+                    logger_name.as_ptr(),
+                    base as *mut EVENT_TRACE_PROPERTIES,
+                )
+            };
+        }
+
         if rc != ERROR_SUCCESS {
             return Err(if rc == 5 {
                 EtwError::NeedAdmin

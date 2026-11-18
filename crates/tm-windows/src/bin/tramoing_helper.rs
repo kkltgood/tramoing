@@ -5,9 +5,9 @@
 //! 托盘程序始终保持普通权限，只读管道。
 //!
 //! 用法（需要在管理员终端里执行一次）：
-//!   tm-helper.exe --install       注册为登录自启（最高权限）并立即启动
-//!   tm-helper.exe --uninstall     停止并移除
-//!   tm-helper.exe --dump-events   诊断：把 ETW 原始事件写进日志，用于校准事件表
+//!   tramoing-helper.exe --install       注册为登录自启（最高权限）并立即启动
+//!   tramoing-helper.exe --uninstall     停止并移除
+//!   tramoing-helper.exe --dump-events   诊断：把 ETW 原始事件写进日志，用于校准事件表
 //!
 //! 所有输出写日志文件而不是控制台 —— 它是以隐藏窗口方式在后台跑的，
 //! 打印到 stdout 没人看得到。
@@ -20,7 +20,7 @@ fn main() {
 
     #[cfg(not(windows))]
     {
-        eprintln!("tm-helper 只用于 Windows。macOS 上采集由 nettop 完成，不需要助手进程。");
+        eprintln!("tramoing-helper 只用于 Windows。macOS 上采集由 nettop 完成，不需要助手进程。");
     }
 }
 
@@ -43,7 +43,7 @@ mod win {
         let has = |f: &str| args.iter().any(|a| a == f);
 
         if has("--help") || has("-h") {
-            log("用法: tm-helper [--install|--uninstall|--dump-events]");
+            log("用法: tramoing-helper [--install|--uninstall|--dump-events]");
             return;
         }
         if has("--install") {
@@ -69,6 +69,12 @@ mod win {
             Ok(s) => {
                 log("ETW 会话已启动（Microsoft-Windows-Kernel-Network）");
                 s
+            }
+            Err(e @ tm_windows::etw::EtwError::AlreadyRunning) => {
+                // 计划任务和手动启动可能撞车，这时不该报错刷日志：
+                // 已经有一个在服务了，本进程安静退出即可。
+                log(&format!("{e}，本进程退出"));
+                std::process::exit(0);
             }
             Err(e) => {
                 log(&format!("ETW 启动失败：{e}"));
@@ -175,7 +181,7 @@ mod win {
             .args(["/Delete", "/TN", TASK_NAME, "/F"])
             .output();
         let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "tm-helper.exe", "/F"])
+            .args(["/IM", "tramoing-helper.exe", "/F"])
             .output();
 
         match out {
@@ -215,7 +221,7 @@ mod win {
             let _ = writeln!(f, "[{secs}] {msg}");
         }
         // 开发时从终端直接跑也能看到
-        eprintln!("[tm-helper] {msg}");
+        eprintln!("[tramoing-helper] {msg}");
     }
 
     fn log_path() -> std::path::PathBuf {

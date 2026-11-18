@@ -42,6 +42,16 @@ pub const WINDOW_W: f32 = 352.0;
 /// （并向下取整到整行），所以以后哪块高度变了也只是少显示一行，不会露出半截。
 pub const PANEL_H: f32 = 411.0;
 
+/// 「收起」时窗口停靠的位置（逻辑点）。
+///
+/// Windows 上不能用 `Visible(false)` 收面板（会让 eframe 的重绘循环停摆，
+/// 托盘点击就再也唤不醒了，见 [`App::park_window`]），只能把窗口挪到屏幕外。
+/// 取 -32000 是 Win32 的老办法：超出任何虚拟桌面边界，系统不会绘制它。
+#[cfg(windows)]
+const PARKED_X: f32 = -32000.0;
+#[cfg(windows)]
+const PARKED_Y: f32 = -32000.0;
+
 /// 列表下方固定区的高度（点）。
 ///
 /// 这里**只含页脚**：提醒行是可选的（真的超阈值才有），提示则画在页脚里。
@@ -218,6 +228,14 @@ pub struct App {
     /// 上次检查系统主题的时间。注册表读一次是微秒级，但也没必要每帧读。
     #[cfg(windows)]
     theme_check_at: Instant,
+    /// 第几帧（只给 `TM_TRACE_FRAMES` 诊断用）
+    frame_no: u64,
+    /// 首帧是否已经做过「可见但停在屏幕外」的兜底设置。
+    ///
+    /// Windows 上窗口不能真隐藏（隐藏后 eframe 的 update 会停摆），
+    /// 所以启动时必须显式把它摆到屏幕外去。
+    #[cfg(windows)]
+    startup_parked: bool,
     /// 还需要强制隐藏几帧。
     ///
     /// eframe 在首帧画完后会**无条件**调 `window.set_visible(true)`
@@ -228,6 +246,9 @@ pub struct App {
     /// 这里在前几帧再明确隐藏一次：ViewportCommand 的处理（handle_viewport_output）
     /// 与 post_rendering 在同一帧内先后执行，所以窗口不会被合成到屏幕上。
     /// 留 3 帧是冗余，防止第一帧的命令赶上首帧初始化还没完成。
+    ///
+    /// 只有 macOS 用得上：Windows 走「挪到屏幕外」，不需要也不允许隐藏窗口。
+    #[cfg(not(windows))]
     startup_hide: u8,
 }
 
@@ -288,7 +309,7 @@ impl App {
 
         let icons = IconSet::new(ctx.clone());
 
-        Self {
+        let mut app = Self {
             rx,
             tray_rx,
             latest: None,
@@ -306,8 +327,11 @@ impl App {
                 "1h" => Window::Hour1,
                 _ => Window::Live,
             },
-            // 等事件循环转两圈再建，见字段注释
+            // macOS 要等状态栏布局好再建（见字段注释）；Windows 的 Shell_NotifyIcon 可以立刻建
+            #[cfg(target_os = "macos")]
             tray_build_at: Instant::now() + Duration::from_millis(600),
+            #[cfg(not(target_os = "macos"))]
+            tray_build_at: Instant::now(),
             icons,
             launch_at_login: autostart::is_enabled(),
             font_lang,
@@ -325,7 +349,12 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
             show_on_start: std::env::var_os("TM_SHOW_ON_START").is_some(),
+            // macOS 靠「前几帧再隐藏」抵消 eframe 的强制显示；Windows 改成摆到屏幕外
+            #[cfg(not(windows))]
             startup_hide: 3,
+            frame_no: 0,
+            #[cfg(windows)]
+            startup_parked: false,
             opened_at: None,
             had_focus: false,
             // build_tray 里已经挂了图标，这里按「已挂」起步
@@ -335,7 +364,14 @@ impl App {
             taskbar_light: tm_windows::theme::taskbar_is_light(),
             #[cfg(windows)]
             theme_check_at: Instant::now(),
-        }
+        };
+
+        // 隐藏窗口不会驱动 eframe 的 update()，托盘图标必须在这里同步建好：
+        // 否则用户根本看不到图标，也就无从点开面板。
+        #[cfg(windows)]
+        app.ensure_tray();
+
+        app
     }
 
     /// 延迟创建状态栏图标，失败则过几秒重试。
@@ -443,6 +479,33 @@ impl App {
     }
 
     pub fn close(&mut self, ctx: &egui::Context) {
+        self.park_window(ctx);
+    }
+
+    /// 收起面板。
+    ///
+    /// Windows 上**不能**用 `ViewportCommand::Visible(false)`：winit 收到之后
+    /// 就不再派发 `RedrawRequested`，eframe 的 `update()` 随之停摆 —— 托盘点击
+    /// 虽然被 handler 塞进了 channel（还顺手 `request_repaint()`），但再也没人
+    /// 消费，表现就是「点图标完全没反应」，只能重启程序。
+    ///
+    /// 所以改成把窗口挪到屏幕外：`WS_VISIBLE` 保持为真，事件循环照常转，
+    /// 面板状态、悬停提示也能继续刷新。逻辑上仍然是「收起」（`visible = false`），
+    /// 展开时再把窗口搬回来。
+    #[cfg(windows)]
+    fn park_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            PARKED_X, PARKED_Y,
+        )));
+        self.visible = false;
+    }
+
+    /// 收起面板。
+    ///
+    /// macOS 的状态项窗口本来就不参与普通窗口管理，直接隐藏最干净，
+    /// 原生状态栏的点击回调也不依赖 eframe 的重绘循环。
+    #[cfg(not(windows))]
+    fn park_window(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.visible = false;
     }
@@ -473,14 +536,14 @@ impl App {
 
         // 悬停提示必须每秒跟着数据走。Windows 的托盘没有文字标题，
         // 这是面板之外唯一能看到实时速率的地方 —— 以前它被 macOS 专用的
-        // 那段逻辑一起跳过了，悬停永远只有一句 "Traffic Monitor"。
+        // 那段逻辑一起跳过了，悬停永远只有一句产品名。
         let tip = match &self.latest {
             Some(s) => format!(
                 "↓ {}    ↑ {}",
                 format_speed(s.total_rx),
                 format_speed(s.total_tx)
             ),
-            None => "Traffic Monitor".to_owned(),
+            None => "Tramoing".to_owned(),
         };
         if tip != self.tray_tip {
             let _ = tray.set_tooltip(Some(tip.as_str()));
@@ -596,6 +659,19 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 排查「点了托盘没反应」用的：确认收起之后 update 还在跑。
+        // 收缩面板如果把窗口真隐藏了，这个计数就会停在收起的那一刻。
+        if std::env::var_os("TM_TRACE_FRAMES").is_some() {
+            self.frame_no = self.frame_no.wrapping_add(1);
+            if self.frame_no % 30 == 0 {
+                eprintln!(
+                    "[ui] frame={} visible={} pos={:?}",
+                    self.frame_no,
+                    self.visible,
+                    ctx.input(|i| i.viewport().outer_rect).map(|r| r.min)
+                );
+            }
+        }
         self.ensure_tray();
         #[cfg(windows)]
         self.sync_tray_theme();
@@ -629,9 +705,29 @@ impl eframe::App for App {
 
         // 抵消 eframe 首帧的强制显示（见字段注释）。
         // 必须在 show_on_start 之后判断，否则 --show 会被自己关掉。
+        //
+        // 只在 macOS 走这条路：Windows 的窗口一直保持 WS_VISIBLE、靠挪到屏幕外
+        // 来「收起」，一旦这里发 Visible(false) 就会把 update() 弄停摆，
+        // 之后点托盘图标不会有任何反应。
+        #[cfg(not(windows))]
         if !self.visible && self.startup_hide > 0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.startup_hide -= 1;
+        }
+        #[cfg(windows)]
+        {
+            // 首帧保险：确保窗口是「可见但停在屏幕外」的状态。
+            // 之所以要主动发一次，是因为窗口一旦真的被隐藏，update() 就停摆了，
+            // 之后再点托盘也唤不回来（见 park_window 的注释）。
+            if !self.startup_parked {
+                self.startup_parked = true;
+                if !self.visible {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        PARKED_X, PARKED_Y,
+                    )));
+                }
+            }
         }
 
         while let Ok(ev) = self.tray_rx.try_recv() {
@@ -651,7 +747,12 @@ impl eframe::App for App {
             let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
             if focused {
                 self.had_focus = true;
-            } else if self.had_focus && self.shown_at.elapsed() > HIDE_DEBOUNCE {
+            } else if self.had_focus
+                // `--show` 是给调试/截图用的：那种情况下窗口本来就不是用户点开的，
+                // 一失焦就收起会导致「刚起来就没了」，根本没法核对界面。
+                && !self.show_on_start
+                && self.shown_at.elapsed() > HIDE_DEBOUNCE
+            {
                 self.close(ctx);
                 self.auto_hidden_at = Some(Instant::now());
             }
@@ -1515,7 +1616,7 @@ pub fn export_history_csv(zh: bool) -> String {
     let result = (|| -> Result<(u64, String), String> {
         let store = tm_store::Store::open(&engine::db_path()).map_err(|e| e.to_string())?;
         let stamp = store.local_now_stamp().map_err(|e| e.to_string())?;
-        let name = format!("TrafficMonitor-{stamp}.csv");
+        let name = format!("Tramoing-{stamp}.csv");
 
         // 先写「下载」目录；被 TCC 拒绝（用户点了不允许）就退到应用自己的目录，
         // 这两个位置都试过才算真失败。
@@ -2072,7 +2173,7 @@ fn build_tray() -> Result<TrayHandle, String> {
         let (rgba, w, h) = icon::waveform_tinted(TRAY_ICON_PX, tray_tint());
         let icon = Icon::from_rgba(rgba, w, h).map_err(|e| e.to_string())?;
         let tray = TrayIconBuilder::new()
-            .with_tooltip("Traffic Monitor")
+            .with_tooltip("Tramoing")
             .with_icon(icon)
             .build()
             .map_err(|e| e.to_string())?;

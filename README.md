@@ -1,6 +1,16 @@
-# Traffic Monitor
+# Tramoing
 
 跨平台（macOS / Windows）菜单栏流量监控工具。状态栏一个图标，点一下弹出小面板，实时显示「哪些程序在用流量、各占多少下行 / 上行带宽」。
+
+> **命名说明（2026-11-18）**：产品对外名称改为 **Tramoing**（仓库目录也从 `traffic-monitoring` 改成 `tramoing`）。
+> 只改「用户看得到的名字」——安装目录、快捷方式、控制面板条目、窗口标题、安装包文件名；
+> 可执行文件也随之改成 `tramoing.exe` / `tramoing-helper.exe`（Cargo 的 `[[bin]]` 名一起改）。
+> **真正没动的只有内部标识**：数据目录 `%LOCALAPPDATA%\TrafficMonitor`、计划任务 `TrafficMonitorHelper`、
+> ETW 会话 `TrafficMonitor-Etw`、管道 `\\.\pipe\traffic-monitor-v1`、HKCU Run 值 ——
+> 这些一旦改，旧版的历史数据和已注册任务就变成孤儿了，测试时分不清是程序坏了还是迁移没做。
+> macOS 的 `.app` 名与 `CFBundleExecutable` 也一起改成了 `Tramoing.app` / `tramoing`，
+> 但 **bundle id 与数据目录仍是 `dev.guolongkang.trafficmonitor` / `~/Library/Application Support/TrafficMonitor`**，
+> 免得升级后历史记录找不到。
 
 - **版本**：0.1.0
 - **技术栈**：纯 Rust + egui / eframe，无 Electron、无 Python、无外部运行时
@@ -51,7 +61,7 @@
 ## 2. 目录结构
 
 ```text
-traffic-monitoring/
+tramoing/
 ├── Cargo.toml                     # workspace 定义，版本 0.1.0 / edition 2021
 ├── Cargo.lock
 ├── README.md                      # 本文档
@@ -96,7 +106,7 @@ macOS:
       └─(pty，行缓冲)→ tm-macos::NettopSampler → 每秒一帧累计值
 
 Windows:
-  tm-helper.exe（管理员，登录自启）
+  tramoing-helper.exe（管理员，登录自启）
       └─ ETW: Microsoft-Windows-Kernel-Network
       └─ Aggregator（按 PID 累加累计字节）
       └─ \\.\pipe\traffic-monitor-v1（每秒一帧，手写小端协议）
@@ -138,7 +148,7 @@ cargo build --release -p tray-app
 cargo check --target x86_64-pc-windows-msvc -p tm-core -p tm-sampler -p tm-windows
 ```
 
-### 4.1 命令行参数（`traffic-monitor`）
+### 4.1 命令行参数（`tramoing`）
 
 | 参数 | 作用 |
 |---|---|
@@ -148,7 +158,7 @@ cargo check --target x86_64-pc-windows-msvc -p tm-core -p tm-sampler -p tm-windo
 | `--export` | 无界面导出全部历史为 CSV，打印结果后退出 |
 | `--autostart [on\|off\|status]` | 查询 / 修改开机自启，不启动界面 |
 
-macOS 上必须放进 `.app` 包运行，直接跑 `target/debug/traffic-monitor` 会看到「图标不出现」的假象——裸二进制的状态栏窗口 `isOnActiveSpace = false`，系统不渲染它。
+macOS 上必须放进 `.app` 包运行，直接跑 `target/debug/tramoing` 会看到「图标不出现」的假象——裸二进制的状态栏窗口 `isOnActiveSpace = false`，系统不渲染它。
 
 ### 4.2 环境变量（调试用）
 
@@ -175,7 +185,7 @@ macOS 上必须放进 `.app` 包运行，直接跑 `target/debug/traffic-monitor
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo run -p tray-app -- --show            # 开发调试
 cargo run -p tray-app -- --show --mock     # 只看界面
-open dist/TrafficMonitor.app               # 验证真实形态（推荐）
+open dist/Tramoing.app                     # 验证真实形态（推荐）
 ```
 
 免 root：采集用的是系统自带的 `nettop`，不读 raw socket。
@@ -187,7 +197,7 @@ open dist/TrafficMonitor.app               # 验证真实形态（推荐）
 ./scripts/package-macos.sh --no-dmg  # 只出 .app
 ```
 
-产物：`dist/TrafficMonitor.app`（约 12 MB，arm64 + x86_64 通用二进制）、`dist/TrafficMonitor-0.1.0.dmg`（约 6.6 MB）。
+产物：`dist/Tramoing.app`（约 12 MB，arm64 + x86_64 通用二进制）、`dist/Tramoing-0.1.0.dmg`（约 6.6 MB）。
 
 签名是 **ad-hoc**（`codesign -s -`）：本机跑没问题，发给别人会被 Gatekeeper 拦，需要右键「打开」或 `xattr -dr com.apple.quarantine`。正式分发需要 Developer ID + notarytool 公证。
 
@@ -224,26 +234,26 @@ cargo run -p tray-app -- --show --mock
 
 Windows 拿「每进程流量」必须提权。仓库里把它拆成两个可执行文件：
 
-- `traffic-monitor.exe`：托盘 + 面板，普通权限
-- `tm-helper.exe`：ETW 采集，登录时以最高权限静默运行
+- `tramoing.exe`：托盘 + 面板，普通权限
+- `tramoing-helper.exe`：ETW 采集，登录时以最高权限静默运行
 
 **手动开发验证**：
 
 ```powershell
 # 普通 PowerShell：编译
 cargo build --release -p tray-app
-cargo build --release -p tm-windows --bin tm-helper
+cargo build --release -p tm-windows --bin tramoing-helper
 
 # 管理员 PowerShell：注册采集助手
-# 先确定 tm-helper.exe 最终位置，--install 会把当前路径写进计划任务
+# 先确定 tramoing-helper.exe 最终位置，--install 会把当前路径写进计划任务
 # 装好之后不要再移动这个文件，否则任务会指向旧路径
-.\target\release\tm-helper.exe --install
+.\target\release\tramoing-helper.exe --install
 
 # 确认任务已注册并正在运行
 schtasks /Query /TN TrafficMonitorHelper /FO LIST
 
 # 普通 PowerShell：启动界面
-.\target\release\traffic-monitor.exe
+.\target\release\tramoing.exe
 ```
 
 日志位置：
@@ -257,20 +267,20 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 
 | # | 操作 | 预期结果 | 备注 |
 |---|---|---|---|
-| T1 | 启动 `traffic-monitor.exe` | 托盘出现波形图标，**不自动弹出面板** | 见 6.6「启动就弹面板」 |
+| T1 | 启动 `tramoing.exe` | 托盘出现波形图标，**不自动弹出面板** | 见 6.6「启动就弹面板」 |
 | T2 | 单击托盘图标 | 弹出面板；再点一次收起 | 失焦约 0.3 秒后也会自动收起 |
 | T3 | 打开面板观察数值 | 每秒更新一次；顶部下载 / 上行两栏等宽 | 不需要等 2~3 秒 |
 | T4 | 进行一个已知方向的传输（如下载一个大文件） | 下行数字明显上升，上行不应同步暴涨 | 若相反，执行 6.5 校准 |
 | T5 | 打开 Chrome 等有多进程的程序 | 列表里合并为**一行**，不是五六个 `chrome.exe` | Windows 按 exe 全路径归并 |
 | T6 | 依次点击 `实时 / 1分钟 / 5分钟 / 1小时` | 列表内容随之变化，滑块滑到对应档位 | |
 | T7 | 设置页逐项切换：外观、语言、最多展示、保留天数、流量提醒 | 立即生效，关闭再打开设置仍保留 | 配置在 `%LOCALAPPDATA%\TrafficMonitor\settings.conf` |
-| T8 | 设置里打开「开机自启」 | 注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TrafficMonitor` 出现 | 命令行 `traffic-monitor.exe --autostart status` 可交叉验证 |
+| T8 | 设置里打开「开机自启」 | 注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TrafficMonitor` 出现 | 命令行 `tramoing.exe --autostart status` 可交叉验证 |
 | T9 | 等待 10 秒后查看数据目录 | 生成 `history.db`，且大小不再为 0 | 每 5 秒落一次盘 |
-| T10 | 点击面板左下「导出」 | `Downloads` 下出现 `TrafficMonitor-<时间戳>.csv` | 没有 Downloads 目录时退到应用数据目录 |
-| T11 | 运行 `traffic-monitor.exe --export` | 终端打印导出行数与路径，程序立即退出 | 无界面 |
+| T10 | 点击面板左下「导出」 | `Downloads` 下出现 `Tramoing-<时间戳>.csv` | 没有 Downloads 目录时退到应用数据目录 |
+| T11 | 运行 `tramoing.exe --export` | 终端打印导出行数与路径，程序立即退出 | 无界面 |
 | T12 | 注销并重新登录 | 托盘自动出现，助手任务自动以最高权限运行 | 验证计划任务 |
-| T13 | `tm-helper.exe --uninstall` 后再启动界面 | 面板停在骨架屏、没有应用列表；控制台打印"连不上采集助手"，每 2 秒重连一次 | 助手是进程级数据的前提；助手恢复后界面会自动重连 |
-| T14 | 运行 NSIS 安装包，再运行卸载程序 | 安装到 `Program Files\Traffic Monitor`；卸载时先停任务再删文件；历史数据默认保留 | 安装包脚本**尚未真机验证**，请重点记录问题 |
+| T13 | `tramoing-helper.exe --uninstall` 后再启动界面 | 面板停在骨架屏、没有应用列表；控制台打印"连不上采集助手"，每 2 秒重连一次 | 助手是进程级数据的前提；助手恢复后界面会自动重连 |
+| T14 | 运行 NSIS 安装包，再运行卸载程序 | 安装到 `Program Files\Tramoing`；开始菜单出现 `Tramoing`；卸载时先停任务再删文件；历史数据默认保留 | 只验证过「生成安装包」，安装/卸载流程待测 |
 
 ### 6.5 【重点】ETW 事件方向校准
 
@@ -289,11 +299,11 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 1. 先停掉正在运行的助手，避免同名 ETW 会话冲突：
    ```powershell
    schtasks /End /TN TrafficMonitorHelper
-   taskkill /IM tm-helper.exe /F
+   taskkill /IM tramoing-helper.exe /F
    ```
 2. 在**管理员** PowerShell 里运行诊断模式（窗口是隐藏子系统，Ctrl+C 不一定生效，停止用 `taskkill`）：
    ```powershell
-   .\target\release\tm-helper.exe --dump-events
+   .\target\release\tramoing-helper.exe --dump-events
    ```
 3. 制造**只有单一方向**的流量。推荐：在内网起一个 HTTP 服务，用 `curl -O` 只下载一个大文件；再用 `curl -T` 只上传一个大文件。
 4. 每次动作后查看 `%LOCALAPPDATA%\TrafficMonitor\etw-dump.log`，形如：
@@ -311,15 +321,15 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
-| 托盘图标"不出现" | Win11 默认把新图标收进任务栏的 `«` 溢出区 | 点任务栏的 `«` 展开，把图标拖到常显区；确认 `traffic-monitor.exe` 进程还活着 |
+| 托盘图标"不出现" | Win11 默认把新图标收进任务栏的 `«` 溢出区 | 点任务栏的 `«` 展开，把图标拖到常显区；确认 `tramoing.exe` 进程还活着 |
 | 托盘图标看不见/几乎是空白 | 图标颜色跟任务栏底色撞了（深色任务栏要白线、浅色要黑线，代码已按注册表自适应，每 3 秒复查一次） | 若仍异常，记录 Windows 版本 + 任务栏明暗设置 |
-| 启动就弹出面板 | eframe 首帧强制显示（已在代码里连发 3 帧隐藏命令抵消） | 若复现，请记录 Windows 版本和是否首次启动 |
-| 点托盘图标后看不到面板 | 面板被摆到屏幕外（任务栏在底部却向下展开） | 已在 6.8 修复；若仍复现，记录任务栏停靠位置 + 显示器数量/缩放 |
-| 面板一直"等待数据"、没有应用列表 | 助手没装、没提权、或崩了 | 看 `helper.log`；确认计划任务状态；`tm-helper.exe --help` 会把用法写进 `helper.log` |
+| 启动就弹出面板 | eframe 首帧强制显示（macOS 上连发 3 帧隐藏命令抵消；Windows 改成开局停在屏幕外） | 若复现，请记录 Windows 版本和是否首次启动 |
+| 点托盘图标后看不到面板 | ① 面板被摆到屏幕外（6.8）；② 收起时把窗口真隐藏，eframe 的 `update()` 停摆，点击没人处理（6.12） | 已在 6.8 / 6.12 修复；若仍复现，`TM_TRACE_FRAMES=1` 启动看收起后 `[ui] frame=` 还在不在涨 |
+| 面板一直"等待数据"、没有应用列表 | 助手没装、没提权、或崩了 | 看 `helper.log`；确认计划任务状态；`tramoing-helper.exe --help` 会把用法写进 `helper.log` |
 | 有总流量但没有进程级数据 | helper 未运行或管道连不上 | 管理员运行 `--install`；检查 `\\.\pipe\traffic-monitor-v1` 是否存在 |
 | 上下行数字对调 | ETW 事件 ID 表不对 | 执行 6.5 |
 | 进程名显示为 `pid 1234` | 进程刚退出，或即使提权也查不到路径 | 正常降级，不影响流量统计 |
-| 数据不更新 | ETW 会话被同名会话占用 | `tm-helper.exe --uninstall` 后重装；检查是否有旧助手进程 |
+| 数据不更新 | ETW 会话被同名会话占用 | `tramoing-helper.exe --uninstall` 后重装；检查是否有旧助手进程 |
 | `makensis` 找不到 | 没装 NSIS | `winget install NSIS.NSIS` |
 
 ### 6.7 Windows 已知差异与未验证项
@@ -327,11 +337,14 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 请测试时特别留意，这些**不是 bug 或已有明确说明**：
 
 1. **ETW 事件 ID 表待校准**（6.5）——目前唯一未经真机确认的核心逻辑。
-2. **安装包脚本未真机验证**：`packaging/windows/build.ps1` 与 `traffic-monitor.nsi` 只在 macOS 上做过静态检查。
+2. **安装包脚本只在真机跑通了「生成」这一步**（见 6.10）：`dist\Tramoing-0.1.0-setup.exe` 已产出，但安装 → 卸载全流程、UAC 提示和 SmartScreen 拦截尚未验证。
 3. **任务栏没有速率文字**：Windows 托盘项不支持文字标题（`tray-icon` 的 `set_title` 只对 macOS 生效），
    所以面板之外的实时速率只有一个出口——**鼠标悬停**（tooltip 每秒更新，显示 `↓ 1.2 MB/s  ↑ 180 KB/s`）。
    设置页里「菜单栏」「菜单栏配色」两行因此只在 macOS 显示。
-4. **列表里是首字母色块，不是真实应用图标**：Windows 侧还没有用 `SHGetFileInfoW` 取图标，目前留了接口。
+4. **少数应用仍显示首字母色块**：图标走 `SHGetFileInfoW` 从 exe 资源里取（见 6.11），
+   取不到就退回首字母方块。已知取不到的一类：装在**受 ACL 保护的服务目录**里的核心程序
+   （例如 `C:\ProgramData\clash-verge-service\cores\verge-mihomo.exe`），普通权限读不到文件，
+   也就取不到图标。这是权限模型决定的，不是渲染 bug。
 5. **未做代码签名**：安装包会触发 SmartScreen 警告。
 6. 滚轮手感、极端长会话（>24h）的内存表现尚未验证。
 
@@ -359,6 +372,101 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 验证方式：`cargo test --workspace`（96 个用例，含定位几何、滚动吸附、速率定宽的单测）；
 `cargo check --target x86_64-pc-windows-msvc`（`tray-app` + `tm-windows`，0 警告）。
 真机行为仍需按 6.4 的用例表复测。
+
+### 6.9 本轮修复（Windows 真机运行）
+
+在 3840×2160 @150% 的 Windows 真机上把两条链路都跑通了（`--show --mock` 走假数据、
+不带 `--mock` 走真实 ETW 助手，275 个进程、稳定 1.00s 一帧），修掉的是只有真机才暴露的问题：
+
+| 问题 | 原因 | 修法 |
+|---|---|---|
+| `cargo check --workspace` 在 Windows 上直接编不过 | workspace 成员是无条件列出的，`tm-macos` / `tm-spike-mac` 没有 crate 级门控，Windows 上会去编 libc / objc2 | `tm-macos` 加 `#![cfg(target_os = "macos")]`；`tm-spike-mac` 给非 macOS 平台留一个空壳 `main` |
+| 开机自启的查询/写入会闪一下黑框，环境禁掉 `reg.exe` 时整个程序起不来 | 在 `App::new()` 里 spawn `reg.exe query`，属于启动路径 | 改调 advapi32（`RegGetValueW` / `RegSetKeyValueW` / `RegDeleteKeyValueW`），落到新模块 `tm-windows::registry_run` |
+| 助手被强杀过一次之后就永远起不来，日志还提示「请确认管理员权限」 | `StartTraceW` 返回 183（同名会话残留）被当成普通失败 | 183 时先探管道：通 → `AlreadyRunning` 安静退出；不通 → 按名字停掉僵尸会话再重试一次 |
+| 列表底部堆一串「0 B/s / 0 B/s」的空行 | 每帧都出现的空转进程走 `a*0+(1-a)*prev`，EMA 永远到不了 0 | EMA 低于 1 B/s 一律归零并在快照里剔除；窗口视图同理 |
+| 刚启动那几十秒切到「1分钟 / 5分钟 / 1小时」，数字明显偏小 | 分母写死窗口长度（60/300/3600），实际只攒了几秒 | 分母取 `min(窗口秒数, 已覆盖秒数)` |
+| 进程路径含中文且超长时整帧被丢弃 | 名字按 512 字节硬切，正好切在多字节字符中间 → 对端 `from_utf8` 失败 | 截断退到最近的字符边界（`is_char_boundary`） |
+| `--show` 起来一瞬间就自己收起，没法截图核对界面 | 失焦自动收起对调试模式同样生效 | `--show` 下不自动收起 |
+
+验证：`cargo test --workspace` 97 个用例全过（Windows 上 `tm-macos` 被平台门控跳过，实跑 77）；
+`tramoing.exe --autostart on/off/status`、`--export` 均实测通过。
+
+### 6.10 打包（Windows）
+
+仓库根目录已改成 `tramoing/`，**打包产物一律出在当前仓库根目录下的 `dist/`**，
+不要再从旧路径（`traffic-monitoring/`）找安装包。
+
+```powershell
+# 需要一个能跑脚本的 PowerShell（或临时放开策略）
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
+# 想手动指定版本
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Version 0.1.1
+```
+
+脚本做的事：读 `Cargo.toml` 的版本 → `cargo build --release` 两个 exe →
+收集到 `dist\windows\` → 调 `makensis` 出 `dist\Tramoing-<version>-setup.exe`（约 2.5 MB）。
+
+实操踩到的两个坑，已在脚本里修掉：
+
+| 坑 | 现象 | 处理 |
+|---|---|---|
+| `build.ps1` / `traffic-monitor.nsi` 没存 BOM | PowerShell 5.1 按 GBK 解读，中文注释乱码 → `字符串缺少终止符`；NSIS 也会按 ANSI 读源码 | 两个文件都存成 **UTF-8 with BOM**（脚本头部有注释提醒；用编辑器改完记得补回） |
+| `makensis` 不在 PATH | `winget install NSIS.NSIS` 不会写 PATH，脚本报「找不到 makensis」 | 脚本先查 `Get-Command`，再退到 `Program Files (x86)\NSIS\makensis.exe` |
+
+已验证：安装包生成成功（0 warning），版本信息为 `Tramoing 0.1.0 / MIT`；
+`dist\windows\tramoing.exe` 直接运行正常。**安装 → 卸载全流程尚未跑过**
+（需要管理员权限，且会改动系统计划任务），首次安装时请留意 `tramoing-helper --install` 的返回码。
+
+改名后安装包的行为：
+
+- 安装目录 `%PROGRAMFILES%\Tramoing`，开始菜单文件夹 / 快捷方式 / 控制面板条目都叫 `Tramoing`，
+  注册表标识 `HKLM\Software\Tramoing`（旧版的 `...\Traffic Monitor` 不会被自动卸载）。
+- 装之前**先把旧版退掉**：改名前的 `traffic-monitor.exe`（或更早装的 `TrafficMonitor.exe`）如果还在跑，会和新包抢命名管道和
+  ETW 会话（表现为面板一直骨架屏，日志里是 183 / 连接被拒）。
+- 卸载新版时会顺手清掉旧版的残留：开始菜单 `Traffic Monitor` 文件夹、`HKCU\...\Run` 里的
+  `TrafficMonitor` 值与 `HKLM\Software\TrafficMonitor*` 键。历史数据默认保留。
+
+### 6.11 应用图标（Windows）
+
+列表左侧的图标不是内置贴图，而是运行期从每个 exe 的资源段里取出来的真图标：
+
+| 环节 | 实现 |
+|---|---|
+| 取图标 | `tm-windows::icon::app_icon(path)` → `SHGetFileInfoW`（`SHGFI_ICON \| SHGFI_LARGEICON`），150% 缩放下返回 48×48 |
+| 解码 | `GetIconInfo` 拿到彩色位图 + AND mask → `GetDIBits` 读 32bpp BGRA；有 alpha 的按「预乘 → 非预乘」反算，没有 alpha 的老图标用 mask 补透明度 |
+| 释放 | `GetIconInfo` 出门就把两张位图的所有权交给你，所以 `DeleteObject` 与 `DestroyIcon` 必须成对，否则每取一个图标漏两块 GDI 对象 |
+| 线程 | 取图跑在 `tray-app::icons` 的后台线程里：`SHGetFileInfoW` 冷启动几十毫秒，放界面线程就是白帧 |
+| 缓存 | 键直接用 `AppKey`（Windows 下就是 exe 全路径），纹理上限 256 张，超了按「10 分钟没上过榜」淘汰 |
+| 兜底 | 取不到就画首字母色块（`tile_color` 按名字散列，颜色稳定） |
+
+排查：`TM_TRACE_ICONS=1 tramoing.exe --show` 会把每个取不到的路径和原因打到 stderr。
+单测在 `crates/tm-windows/src/icon.rs`（占位名/不存在路径/真实系统图标解码）。
+
+### 6.12 本轮修复（点托盘图标没反应）
+
+**现象**：启动后点托盘图标，面板不弹出来；托盘图标本身是在的，鼠标悬停也正常。
+
+**原因**：收面板用的是 `ViewportCommand::Visible(false)`。窗口一旦真的隐藏，
+winit 就不再派发 `RedrawRequested`，eframe 的 `update()` 整个停摆 ——
+托盘点击虽然被 handler 塞进 channel（还顺手 `request_repaint()`），但再也没人消费。
+更糟的是启动路径：`with_visible(false)` + 前 3 帧强制隐藏，导致 `update()`
+在第一秒内就停了，连托盘图标都是靠"运气"建的。
+
+**修法**：
+
+| 位置 | 改动 |
+|---|---|
+| `main.rs` | Windows 改成开局就 `with_position([-32000, -32000])` + `with_visible(true)`：窗口一直"可见"，只是停在屏幕外，事件循环不会停 |
+| `app.rs::park_window` | 收起时 Windows 用 `OuterPosition(-32000, -32000)` 挪走（`visible` 逻辑状态照旧置 false）；macOS 仍用 `Visible(false)` |
+| `app.rs::App::new` | Windows 上同步 `ensure_tray()`，不再等 `update()` 里那 600ms 延迟（macOS 的 NSStatusBar 布局延迟保留） |
+| `app.rs::update` | Win 专属：首帧兜底确认窗口是"可见 + 停在屏幕外"；`startup_hide` 只在 macOS 编译 |
+
+**验证**：用 `PostMessage(hwnd, WM_USER_TRAYICON=6002, 0, WM_LBUTTONUP)`
+向 `tray_icon_app` 窗口模拟点击，连续三轮「开 → 收 → 开」都正确：
+打开时窗口在 `(2127, 973)`，收起时回到 `-32000` 屏幕外，面板内容完整渲染。
+`TM_TRACE_FRAMES=1` 可以看到收起后 `[ui] frame=` 依旧每 30 帧打一次（说明 update 没停）。
+
+
 
 ---
 
@@ -388,7 +496,7 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 | `settings.conf` | 同上 | 用户设置 |
 | `helper.log` | 同上（Windows） | 采集助手运行日志 |
 | `etw-dump.log` | 同上（Windows） | 事件诊断日志，仅 `--dump-events` 时产生 |
-| `TrafficMonitor-<时间戳>.csv` | `Downloads`，失败退到应用目录下的 `exports/` | 导出结果 |
+| `Tramoing-<时间戳>.csv` | `Downloads`，失败退到应用目录下的 `exports/` | 导出结果 |
 
 `history.db` 可以用任何 SQLite 工具打开，例如 `sqlite3 history.db "select * from samples limit 5;"`。
 

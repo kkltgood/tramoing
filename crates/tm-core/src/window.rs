@@ -69,19 +69,25 @@ impl WindowTracker {
     }
 
     /// 最近 `secs` 秒的平均速率（字节/秒），按总量降序。
+    ///
+    /// 分母取「实际攒到的秒数」和 `secs` 里小的那个：刚启动 5 秒时看「1小时」，
+    /// 分母若按 3600 算，数字会小到像没在工作。攒满 `secs` 秒之后语义才回到
+    /// 「最近 N 秒的平均」。
     pub fn rates(&self, secs: usize) -> Vec<(AppKey, f64, f64)> {
         let n = secs.clamp(1, self.max_slots);
-        let denom = n as f64;
 
         let mut out: Vec<(AppKey, f64, f64)> = self
             .per_app
             .iter()
             .filter_map(|(app, d)| {
                 let (rx, tx) = sum_last(d, n);
-                if rx == 0 && tx == 0 {
+                let denom = n.min(d.len()).max(1) as f64;
+                let (rx, tx) = (rx as f64 / denom, tx as f64 / denom);
+                // 平均下来不到 1 B/s 的，界面上就是「0 B/s」，不占列表位置
+                if rx < 1.0 && tx < 1.0 {
                     return None;
                 }
-                Some((app.clone(), rx as f64 / denom, tx as f64 / denom))
+                Some((app.clone(), rx, tx))
             })
             .collect();
 
@@ -93,11 +99,12 @@ impl WindowTracker {
         out
     }
 
-    /// 最近 `secs` 秒的总平均速率。
+    /// 最近 `secs` 秒的总平均速率。分母规则同 [`Self::rates`]。
     pub fn total_rate(&self, secs: usize) -> (f64, f64) {
         let n = secs.clamp(1, self.max_slots);
         let (rx, tx) = sum_last(&self.total, n);
-        (rx as f64 / n as f64, tx as f64 / n as f64)
+        let denom = n.min(self.total.len()).max(1) as f64;
+        (rx as f64 / denom, tx as f64 / denom)
     }
 
     /// 最近 `secs` 秒每秒的总下载量，给折线图用。长度不足时前面少几个点。
@@ -234,5 +241,19 @@ mod tests {
         let mut w = WindowTracker::new(10);
         w.push(&[(app("a"), 0, 0)]);
         assert!(w.rates(1).is_empty());
+    }
+
+    #[test]
+    fn short_history_divides_by_covered_seconds() {
+        // 刚启动 3 秒就切到「1 分钟」：分母应是 3（已覆盖的秒数），不是 60。
+        // 按 60 算的话，1000 B/s 会显示成 50 B/s，看着像采样坏了。
+        let mut w = WindowTracker::new(3600);
+        for _ in 0..3 {
+            w.push(&[(app("a"), 1000, 0)]);
+        }
+        let r = w.rates(60);
+        assert!((r[0].1 - 1000.0).abs() < 0.01, "得到 {}", r[0].1);
+        let (rx, _) = w.total_rate(60);
+        assert!((rx - 1000.0).abs() < 0.01, "得到 {rx}");
     }
 }

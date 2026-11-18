@@ -5,7 +5,7 @@
 #   ./scripts/package-macos.sh            # 有 x86_64 target 就做通用二进制，否则只做本机架构
 #   ./scripts/package-macos.sh --no-dmg   # 只出 .app
 #
-# 产物：dist/TrafficMonitor.app、dist/TrafficMonitor-<version>.dmg
+# 产物：dist/Tramoing.app、dist/Tramoing-<version>.dmg
 #
 # 签名说明：用的是 ad-hoc（`codesign -s -`）。别人第一次打开会被 Gatekeeper 拦，
 # 需要右键「打开」或 `xattr -dr com.apple.quarantine`。要正式分发得买 Developer ID
@@ -15,9 +15,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 
-APP_NAME="TrafficMonitor"
-APP_DISPLAY_NAME="Traffic Monitor"
-BIN="traffic-monitor"
+APP_NAME="Tramoing"
+APP_DISPLAY_NAME="Tramoing"
+BIN="tramoing"
 BUNDLE_ID="dev.guolongkang.trafficmonitor"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST="$ROOT/dist"
@@ -104,7 +104,7 @@ codesign --verify --deep --strict "$APP" && echo "    签名校验通过"
 
 # ---------- 5. DMG ----------
 if [[ $MAKE_DMG -eq 1 ]]; then
-  DMG="$DIST/TrafficMonitor-$VERSION.dmg"
+  DMG="$DIST/Tramoing-$VERSION.dmg"
   STAGE="$DIST/.dmg-stage"
   echo "==> 打包 $DMG"
   rm -rf "$STAGE"

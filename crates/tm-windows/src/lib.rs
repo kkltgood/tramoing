@@ -5,10 +5,10 @@
 //! 所以拆成两个进程：
 //!
 //! ```text
-//!   tm-helper（管理员，登录时自启）
+//!   tramoing-helper（管理员，登录时自启）
 //!       └─ ETW 实时会话 → Aggregator → 每秒一帧 → 命名管道
 //!                                                     │
-//!   traffic-monitor（普通权限，托盘）  ←───────────────┘
+//!   tramoing（普通权限，托盘）  ←───────────────┘
 //! ```
 //!
 //! 界面进程永远不需要提权，装一次就好。
@@ -22,9 +22,13 @@ pub mod proto;
 #[cfg(windows)]
 pub mod etw;
 #[cfg(windows)]
+pub mod icon;
+#[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
 pub mod proc;
+#[cfg(windows)]
+pub mod registry_run;
 #[cfg(windows)]
 pub mod sampler;
 #[cfg(windows)]

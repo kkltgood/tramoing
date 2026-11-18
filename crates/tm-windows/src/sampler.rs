@@ -69,7 +69,7 @@ fn reader_loop(tx: mpsc::Sender<Frame>) {
                 if !warned {
                     eprintln!("[windows] 连不上采集助手（{e}）。");
                     eprintln!(
-                        "[windows] 请以管理员身份运行一次：tm-helper.exe --install"
+                        "[windows] 请以管理员身份运行一次：tramoing-helper.exe --install"
                     );
                     warned = true;
                 }

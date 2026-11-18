@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>TrafficMonitor</string>
+    <string>Tramoing</string>
     <key>CFBundleDisplayName</key>
-    <string>Traffic Monitor</string>
+    <string>Tramoing</string>
     <key>CFBundleIdentifier</key>
     <!-- 必须和 tray-app/src/autostart.rs 里的 LABEL 一致，
          否则「登录项与扩展」里会出现两个同名条目 -->
     <string>dev.guolongkang.trafficmonitor</string>
     <key>CFBundleExecutable</key>
-    <string>traffic-monitor</string>
+    <string>tramoing</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>

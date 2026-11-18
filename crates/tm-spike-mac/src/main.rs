@@ -8,20 +8,35 @@
 //!
 //! 注意：必须在**真终端**里跑。若被沙箱/权限拦截，nettop 会被直接 kill。
 
+// 这个探针只在 macOS 上有意义（它直接调 nettop）。workspace 成员是无条件列出的，
+// 所以非 macOS 平台留一个空壳 main，别让 `cargo check --workspace` 卡在一个
+// 跟当前平台毫无关系的 crate 上。
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports, dead_code))]
+
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use tm_core::{format_speed, AppRate, RateCalculator};
+#[cfg(target_os = "macos")]
 use tm_macos::{NettopParser, NettopSampler};
 use tm_sampler::{MockSampler, Sampler, SamplerError};
 
 const TOP_N: usize = 12;
 
+#[cfg(target_os = "macos")]
 fn main() {
     std::process::exit(run());
 }
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("tm-spike-mac 是 macOS 专用探针，当前平台不需要运行它。");
+}
+
+#[cfg(target_os = "macos")]
 fn run() -> i32 {
     let args = Args::parse();
 
@@ -67,6 +82,7 @@ fn run() -> i32 {
     0
 }
 
+#[cfg(target_os = "macos")]
 fn dump(lines: usize) -> i32 {
     let bin = std::env::var("TM_NETTOP_BIN").unwrap_or_else(|_| "/usr/bin/nettop".to_owned());
     let mut child = match Command::new(&bin)

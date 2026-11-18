@@ -32,9 +32,18 @@ pub struct IconSet {
     pending: HashSet<String>,
     /// 确认取不到的键，不用每次重试
     missing: HashSet<String>,
+    /// 每帧自增，配合 `seen` 做过期淘汰
+    frame: u64,
+    /// 键 → 最后一次被列表请求的帧号
+    seen: HashMap<String, u64>,
     req_tx: Sender<String>,
     res_rx: Receiver<(String, Option<egui::ColorImage>)>,
 }
+
+/// 纹理上限。一个应用一张 48×48 图 ≈ 9 KB，256 张不到 3 MB；
+/// 超过就按「多久没被用到」淘汰。长会话里进程开了又关，
+/// 不做这件事纹理表只增不减（虽然慢，但确实是泄漏）。
+const MAX_TEXTURES: usize = 256;
 
 impl IconSet {
     pub fn new(ctx: egui::Context) -> Self {
@@ -60,6 +69,8 @@ impl IconSet {
             textures: HashMap::new(),
             pending: HashSet::new(),
             missing: HashSet::new(),
+            frame: 0,
+            seen: HashMap::new(),
             req_tx,
             res_rx,
         }
@@ -67,6 +78,7 @@ impl IconSet {
 
     /// 把后台已完成的图标转成纹理。每帧调用一次，非阻塞。
     pub fn poll(&mut self) {
+        self.frame += 1;
         while let Ok((key, img)) = self.res_rx.try_recv() {
             self.pending.remove(&key);
             match img {
@@ -81,10 +93,20 @@ impl IconSet {
                 }
             }
         }
+
+        if self.textures.len() > MAX_TEXTURES {
+            let now = self.frame;
+            // 面板每秒至少重绘一次，600 帧≈10 分钟没上过榜的图标可以丢掉
+            self.textures
+                .retain(|k, _| now.saturating_sub(*self.seen.get(k).unwrap_or(&0)) < 600);
+            self.seen.retain(|k, _| self.textures.contains_key(k) || self.pending.contains(k));
+        }
     }
 
     /// 取图标纹理；没有就顺手排进后台队列，本帧返回 `None`。
     pub fn get(&mut self, key: &str) -> Option<egui::TextureHandle> {
+        // 记一次「本帧还在用」，供过期淘汰参考
+        self.seen.insert(key.to_owned(), self.frame);
         if let Some(t) = self.textures.get(key) {
             return Some(t.clone());
         }
@@ -118,9 +140,42 @@ fn load(key: &str) -> Option<egui::ColorImage> {
         ));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        // Windows 侧后续用 SHGetFileInfoW 补上，现在统一走色块
+        // Windows 的 AppKey 就是可执行文件全路径（见 tm-core::AppKey 的说明），
+        // 所以这里不用再反查 pid：直接拿路径去 shell 要图标。
+        // 拿不到（进程已退出、路径是 `pid N` 占位符）就返回 None，上层退化成色块。
+        let trace = std::env::var_os("TM_TRACE_ICONS").is_some();
+        if !std::path::Path::new(key).is_absolute() {
+            if trace {
+                eprintln!("[icons] 跳过（不是绝对路径）：{key}");
+            }
+            return None;
+        }
+        let bmp = match tm_windows::icon::app_icon(key) {
+            Some(b) => b,
+            None => {
+                if trace {
+                    eprintln!(
+                        "[icons] 取不到：{key}（文件存在={}）",
+                        std::path::Path::new(key).exists()
+                    );
+                }
+                return None;
+            }
+        };
+        if trace {
+            eprintln!("[icons] ok {}x{} {key}", bmp.width, bmp.height);
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [bmp.width as usize, bmp.height as usize],
+            &bmp.rgba,
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        // 其他平台没有取图标的实现，统一走首字母色块
         let _ = key;
         None
     }

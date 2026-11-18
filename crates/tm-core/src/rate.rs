@@ -1,6 +1,5 @@
 //! 速率计算：把「累计字节」差分 + 平滑成「字节/秒」，并按应用归并。
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -109,18 +108,15 @@ impl RateCalculator {
         //    权重按实际间隔换算：间隔越长，越该相信这一帧的瞬时值。
         let a = 1.0 - (1.0 - self.alpha).powf(dt);
         for (app, (rx, tx)) in &per_app {
-            match self.ema.entry((*app).clone()) {
-                Entry::Occupied(mut o) => {
-                    let (prev_rx, prev_tx) = *o.get();
-                    o.insert((
-                        a * rx + (1.0 - a) * prev_rx,
-                        a * tx + (1.0 - a) * prev_tx,
-                    ));
+            match self.ema.get_mut(*app) {
+                Some(e) => {
+                    e.0 = a * rx + (1.0 - a) * e.0;
+                    e.1 = a * tx + (1.0 - a) * e.1;
                 }
                 // 首次出现的应用直接取瞬时值。若也从 0 开始平滑，
                 // 启动后第一秒会显示成真实速度的一半，观感很差。
-                Entry::Vacant(v) => {
-                    v.insert((*rx, *tx));
+                None => {
+                    self.ema.insert((*app).clone(), (*rx, *tx));
                 }
             }
         }
@@ -128,12 +124,15 @@ impl RateCalculator {
             if !per_app.contains_key(app) {
                 e.0 *= 1.0 - a;
                 e.1 *= 1.0 - a;
-                if e.0 < 1.0 {
-                    e.0 = 0.0;
-                }
-                if e.1 < 1.0 {
-                    e.1 = 0.0;
-                }
+            }
+            // 不到 1 B/s 的一律归零。每帧都出现的进程（挂着但没流量）走的是
+            // `a*0 + (1-a)*prev` 这条指数衰减，永远到不了 0，于是列表底部会堆一串
+            // 「0 B/s / 0 B/s」的空行 —— 界面上显示的就是 0，留着没有任何信息量。
+            if e.0 < 1.0 {
+                e.0 = 0.0;
+            }
+            if e.1 < 1.0 {
+                e.1 = 0.0;
             }
         }
         self.ema.retain(|_, (rx, tx)| *rx > 0.0 || *tx > 0.0);
@@ -295,6 +294,27 @@ mod tests {
         }
         let out = c.snapshot();
         assert!(!out.iter().any(|r| r.app.as_str() == "app"), "应已衰减移除");
+    }
+
+    #[test]
+    fn idle_but_alive_app_drops_out_of_the_list() {
+        // 进程还活着、每秒都出现在采样里，但一点流量都没有。
+        // EMA 走 a*0+(1-a)*prev 永远到不了 0，以前会一直挂在列表底部显示 0 B/s。
+        let mut c = RateCalculator::with_smoothing(0.7);
+        let t0 = Instant::now();
+        c.update(t0, &[s(1, "app", 0, 0), s(2, "idle", 0, 0)]);
+        c.update(t0 + Duration::from_secs(1), &[s(1, "app", 5000, 0), s(2, "idle", 0, 0)]);
+
+        let mut t = t0 + Duration::from_secs(1);
+        for _ in 0..20 {
+            t += Duration::from_secs(1);
+            c.update(t, &[s(1, "app", 5000, 0), s(2, "idle", 0, 0)]);
+        }
+        let out = c.snapshot();
+        assert!(
+            !out.iter().any(|r| r.app.as_str() == "idle"),
+            "空转的应用应该从列表里消失"
+        );
     }
 
     #[test]

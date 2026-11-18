@@ -102,7 +102,7 @@ mod imp {
     /// LaunchAgent 的启动命令。
     ///
     /// 跑在 `.app` 里时要通过 `open -g` 拉起整个包：直接执行
-    /// `Contents/MacOS/traffic-monitor` 会丢掉 bundle 身份，
+    /// `Contents/MacOS/tramoing` 会丢掉 bundle 身份，
     /// LSUIElement（不进 Dock）、图标、容器目录全都不生效，
     /// 系统还会弹一条「App 后台活动」。
     fn launch_argv(exe: &Path) -> Vec<String> {
@@ -176,12 +176,12 @@ mod imp {
         fn bundle_path_is_recovered() {
             assert_eq!(
                 app_bundle_of(Path::new(
-                    "/Applications/TrafficMonitor.app/Contents/MacOS/traffic-monitor"
+                    "/Applications/Tramoing.app/Contents/MacOS/tramoing"
                 )),
-                Some(PathBuf::from("/Applications/TrafficMonitor.app"))
+                Some(PathBuf::from("/Applications/Tramoing.app"))
             );
             assert_eq!(
-                app_bundle_of(Path::new("/Users/x/code/target/debug/traffic-monitor")),
+                app_bundle_of(Path::new("/Users/x/code/target/debug/tramoing")),
                 None
             );
         }
@@ -189,12 +189,12 @@ mod imp {
         #[test]
         fn launch_uses_open_inside_bundle() {
             let argv = launch_argv(Path::new(
-                "/Applications/TrafficMonitor.app/Contents/MacOS/traffic-monitor",
+                "/Applications/Tramoing.app/Contents/MacOS/tramoing",
             ));
             assert_eq!(argv[0], "/usr/bin/open");
-            assert_eq!(argv[2], "/Applications/TrafficMonitor.app");
+            assert_eq!(argv[2], "/Applications/Tramoing.app");
 
-            let dev = launch_argv(Path::new("/Users/x/code/target/debug/traffic-monitor"));
+            let dev = launch_argv(Path::new("/Users/x/code/target/debug/tramoing"));
             assert_eq!(dev.len(), 1, "开发时直接执行自身，不要绕 open");
         }
 
@@ -203,7 +203,7 @@ mod imp {
         /// 这里**不能**调 `set_enabled`：它会跑 `launchctl bootstrap`，
         /// 而测试进程的 `current_exe` 是测试二进制本身——真注册上去，
         /// 下次登录会跑一遍整个测试套件。要真机验证请用
-        /// `traffic-monitor --autostart on`。
+        /// `tramoing --autostart on`。
         #[test]
         fn plist_write_remove_roundtrip() {
             let dir = std::env::temp_dir().join("tm-test-launchagent");
@@ -228,42 +228,25 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use std::process::Command;
-
-    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    // 注册表读写放在 tm-windows 里：那个 crate 才有 windows-sys 依赖，
+    // 也符合「Windows 系统调用集中在 tm-windows」的分层。
     const VALUE: &str = "TrafficMonitor";
 
     pub fn is_enabled() -> bool {
-        Command::new("reg")
-            .args(["query", RUN_KEY, "/v", VALUE])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        tm_windows::registry_run::value_exists(VALUE)
     }
 
     pub fn set_enabled(on: bool) -> Result<(), String> {
-        if on {
-            let exe = std::env::current_exe().map_err(|e| format!("取不到自身路径：{e}"))?;
-            let quoted = format!("\"{}\"", exe.display());
-            run(&[
-                "add", RUN_KEY, "/v", VALUE, "/t", "REG_SZ", "/d", &quoted, "/f",
-            ])
+        let exe = if on {
+            std::env::current_exe()
+                .map_err(|e| format!("取不到自身路径：{e}"))?
+                .display()
+                .to_string()
         } else {
-            let _ = run(&["delete", RUN_KEY, "/v", VALUE, "/f"]);
-            Ok(())
-        }
-    }
-
-    fn run(args: &[&str]) -> Result<(), String> {
-        let out = Command::new("reg")
-            .args(args)
-            .output()
-            .map_err(|e| format!("调用 reg.exe 失败：{e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
-        }
+            String::new()
+        };
+        tm_windows::registry_run::set_value(VALUE, on, &exe)
+            .map_err(|code| format!("写入注册表失败（Win32 错误 {code}）"))
     }
 }
 

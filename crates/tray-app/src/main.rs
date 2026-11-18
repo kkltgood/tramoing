@@ -32,7 +32,7 @@ fn main() -> eframe::Result<()> {
         std::env::set_var("TM_SHOW_ON_START", "1");
         std::env::set_var("TM_VIEW", "settings");
     }
-    // 无界面导出，方便脚本或定时任务调用：traffic-monitor --export
+    // 无界面导出，方便脚本或定时任务调用：tramoing --export
     if args.iter().any(|a| a == "--export") {
         println!("{}", app::export_history_csv(true));
         return Ok(());
@@ -63,27 +63,40 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Tramoing")
+        // 高度固定：面板不再跟着内容伸缩，列表装不下就滚动
+        .with_inner_size([app::WINDOW_W, app::PANEL_H])
+        .with_min_inner_size([app::WINDOW_W, app::PANEL_H])
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_taskbar(false)
+        // active(false)：不抢焦点，否则点完图标切到别的应用时
+        // 这个窗口还占着 key window，交互会发涩。
+        .with_active(false);
+
+    // 「启动先收起来」两个平台的实现不一样：
+    // - macOS：直接隐藏窗口，原生状态项点击不依赖 eframe 的重绘循环；
+    // - Windows：**不能隐藏**。`WS_VISIBLE` 一去掉，winit 就停了
+    //   `RedrawRequested`，eframe 的 `update()` 跟着停摆 —— 托盘点击虽然进了
+    //   channel，但没人消费，表现就是「点图标没反应」。所以改成一开始就
+    //   摆在屏幕外（保持可见），点图标时再搬回来。
+    #[cfg(windows)]
+    let viewport = viewport
+        .with_position([-32000.0, -32000.0])
+        .with_visible(true);
+    #[cfg(not(windows))]
+    let viewport = viewport.with_visible(false);
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Traffic Monitor")
-            // 高度固定：面板不再跟着内容伸缩，列表装不下就滚动
-            .with_inner_size([app::WINDOW_W, app::PANEL_H])
-            .with_min_inner_size([app::WINDOW_W, app::PANEL_H])
-            .with_resizable(false)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_taskbar(false)
-            // 启动时先藏起来，等用户点状态栏图标再出现。
-            // active(false) 是配套的：不抢焦点，否则点完图标切到别的应用时
-            // 这个隐藏窗口还占着 key window，菜单栏交互会发涩。
-            .with_visible(false)
-            .with_active(false),
+        viewport,
         ..Default::default()
     };
 
     eframe::run_native(
-        "traffic-monitor",
+        "tramoing",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )

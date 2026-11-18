@@ -3,6 +3,11 @@
 //! 数据源是 `nettop` 子进程（免 root），配合 `libproc` 把 pid 还原成
 //! 「应用」——把 Chrome 的一堆 helper 进程合并成一行「Google Chrome」。
 
+// 整个 crate 都是 macOS 专属：workspace 里成员是无条件列出的，
+// Windows 上 `cargo check --workspace` 也会来编它。crate 级门控之后，
+// 非 macOS 平台编出来是个空 crate，不会去碰 libc / objc2 这些 macOS-only 依赖。
+#![cfg(target_os = "macos")]
+
 pub mod appid;
 pub mod icon;
 pub mod nettop;
