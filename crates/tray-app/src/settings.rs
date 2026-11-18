@@ -47,8 +47,9 @@ pub struct Settings {
     pub tray_mode: TrayMode,
     pub theme: ThemeMode,
     pub lang: LangMode,
-    /// 列表最多显示几个应用
-    pub row_limit: usize,
+    /// 列表最多列出几个应用。超出这个数量的应用不参与展示（按流量从高到低截断），
+    /// 超过可视行数的那部分靠滚动查看。
+    pub max_apps: usize,
     /// 历史保留天数
     pub retention_days: i64,
     /// 近 10 分钟单应用超过这个 MB 数就在面板里提醒；0 表示关闭
@@ -63,7 +64,7 @@ impl Default for Settings {
             tray_mode: TrayMode::Both,
             theme: ThemeMode::System,
             lang: LangMode::Auto,
-            row_limit: 8,
+            max_apps: 10,
             retention_days: 30,
             alert_mb: 0,
             tray_color: true,
@@ -121,9 +122,16 @@ impl Settings {
                         s.lang = m;
                     }
                 }
+                "max_apps" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        s.max_apps = snap_options(n);
+                    }
+                }
+                // 旧版本这个键叫 row_limit，语义是「可视行数」。
+                // 读到时按新语义接住，别让升级把用户的选择重置成默认值。
                 "row_limit" => {
                     if let Ok(n) = v.parse::<usize>() {
-                        s.row_limit = n.clamp(3, 20);
+                        s.max_apps = snap_options(n);
                     }
                 }
                 "retention_days" => {
@@ -168,16 +176,27 @@ impl Settings {
              tray_mode={tray}\n\
              theme={theme}\n\
              lang={lang}\n\
-             row_limit={}\n\
+             max_apps={}\n\
              retention_days={}\n\
              alert_mb={}\n\
              tray_color={}\n",
-            self.row_limit,
+            self.max_apps,
             self.retention_days,
             self.alert_mb,
             if self.tray_color { "on" } else { "off" }
         )
     }
+}
+
+/// 把任意数字吸附到界面上真实提供的三档。
+///
+/// 配置文件是可以手改的，旧版本也会写下 8 / 12 这种值。如果原样留着，
+/// 设置页会一个选项都点不亮（`option_row` 找不到匹配项就落在第一档上）。
+fn snap_options(n: usize) -> usize {
+    [5usize, 10, 20]
+        .into_iter()
+        .min_by_key(|o| o.abs_diff(n))
+        .unwrap_or(10)
 }
 
 fn parse_tray(v: &str) -> Option<TrayMode> {
@@ -219,7 +238,7 @@ mod tests {
             tray_mode: TrayMode::SpeedOnly,
             theme: ThemeMode::Dark,
             lang: LangMode::En,
-            row_limit: 12,
+            max_apps: 20,
             retention_days: 90,
             alert_mb: 500,
             tray_color: false,
@@ -244,19 +263,26 @@ mod tests {
             # 注释\n\
             \n\
             theme=neon\n\
-            row_limit=abc\n\
+            max_apps=abc\n\
             future_key=42\n\
             lang=en\n";
         let s = Settings::parse(text);
         assert_eq!(s.theme, ThemeMode::System, "非法值应该退回默认");
-        assert_eq!(s.row_limit, 8, "非法数字应该退回默认");
+        assert_eq!(s.max_apps, 10, "非法数字应该退回默认");
         assert_eq!(s.lang, LangMode::En, "同一行里的合法值仍要生效");
     }
 
     #[test]
+    fn legacy_visible_rows_key_still_loads() {
+        // 旧版本写的是 row_limit（可视行数）。升级后不能被当成未知键丢掉。
+        let s = Settings::parse("row_limit=12");
+        assert_eq!(s.max_apps, 10, "旧键要按「最多展示」接住，并吸附到最近的档位");
+    }
+
+    #[test]
     fn values_are_clamped() {
-        let s = Settings::parse("row_limit=999\nretention_days=-5\nalert_mb=999999999999");
-        assert_eq!(s.row_limit, 20);
+        let s = Settings::parse("max_apps=999\nretention_days=-5\nalert_mb=999999999999");
+        assert_eq!(s.max_apps, 20, "超出档位要吸附到最大一档");
         assert_eq!(s.retention_days, 1, "少于一天等于没有历史，夹到 1");
         assert_eq!(s.alert_mb, 1024 * 1024);
     }

@@ -66,10 +66,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Traffic Monitor")
-            .with_inner_size([app::WINDOW_W, app::WINDOW_H])
-            // 最小高度必须远小于初始高度：面板高度会随内容自适应，
-            // 这里设成 WINDOW_H 的话会把缩小请求夹住，底部留一块空白。
-            .with_min_inner_size([app::WINDOW_W, 160.0])
+            // 高度固定：面板不再跟着内容伸缩，列表装不下就滚动
+            .with_inner_size([app::WINDOW_W, app::PANEL_H])
+            .with_min_inner_size([app::WINDOW_W, app::PANEL_H])
             .with_resizable(false)
             .with_decorations(false)
             .with_transparent(true)

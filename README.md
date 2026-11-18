@@ -4,7 +4,7 @@
 
 - **版本**：0.1.0
 - **技术栈**：纯 Rust + egui / eframe，无 Electron、无 Python、无外部运行时
-- **当前状态**：macOS 已完成并打包验证；Windows 代码完成、已通过交叉编译检查，**等待真机功能测试与 ETW 事件表校准**（见 [第 6 节](#6-windows-真机测试指南)）
+- **当前状态**：macOS 已完成并打包验证；Windows 代码完成、`tray-app` 与 `tm-windows` 已通过交叉编译检查（0 警告），**等待真机功能测试与 ETW 事件表校准**（见 [第 6 节](#6-windows-真机测试指南)，本轮修复见 [6.8](#68-本轮修复windows-面板定位等)）
 
 ![主面板](docs/screenshot-panel.png)
 
@@ -60,7 +60,7 @@ traffic-monitoring/
 │   ├── tm-core/                   # 平台无关的速率/窗口聚合核心
 │   ├── tm-sampler/                # Sampler trait + MockSampler
 │   ├── tm-macos/                  # macOS：nettop 采集、应用归并、原生状态栏
-│   ├── tm-windows/                # Windows：ETW 助手、命名管道、进程路径
+│   ├── tm-windows/                # Windows：ETW 助手、命名管道、进程路径、屏幕工作区
 │   ├── tm-store/                  # SQLite 历史库（rusqlite bundled）
 │   ├── tm-spike-mac/              # macOS 探针小程序（开发用）
 │   └── tray-app/                  # egui 面板 + 设置 + 自启 + 采样线程
@@ -82,11 +82,11 @@ traffic-monitoring/
 | `tm-core` | 累计值差分、EMA 平滑、按应用归并、1m/5m/1h 窗口聚合 | 否，纯逻辑 |
 | `tm-sampler` | `Sampler` trait 与演示数据实现 | 否 |
 | `tm-macos` | `nettop` 子进程 + pty、pid→应用归并、AppKit 图标/状态栏 | 仅 macOS |
-| `tm-windows` | ETW 会话、聚合、命名管道协议、进程路径解析 | 仅 Windows |
+| `tm-windows` | ETW 会话、聚合、命名管道协议、进程路径解析、屏幕工作区与任务栏明暗 | 仅 Windows |
 | `tm-store` | SQLite 建表/写入/查询/清理/CSV 导出 | 否（SQLite 已 bundled） |
 | `tray-app` | 采样线程、界面、设置、自启、导出 | 平台相关部分用 cfg 隔离 |
 
-**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 87 个测试里有一半以上与平台无关的原因。
+**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 96 个测试里有一半以上与平台无关的原因。
 
 ### 3.2 数据流
 
@@ -162,7 +162,8 @@ macOS 上必须放进 `.app` 包运行，直接跑 `target/debug/traffic-monitor
 | `TM_TRAY_PNG=/tmp/x.png` | macOS：把状态栏按钮离屏渲染成 PNG（状态项被折叠进 `«` 时唯一可靠的检查手段） |
 | `TM_NETTOP_BIN` | 覆盖 `nettop` 路径 |
 | `TM_DB_PATH` | 覆盖历史库路径 |
-| `TM_PANEL_Y` / `TM_SCROLL` | 截图时调整面板位置 / 列表滚动位置 |
+| `TM_PANEL_Y` / `TM_SCROLL` | 截图时调整面板位置 / 给列表一个初始滚动位置（之后照常按整行吸附） |
+| `TM_TRACE_LIST` | 打印列表可用高度、能放几行、整行高度，以及设置页余量（调固定高度时用） |
 
 ---
 
@@ -262,7 +263,7 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 | T4 | 进行一个已知方向的传输（如下载一个大文件） | 下行数字明显上升，上行不应同步暴涨 | 若相反，执行 6.5 校准 |
 | T5 | 打开 Chrome 等有多进程的程序 | 列表里合并为**一行**，不是五六个 `chrome.exe` | Windows 按 exe 全路径归并 |
 | T6 | 依次点击 `实时 / 1分钟 / 5分钟 / 1小时` | 列表内容随之变化，滑块滑到对应档位 | |
-| T7 | 设置页逐项切换：外观、语言、可视行数、保留天数、流量提醒 | 立即生效，关闭再打开设置仍保留 | 配置在 `%LOCALAPPDATA%\TrafficMonitor\settings.conf` |
+| T7 | 设置页逐项切换：外观、语言、最多展示、保留天数、流量提醒 | 立即生效，关闭再打开设置仍保留 | 配置在 `%LOCALAPPDATA%\TrafficMonitor\settings.conf` |
 | T8 | 设置里打开「开机自启」 | 注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\TrafficMonitor` 出现 | 命令行 `traffic-monitor.exe --autostart status` 可交叉验证 |
 | T9 | 等待 10 秒后查看数据目录 | 生成 `history.db`，且大小不再为 0 | 每 5 秒落一次盘 |
 | T10 | 点击面板左下「导出」 | `Downloads` 下出现 `TrafficMonitor-<时间戳>.csv` | 没有 Downloads 目录时退到应用数据目录 |
@@ -310,8 +311,10 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
-| 托盘图标不出现 | 资源管理器缓存 / 图标未加载 | 重启资源管理器；确认 `traffic-monitor.exe` 进程还活着 |
+| 托盘图标"不出现" | Win11 默认把新图标收进任务栏的 `«` 溢出区 | 点任务栏的 `«` 展开，把图标拖到常显区；确认 `traffic-monitor.exe` 进程还活着 |
+| 托盘图标看不见/几乎是空白 | 图标颜色跟任务栏底色撞了（深色任务栏要白线、浅色要黑线，代码已按注册表自适应，每 3 秒复查一次） | 若仍异常，记录 Windows 版本 + 任务栏明暗设置 |
 | 启动就弹出面板 | eframe 首帧强制显示（已在代码里连发 3 帧隐藏命令抵消） | 若复现，请记录 Windows 版本和是否首次启动 |
+| 点托盘图标后看不到面板 | 面板被摆到屏幕外（任务栏在底部却向下展开） | 已在 6.8 修复；若仍复现，记录任务栏停靠位置 + 显示器数量/缩放 |
 | 面板一直"等待数据"、没有应用列表 | 助手没装、没提权、或崩了 | 看 `helper.log`；确认计划任务状态；`tm-helper.exe --help` 会把用法写进 `helper.log` |
 | 有总流量但没有进程级数据 | helper 未运行或管道连不上 | 管理员运行 `--install`；检查 `\\.\pipe\traffic-monitor-v1` 是否存在 |
 | 上下行数字对调 | ETW 事件 ID 表不对 | 执行 6.5 |
@@ -325,10 +328,37 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 
 1. **ETW 事件 ID 表待校准**（6.5）——目前唯一未经真机确认的核心逻辑。
 2. **安装包脚本未真机验证**：`packaging/windows/build.ps1` 与 `traffic-monitor.nsi` 只在 macOS 上做过静态检查。
-3. **托盘文字三档在 Windows 无效果**：`tray-icon` 不支持文字标题，只有图标；「菜单栏配色」同理。这两项设置只影响 macOS。
+3. **任务栏没有速率文字**：Windows 托盘项不支持文字标题（`tray-icon` 的 `set_title` 只对 macOS 生效），
+   所以面板之外的实时速率只有一个出口——**鼠标悬停**（tooltip 每秒更新，显示 `↓ 1.2 MB/s  ↑ 180 KB/s`）。
+   设置页里「菜单栏」「菜单栏配色」两行因此只在 macOS 显示。
 4. **列表里是首字母色块，不是真实应用图标**：Windows 侧还没有用 `SHGetFileInfoW` 取图标，目前留了接口。
 5. **未做代码签名**：安装包会触发 SmartScreen 警告。
 6. 滚轮手感、极端长会话（>24h）的内存表现尚未验证。
+
+### 6.8 本轮修复（面板定位 / 设置页高度）
+
+之前 Windows 上有一批只在 macOS 验证过、Windows 分支从未真机跑过的逻辑，逐条修掉：
+
+| 问题 | 原因 | 修法 |
+|---|---|---|
+| 面板打开位置/方向都不对 | `place_below()` 写死「在图标下方展开」——macOS 菜单栏在顶部成立，Windows 任务栏在底部就把面板顶到屏幕外 | 方向由「图标在工作区上半还是下半」决定；工作区取图标所在显示器的 `rcWork`（扣掉任务栏），副屏/竖屏也准 |
+| 面板展开动画像在往下掉 | 窗口高度动画只钉了顶边 | 向上展开时每帧按当前高度重算顶边，底边始终贴着图标 |
+| 悬停看不到实时速率 | `sync_tray_title()` 开头 `if !macos { return }`，把 tooltip 一起跳过了 | tooltip 提到平台分支之外，两平台每秒更新 |
+| 托盘图标在深色任务栏上隐形 | 图标是给 macOS 模板图设计的纯黑 36px，Windows 照原样画 | 按注册表 `SystemUsesLightTheme` 出白线/黑线，32px；主题切换 3 秒内自动重画 |
+| 面板一打开就自己关掉 | Windows 的 `SetForegroundWindow` 可能被前台规则拒绝，焦点一直为 false 就触发「失焦收起」 | 只有**曾经拿到过焦点**才允许失焦收起；没焦点时再点一次图标收起 |
+| 界面全是英文 | 中文字体候选路径只有 macOS 的 | Windows 依次找 微软雅黑 / 等线 / 黑体 / 宋体，`.ttc` 用 `FontData::index` 取字面 |
+| 设置里两个开关调了没反应 | 那两个选项只在 macOS 生效，却照样显示 | Windows 上不再渲染这两行 |
+| 加载态只有三行灰条、下面一片空白 | 骨架屏写死画 3 行，而面板高度固定 | 骨架铺满可视行数（7 行）、逐行变淡，并画成同样的行盒；空状态文案在列表格里垂直居中 |
+| 点开设置时"卡一下 + 面板变矮" | 窗口高度按内容逐帧算出来，切页/换数据都会让它变 | **面板改成固定高度 411pt**（`PANEL_H`，正好 7 行列表）：列表吃掉剩余空间并按整行裁剪，超出滚动；页脚与设置页的"开机自启"都贴底。窗口尺寸从此不再变化 |
+| 列表滚动后上下各露半截行，底部还空一截 | ① 触控板停下时偏移量停在 12.3 这种半行值；② 列表下方无条件预留了提醒 22pt + 提示 18pt，没内容时就是一块死白 | ① 滚动停下后把偏移吸附到整行（`snap_scroll`）；② 只保留页脚带，提醒行真有内容时才占位；提示改画在页脚里，不再单占一行 |
+| 设置页中间一大块空白 | 7 行设置按 32.5pt 排，面板比内容高 110pt，全堆在"流量提醒"和"开机自启"之间 | 设置行改成 37pt 一行（行高 32 + 间距 5），并把面板高度压到刚好装下：余量只剩 10pt |
+| 列表看着像普通表格 | 行与行之间没有层级；`1.3 MB/s` 整串落字，单位占一半宽度；字母图标是一整块高饱和色块 | **每一行做成独立的小卡**：1px 淡描边 + 6pt 圆角 + 5pt 行距，条目边界一眼可见；数值用等宽字体、单位缩到 8.5pt 并收到固定单位列（小数点竖着对齐）；字母图标改成同色系淡底 + 亮字；悬停时底色提亮一档、描边渐变到强调色（120ms） |
+| 滚动条把手压在行盒描边上 | 用的是 egui 自带的浮动把手，它画在内容矩形之内 | 关掉自带把手，改成自绘的 3pt 指示条，专门占行盒右侧的 9pt 过道；滚动仍然按整行吸附 |
+| 菜单栏速率宽度来回跳 | 菜单栏项按标题宽度自适应，而 `compact()` 是"最短写法"：`9.9M`/`10M`、`56B`/`1.2M` 长度不同，`820K` 和 `1.2M` 长度相同但 K/M 字母宽度不同；空闲时 `0` 只有一个字符 | 速率固定成 **4 个字符**（`menu_speed`：`"  0B"`、`" 820K"`、`"1.2M"`），标题字体从"等宽数字"换成**整段等宽**（SF Mono）；实测连续 7 次刷新按钮宽度恒为 56×22（带图标 76×22） |
+
+验证方式：`cargo test --workspace`（96 个用例，含定位几何、滚动吸附、速率定宽的单测）；
+`cargo check --target x86_64-pc-windows-msvc`（`tray-app` + `tm-windows`，0 警告）。
+真机行为仍需按 6.4 的用例表复测。
 
 ---
 
@@ -343,7 +373,7 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 | `tray_mode` | `both` / `speed` / `icon` | `both` | 旧值 `full`→`both`、`compact`→`speed` 自动兼容 |
 | `theme` | `system` / `light` / `dark` | `system` | |
 | `lang` | `auto` / `zh` / `en` | `auto` | auto 按是否有中文字体决定 |
-| `row_limit` | 3~20 | `8` | 列表最多显示几行 |
+| `max_apps` | 5 / 10 / 20 | `10` | 列表最多列出几个应用；装不下或超出可视行数时滚动查看。旧键 `row_limit` 仍可读，会吸附到最近的档位 |
 | `retention_days` | 1~365 | `30` | 历史保留天数 |
 | `alert_mb` | 0~1048576 | `0` | 近 10 分钟单应用超阈值提醒，0 关闭 |
 | `tray_color` | `on` / `off` | `on` | 仅 macOS 有效 |

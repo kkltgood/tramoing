@@ -4,6 +4,7 @@
 //! `HKCU\...\Run` 注册表项。两边都是「当前用户」级别，不需要管理员权限，
 //! 也不会在系统里留下需要卸载的服务。
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
 /// 自启状态。
@@ -227,7 +228,6 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use super::*;
     use std::process::Command;
 
     const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";

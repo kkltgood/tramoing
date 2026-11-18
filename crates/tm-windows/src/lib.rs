@@ -27,6 +27,10 @@ pub mod pipe;
 pub mod proc;
 #[cfg(windows)]
 pub mod sampler;
+#[cfg(windows)]
+pub mod screen;
+#[cfg(windows)]
+pub mod theme;
 
 #[cfg(windows)]
 pub use sampler::WindowsSampler;

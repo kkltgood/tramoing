@@ -74,10 +74,16 @@ const BASELINE_SHIFT: f64 = -4.0;
 
 /// 标题字号取系统菜单栏字体大小，保证和旁边的输入法、电量图标一个高度。
 fn title_font() -> Retained<NSFont> {
-    // 等宽数字：速率每帧都在变，比例数字会让整段标题左右抖动。
+    // **整段等宽**，不只是数字。
+    //
+    // 数值本身已经固定成 4 个字符（`tray-app` 的 `menu_speed`），但 K/M/B
+    // 这些单位字母在比例字体里宽度不同：`820K` 和 `1.2M` 都是 4 字符，
+    // 宽度却能差一两个像素，菜单栏项照样会左右挪。全等宽之后，字符数相同
+    // 宽度就相同，整块标题一个像素都不会变。
+    //
     // 权重 medium 而不是 semibold —— 菜单栏里其他文字都是 regular，
     // semibold 会显得比系统时间还重，像在喊。
-    unsafe { NSFont::monospacedDigitSystemFontOfSize_weight(FONT_SIZE, NSFontWeightMedium) }
+    unsafe { NSFont::monospacedSystemFontOfSize_weight(FONT_SIZE, NSFontWeightMedium) }
 }
 
 /// 状态栏当前是不是深色。`name` 里带 `Dark` 的就是。

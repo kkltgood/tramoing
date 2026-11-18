@@ -1,10 +1,15 @@
 //! 主题与字体。
 //!
-//! egui 自带字体不含中文，直接显示会变成方块。macOS 上没有单独的 CJK `.ttf`
-//! （大多是 `.ttc` 字体集合，ab_glyph 不支持），只有
-//! `/System/Library/Fonts/Supplemental/Arial Unicode.ttf` 是单文件字体，
-//! 所以优先用它，找不到就把界面切成英文 —— 绝不能给用户看一屏方块。
+//! egui 自带字体不含中文，直接显示会变成方块。两个平台的系统字体形态不一样：
+//!
+//! - macOS 没有单文件 CJK `.ttf`（大多是 `.ttc` 字体集合），只有
+//!   `/System/Library/Fonts/Supplemental/Arial Unicode.ttf` 是单文件；
+//! - Windows 全是 `.ttc`（微软雅黑、宋体）或单文件（黑体、等线），
+//!   但 egui 的 `FontData` 带 `index` 字段，`.ttc` 取第 0 个字面是支持的。
+//!
+//! 找不到就把界面切成英文 —— 绝不能给用户看一屏方块。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -25,25 +30,70 @@ impl Lang {
     }
 }
 
-const CJK_CANDIDATES: &[&str] = &[
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/Library/Fonts/Arial Unicode.ttf",
-];
+/// 一个候选字体：文件路径 + 集合内的字面序号（单文件字体恒为 0）。
+struct Candidate {
+    path: PathBuf,
+    index: u32,
+}
+
+fn candidates() -> Vec<Candidate> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            Candidate {
+                path: PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+                index: 0,
+            },
+            Candidate {
+                path: PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+                index: 0,
+            },
+        ]
+    }
+
+    #[cfg(windows)]
+    {
+        // 不写死 C: —— 系统盘符可以改，WINDIR 才是准的
+        let fonts = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+
+        let pick = |name: &str| Candidate {
+            path: fonts.join(name),
+            index: 0,
+        };
+
+        vec![
+            pick("msyh.ttc"),   // 微软雅黑（Win7+ 都有）
+            pick("Deng.ttf"),   // 等线（Win10+）
+            pick("simhei.ttf"), // 黑体（最老的兜底，一定在）
+            pick("simsun.ttc"), // 宋体
+        ]
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Vec::new()
+    }
+}
 
 /// 尝试安装中文字体，成功返回所用文件路径。
 pub fn install_cjk(ctx: &egui::Context) -> Option<String> {
-    for path in CJK_CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
+    for c in candidates() {
+        let Ok(bytes) = std::fs::read(&c.path) else {
             continue;
         };
-        if !looks_like_single_font(&bytes) {
+        if !looks_like_font(&bytes) {
             continue;
         }
+
+        let mut data = egui::FontData::from_owned(bytes);
+        // `.ttc` 是字体集合，用第 index 个字面；单文件字体这个值恒为 0
+        data.index = c.index;
+
         let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "cjk".to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
-        );
+        fonts.font_data.insert("cjk".to_owned(), Arc::new(data));
         // 放在最前面：中英文混排时优先用它的中文字形
         if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             family.insert(0, "cjk".to_owned());
@@ -53,17 +103,20 @@ pub fn install_cjk(ctx: &egui::Context) -> Option<String> {
             family.push("cjk".to_owned());
         }
         ctx.set_fonts(fonts);
-        return Some((*path).to_owned());
+        return Some(c.path.display().to_string());
     }
     None
 }
 
-/// 只接受单字体文件（TrueType / OpenType），排除 `.ttc` 集合。
-fn looks_like_single_font(bytes: &[u8]) -> bool {
-    bytes.len() > 16
+/// 只接受字体文件（TrueType / OpenType / 字体集合），排除把图片之类当字体读进去。
+///
+/// 前四个字节就够判断了：`00 01 00 00` / `true` / `OTTO` / `ttcf`。
+fn looks_like_font(bytes: &[u8]) -> bool {
+    bytes.len() > 12
         && (bytes.starts_with(&[0x00, 0x01, 0x00, 0x00])
             || bytes.starts_with(b"true")
-            || bytes.starts_with(b"OTTO"))
+            || bytes.starts_with(b"OTTO")
+            || bytes.starts_with(b"ttcf"))
 }
 
 /// 一套配色。跟随系统明暗模式。
@@ -115,9 +168,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_font_collections() {
-        assert!(!looks_like_single_font(b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00\x00"));
-        assert!(looks_like_single_font(&[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]));
+    fn accepts_collections_but_not_garbage() {
+        // .ttc（字体集合）要收：Windows 的中文字体几乎都是集合，
+        // egui 的 FontData 带 index，取第 0 个字面就行
+        assert!(looks_like_font(
+            b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+        ));
+        assert!(looks_like_font(&[
+            0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+        ]));
+        // PNG 之类的二进制不能被当成字体读进去
+        assert!(!looks_like_font(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
     }
 
     #[test]
