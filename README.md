@@ -22,13 +22,31 @@
 
 ## 1. 功能清单
 
-### 1.1 菜单栏
+### 1.1 菜单栏 / 任务栏
+
+**macOS（状态栏文字）**
 
 - 波形图标 + 速率文字；速率每秒刷新一次
 - 上传 / 下载**上下两行**显示，上行绿箭头、下行蓝箭头，数字保持系统色（保证可读性）
 - 三档显示模式：`图标+网速` / `仅网速` / `仅图标`，运行时切换即时生效
 - 可选「单色」模式，全部文字跟随系统色
 - 鼠标悬停显示完整数值（菜单栏里只放得下缩写）
+
+**Windows（任务栏贴片）**
+
+Windows 的托盘图标是定死的方形槽（150% DPI 下 24×24），塞不进 `↓1.2M`，
+所以数字画在一个**独立的小窗口**里，位置落在任务栏条内、系统托盘区左侧：
+
+- 两行缩写：`↓ 7.5M` / `↑ 841K`，长度恒为 4 个字符，数字列不会左右跳。
+  方向图标是**手绘的细箭头**（竖杆 + 三角头），高度按数字字高对齐
+- 背景是**抠出来的**（纯黑颜色键），所以看起来就是任务栏自己的一部分，
+  不是浮在上面的小方块
+- **点贴片等于点托盘图标**：面板没开就打开、开着就收起（抠出来的区域收不到
+  鼠标消息，所以点击是自己轮询认的，见 [6.13](#613-windows-任务栏网速贴片)）
+- 任务栏上有别的同类工具（TrafficMonitor 之类）时自动让到它左边，两边的字不会叠在一起
+- 设置里可关（「任务栏网速」），也可以切「网速配色」彩色/单色
+
+![任务栏贴片](docs/screenshot-tray-badge.png)
 
 ### 1.2 弹出面板
 
@@ -55,6 +73,7 @@
 | 数据面板 | ![面板](docs/screenshot-panel.png) |
 | 加载骨架屏 | ![加载](docs/screenshot-loading.png) |
 | 设置页 | ![设置](docs/screenshot-settings.png) |
+| Windows 任务栏贴片 | ![任务栏](docs/screenshot-tray-badge.png) |
 
 ---
 
@@ -132,6 +151,8 @@ Windows:
 | 管道协议手写小端编码 | 一帧只有几个数字加进程名，省掉 serde/bincode 依赖和编译时间 |
 | macOS 给 `nettop` 开 pty | `nettop` 的 stdout 接管道时走 4KB 全缓冲，`-s 1` 实际 3 秒才吐一帧；接 tty 才是精确 1 秒 |
 | Windows 拆成两个进程 | ETW 按进程统计必须提权；助手提权跑，托盘程序始终普通权限 |
+| Windows 网速数字不画进托盘图标，另开一个贴片窗口 | `Shell_NotifyIcon` 只接受方形小图标，`↓1.2M` 塞进去会被系统缩成一团糊；图标槽的 rect 是壳定死的，撑开 HICON 也没用 |
+| 贴片用**颜色键**抠背景，不用逐像素 alpha | eframe 的 GL 配置在这台机器上没有 alpha 通道（`Cannot create transparent window`），`UpdateLayeredWindow` 那套用不上；纯黑颜色键既能抠干净，又顺带让鼠标穿透。详见 [6.13](#613-windows-任务栏网速贴片) |
 
 ---
 
@@ -465,6 +486,61 @@ winit 就不再派发 `RedrawRequested`，eframe 的 `update()` 整个停摆 —
 向 `tray_icon_app` 窗口模拟点击，连续三轮「开 → 收 → 开」都正确：
 打开时窗口在 `(2127, 973)`，收起时回到 `-32000` 屏幕外，面板内容完整渲染。
 `TM_TRACE_FRAMES=1` 可以看到收起后 `[ui] frame=` 依旧每 30 帧打一次（说明 update 没停）。
+
+### 6.13 Windows 任务栏网速贴片
+
+**目标**：像 TrafficMonitor 那样，把上下行速率直接显示在**任务栏条里**，
+而不是浮在任务栏上方的一块小卡片。
+
+**为什么不能画进托盘图标**：`Shell_NotifyIcon` 只接受方形小图标（150% DPI
+下 24×24），`↓1.2M` 这种宽内容会被系统等比缩成一团糊；图标槽的 rect 由壳
+决定，撑大 HICON 也没用。所以数字必须由**另一个窗口**来画。
+
+**位置**：`Shell_TrayWnd`（任务栏整条）→ `TrayNotifyWnd`（托盘区）→ 贴片
+放在托盘区左缘再往左 `GAP` 处，纵向按任务栏高度居中。任务栏上如果已经插着
+别的同类工具（`Shell_TrayWnd` 里不属于系统类的子窗口，TrafficMonitor 就是
+一个 `#32770`），贴片继续往左让，避免两边文字叠在一起。
+
+**方向图标**：手绘的细箭头（竖杆 + 三角头），不用 `↓`/`↑` 字符（字体缺字形
+就是个方块）；箭头高度按数字的**字高**对齐，不要更高——11pt 那种高度试过，
+两个箭头会把视觉重心全抢走，数字显得又小又灰。箭头比文字基线再上提 0.5pt，
+因为 `layout_no_wrap` 量出来的中心含了下沉部。
+
+**点击**：点贴片和点托盘图标完全等价（`toggle`），但**锚点不同**：点贴片时
+面板以**贴片自己**为锚点（`TrayEvent::BadgeClick`），不是托盘图标。贴片和托盘
+图标之间常常隔着一整个第三方插件（TrafficMonitor 那种），按托盘图标摆的话，
+点最左边的数字、面板却从右边托盘上方冒出来，偏出去三百多像素。这里有个反直觉的坑：
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 只有笔画本身能点，箭头/数字之间的留白点不到 | 颜色键分层窗口的命中测试是**按像素**走的，抠掉的像素在系统眼里根本不属于这个窗口；`WM_NCHITTEST` 返回 `HTCLIENT` 也没用（那一步在窗口过程之前就做完了，实测无效），`SetWindowRgn` 覆盖整块矩形也没用 | 后台线程每 12ms 读一次 `GetCursorPos` + `GetAsyncKeyState(VK_LBUTTON)`，按下和抬起都落在贴片矩形里就算一次点击（按住超过 900ms 或者中途拖出去不算）。贴片周围留 40px 的「快速区」也用 12ms 采样，否则一次 30ms 的快速点击可能整个落在两次慢轮询之间 |
+
+不用全局鼠标钩子（`WH_MOUSE_LL`）：那会进到系统输入链路里，我们这条线程
+一卡，整机的鼠标都跟着卡。也别想靠 `SetWindowSubclass` 做命中测试——它只在
+comctl32 **v6** 里，没有应用清单的程序会被加载 5.82，静态导入的结果是整个
+进程起不来（退出码 127 / `ERROR_PROC_NOT_FOUND`，一行日志都没有）。
+
+矩形由轮询线程自己按窗口句柄 `GetWindowRect`，**不要**从主循环传过去：
+`update()` 空闲时只有 1Hz，而贴片的落位是子 viewport 自己自校正的，刚启动
+或任务栏重排那一两秒会点不中（踩过一次，点下去完全没反应）。
+
+**渲染的四个坑（都踩过，勿回退）**
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 窗口位置、样式、Z 序全对，就是一个像素都不显示 | 用 `show_viewport_immediate` 建子 viewport：它的 `swap_buffers` 走父窗口那一帧的 GL 上下文切换，画完屏幕上什么都没有（连不透明洋红测试块都看不见） | 换成 `show_viewport_deferred`（走和主窗口相同的渲染通道）。代价是回调必须 `'static + Send + Sync`，数据走 `Arc<Mutex<BadgeData>>` |
+| 贴片是一块黑方块 | 窗口是 GL 画的，而 eframe 拿到的 GL 配置**没有 alpha 通道**（启动日志 `Cannot create transparent window: the GL config does not support it`），`glClear(0,0,0,0)` 的 alpha 被丢掉 | `WS_EX_LAYERED` + `SetLayeredWindowAttributes(hwnd, 0, 0, LWA_COLORKEY)`：把纯黑整片抠成透明。抗锯齿过渡像素是「文字色×覆盖率」不是纯黑，不会被误抠。顺带抠掉的区域鼠标也穿透 |
+| 一开始完全不显示 / 后来又能显示 | 想用 `with_mouse_passthrough(true)` 做穿透，winit 那条路加的是 `WS_EX_TRANSPARENT \| WS_EX_LAYERED`，而**没有分层属性的分层窗口不会被合成** | 不碰 `with_mouse_passthrough`，穿透交给颜色键 |
+| 贴片毫无征兆地消失，过一会儿又出现 | 任务栏自己也是 TOPMOST，它每次重绘（时间跳一分钟、托盘图标变化）都会把自己重新提到最前 | `tune()` 每次更新都 `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` 重新申明一次；样式位也一样会被 winit 按 `WindowFlags` 重算掉，所以 `tune()` 是幂等的、每帧都调 |
+
+**进不进 Alt+Tab / 抢不抢焦点**：`WS_EX_TOOLWINDOW`（不进 Alt+Tab）、
+`WS_EX_NOACTIVATE`（点了不激活）。这两个位 winit 也会覆盖，同样靠幂等的
+`tune()` 每秒补一次。
+
+**排查**：`TM_TRACE_BADGE=1` 会打贴片的 `screen/inner/outer` 和实际缩放；
+`TM_LOG=1` 把 eframe/winit 的内部日志接到 stderr（`swap_buffers failed`
+这类错误平时是静默的）。`scripts/grab.py` 是 DPI 感知的屏幕抓图小工具，
+截图核对时用它，别用 DPI 无感的截图（3840×2160@150% 下会差 1.5 倍）。
 
 
 

@@ -158,6 +158,14 @@ enum TrayEvent {
     /// `«` 溢出区时，`Shell_NotifyIconGetRect` 会失败，那时就用点击事件
     /// 里带的位置兜底，否则点了完全没反应。
     Click { fallback: Option<IconRect> },
+    /// 用户点了任务栏上的网速贴片（Windows 专属）。
+    ///
+    /// 和托盘点击分开记，是因为**锚点不一样**：贴片在任务栏条里，和托盘
+    /// 图标之间可能隔着一整个第三方插件（TrafficMonitor 那种）。按托盘
+    /// 图标摆的话，点最左边的数字、面板却从右边托盘上方冒出来，看着像点
+    /// 错了东西。这里直接以被点的贴片为锚点——点哪儿弹哪儿。
+    #[cfg(windows)]
+    BadgeClick { at: IconRect },
 }
 
 // tray-icon 只允许注册一个全局回调，所以用全局 channel 把事件转回 App。
@@ -228,6 +236,9 @@ pub struct App {
     /// 上次检查系统主题的时间。注册表读一次是微秒级，但也没必要每帧读。
     #[cfg(windows)]
     theme_check_at: Instant,
+    /// 任务栏上方的网速贴片（Windows 专属，见 [`crate::badge_window`]）
+    #[cfg(windows)]
+    badge: crate::badge_window::Badge,
     /// 第几帧（只给 `TM_TRACE_FRAMES` 诊断用）
     frame_no: u64,
     /// 首帧是否已经做过「可见但停在屏幕外」的兜底设置。
@@ -364,6 +375,8 @@ impl App {
             taskbar_light: tm_windows::theme::taskbar_is_light(),
             #[cfg(windows)]
             theme_check_at: Instant::now(),
+            #[cfg(windows)]
+            badge: crate::badge_window::Badge::new(),
         };
 
         // 隐藏窗口不会驱动 eframe 的 update()，托盘图标必须在这里同步建好：
@@ -614,6 +627,32 @@ impl App {
         }
     }
 
+    /// 把最新的总速率推给任务栏贴片。
+    ///
+    /// 贴片现在嵌在任务栏条里，和面板（从任务栏上方弹出来）不重叠，
+    /// 所以面板展开时不必让它让位——一直显示反而更像任务栏自己的东西。
+    #[cfg(windows)]
+    fn sync_badge(&mut self, ctx: &egui::Context) {
+        use crate::badge_window::BadgeState;
+
+        let state = match (&self.latest, self.tray_icon_rect(ctx)) {
+            (Some(snap), Some(icon))
+                if self.settings.tray_badge && icon.w >= 1.0 && icon.h >= 1.0 =>
+            {
+                Some(BadgeState {
+                    icon,
+                    rx: snap.total_rx,
+                    tx: snap.total_tx,
+                    light: self.taskbar_light,
+                    colored: self.settings.tray_color,
+                })
+            }
+            // 还没第一帧数据、图标被 Win11 收进溢出区、用户关了贴片
+            _ => None,
+        };
+        self.badge.show(ctx, state);
+    }
+
     /// 状态栏图标在屏幕上的位置，单位是物理像素（`compute_placement` 的约定）。
     fn tray_icon_rect(&self, ctx: &egui::Context) -> Option<IconRect> {
         let tray = self.tray.as_ref()?;
@@ -677,6 +716,8 @@ impl eframe::App for App {
         self.sync_tray_theme();
         self.drain_engine();
         self.sync_tray_title();
+        #[cfg(windows)]
+        self.sync_badge(ctx);
         self.icons.poll();
 
         // 调试模式：摆到屏幕右上角，方便截图核对排版
@@ -731,11 +772,14 @@ impl eframe::App for App {
         }
 
         while let Ok(ev) = self.tray_rx.try_recv() {
-            let TrayEvent::Click { fallback } = ev;
-            match self.tray_icon_rect(ctx).or(fallback) {
-                Some(rect) => self.toggle(ctx, rect),
-                // 状态项还没被布局（刚创建的头几帧）就拿不到位置，这次点击直接忽略
-                None => eprintln!("[ui] 状态栏项还没有位置，忽略这次点击"),
+            match ev {
+                TrayEvent::Click { fallback } => match self.tray_icon_rect(ctx).or(fallback) {
+                    Some(rect) => self.toggle(ctx, rect),
+                    // 状态项还没被布局（刚创建的头几帧）就拿不到位置，这次点击直接忽略
+                    None => eprintln!("[ui] 状态栏项还没有位置，忽略这次点击"),
+                },
+                #[cfg(windows)]
+                TrayEvent::BadgeClick { at } => self.toggle(ctx, at),
             }
         }
 
@@ -906,6 +950,40 @@ impl App {
                 ui,
                 p,
                 lang.t("菜单栏配色", "Menu bar color"),
+                &mut self.settings.tray_color,
+                &[
+                    (true, lang.t("彩色", "Color")),
+                    (false, lang.t("单色", "Mono")),
+                ],
+            ) {
+                changed = true;
+            }
+        }
+
+        // ---- 任务栏（只有 Windows 有这回事）----
+        //
+        // Windows 的托盘图标是定死的方形槽，塞不进 `↓1.2M`；数字是画在图标
+        // 上方的独立贴片里的（`badge_window`）。所以这里的选项和 macOS 不同：
+        // 那边调的是「状态栏显示什么」，这边只有「贴片开不开」。
+        #[cfg(windows)]
+        {
+            if option_row(
+                ui,
+                p,
+                lang.t("任务栏网速", "Tray speed"),
+                &mut self.settings.tray_badge,
+                &[
+                    (true, lang.t("显示", "Show")),
+                    (false, lang.t("隐藏", "Hide")),
+                ],
+            ) {
+                changed = true;
+            }
+
+            if option_row(
+                ui,
+                p,
+                lang.t("网速配色", "Speed color"),
                 &mut self.settings.tray_color,
                 &[
                     (true, lang.t("彩色", "Color")),
@@ -2076,7 +2154,7 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     )
 }
 
-/// 菜单栏用的速率写法：**长度恒定为 4 个字符**，右对齐补空格。
+/// 菜单栏/贴片用的速率写法：**长度恒定为 4 个字符**，右对齐补空格。
 ///
 /// 菜单栏项是按标题宽度自适应的：文字一变长，整项就跟着变宽，右边的图标被
 /// 推着来回挪。以前这里是「最短写法」，`9.9M` 和 `10M`、`56B` 和 `1.2M`
@@ -2085,11 +2163,11 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 /// 现在只保证一件事：不管数值多少，结果都是 4 个字符——
 /// `"  0B"`、`"999B"`、`" 820K"`、`"1.2M"`、`" 12M"`、`"1.0G"`。
 /// 再配上 `tm_macos::title_font` 里的等宽字体，宽度一个像素都不会变。
+/// Windows 的贴片同理：宽度不变，数字列才不会左右抖。
 ///
 /// 阈值取 999.5 而不是 1024：`{:.0}` 会把 1023.6K 进位成 `1024K`（5 个字符），
 /// 所以提前一档换单位，保证取整后不会溢出 4 格。
-#[cfg(any(target_os = "macos", test))]
-fn menu_speed(bps: f64) -> String {
+pub(crate) fn menu_speed(bps: f64) -> String {
     const K: f64 = 1024.0;
     let b = bps.max(0.0);
     let (v, unit) = if b < 999.5 {
@@ -2211,6 +2289,40 @@ fn install_tray_handler() {
             }
         }
     }));
+}
+
+/// 点了任务栏上的网速贴片。
+///
+/// 和点托盘图标共用同一套开合逻辑（`toggle`），只是**锚点用贴片自己**：
+/// 贴片所在的位置和托盘图标可能差好几百像素，用托盘图标当锚点的话，
+/// 点最左边的数字、面板却从右边冒出来，看着像点错了东西。
+///
+/// 贴片窗口拿不到 `&mut App`，所以只往 channel 里塞一条事件，真正的开合
+/// 仍然在 `update()` 里按状态决定——两边各记一份「面板开没开」迟早对不上。
+#[cfg(windows)]
+pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>) {
+    let Some(r) = at else {
+        // 连自己的矩形都拿不到（窗口正在销毁）：退回按托盘图标摆
+        if let Some(tx) = TRAY_TX.get() {
+            let _ = tx.send(TrayEvent::Click { fallback: None });
+        }
+        if let Some(ctx) = CTX.get() {
+            ctx.request_repaint();
+        }
+        return;
+    };
+    let at = IconRect {
+        x: r.x as f32,
+        y: r.y as f32,
+        w: r.w as f32,
+        h: r.h as f32,
+    };
+    if let Some(tx) = TRAY_TX.get() {
+        let _ = tx.send(TrayEvent::BadgeClick { at });
+    }
+    if let Some(ctx) = CTX.get() {
+        ctx.request_repaint();
+    }
 }
 
 /// 一块屏幕区域，单位**物理像素**。面板定位的数学全在这个单位下做，

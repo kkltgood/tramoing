@@ -56,6 +56,11 @@ pub struct Settings {
     pub alert_mb: u64,
     /// 菜单栏用彩色区分上下行。关掉后统一跟随系统色，适合喜欢素一点的菜单栏
     pub tray_color: bool,
+    /// 是否在托盘图标上方显示网速贴片（只在 Windows 生效）。
+    ///
+    /// Windows 的托盘图标是定死的方形，塞不进 `↓1.2M`，数字只能画在图标
+    /// 上方那个自绘小窗口里；不想看的人可以在这里关掉。
+    pub tray_badge: bool,
 }
 
 impl Default for Settings {
@@ -68,6 +73,7 @@ impl Default for Settings {
             retention_days: 30,
             alert_mb: 0,
             tray_color: true,
+            tray_badge: true,
         }
     }
 }
@@ -149,6 +155,11 @@ impl Settings {
                     "off" | "false" | "0" => s.tray_color = false,
                     _ => {}
                 },
+                "tray_badge" => match v {
+                    "on" | "true" | "1" => s.tray_badge = true,
+                    "off" | "false" | "0" => s.tray_badge = false,
+                    _ => {}
+                },
                 _ => {} // 未知键忽略：旧版本写的字段不该让新版本报错
             }
         }
@@ -179,11 +190,13 @@ impl Settings {
              max_apps={}\n\
              retention_days={}\n\
              alert_mb={}\n\
-             tray_color={}\n",
+             tray_color={}\n\
+             tray_badge={}\n",
             self.max_apps,
             self.retention_days,
             self.alert_mb,
-            if self.tray_color { "on" } else { "off" }
+            if self.tray_color { "on" } else { "off" },
+            if self.tray_badge { "on" } else { "off" }
         )
     }
 }
@@ -242,6 +255,7 @@ mod tests {
             retention_days: 90,
             alert_mb: 500,
             tray_color: false,
+            tray_badge: false,
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }

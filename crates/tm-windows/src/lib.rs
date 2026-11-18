@@ -20,6 +20,8 @@ pub mod agg;
 pub mod proto;
 
 #[cfg(windows)]
+pub mod badge;
+#[cfg(windows)]
 pub mod etw;
 #[cfg(windows)]
 pub mod icon;

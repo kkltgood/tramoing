@@ -11,6 +11,9 @@
 
 mod app;
 mod autostart;
+// Windows 任务栏的网速贴片。macOS 的状态栏能直接写文字，用不到这个窗口。
+#[cfg(windows)]
+mod badge_window;
 mod engine;
 mod icon;
 mod icons;
@@ -19,7 +22,34 @@ mod theme;
 
 use eframe::egui;
 
+/// `TM_LOG=1` 时把 eframe/winit 的内部日志接到 stderr。
+///
+/// 平时不能接：release 是 GUI 子系统，这些日志没人看还多一层开销。
+/// 排查「窗口不对/画不出来」这类问题时它是第一现场——eframe 把
+/// `swap_buffers failed`、`was not created on main thread` 这类关键信息
+/// 全打在 log 里，没装 logger 就等于没发生过。
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        meta.level() <= log::Level::Info
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
+
 fn main() -> eframe::Result<()> {
+    if std::env::var_os("TM_LOG").is_some() {
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Info);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--mock") {
         std::env::set_var("TM_FORCE_MOCK", "1");

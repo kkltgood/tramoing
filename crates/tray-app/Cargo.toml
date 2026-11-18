@@ -13,6 +13,9 @@ tm-core = { path = "../tm-core" }
 tm-sampler = { path = "../tm-sampler" }
 tm-store = { path = "../tm-store" }
 eframe = "0.33"
+# 只为了把 eframe/winit 的内部告警接到 stderr（见 main.rs 的 `TM_LOG`）。
+# 没有它，多 viewport 出问题时只能看到一个「什么都没画」的窗口。
+log = "0.4"
 
 # 两个平台实现互斥：macOS 走 nettop（tm-macos），Windows 走 ETW 助手（tm-windows）。
 # 不能都当普通依赖，否则在 Windows 上会把 macOS 的 libproc FFI 也编进去。

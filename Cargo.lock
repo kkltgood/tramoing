@@ -3631,6 +3631,7 @@ name = "tray-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "log",
  "tm-core",
  "tm-macos",
  "tm-sampler",
