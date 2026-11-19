@@ -122,6 +122,10 @@ fn looks_like_font(bytes: &[u8]) -> bool {
 /// 一套配色。跟随系统明暗模式。
 pub struct Palette {
     pub panel: egui::Color32,
+    /// 卡片、设置分组的底色。
+    pub surface: egui::Color32,
+    /// 分段选项的选中底色。
+    pub selection: egui::Color32,
     pub text: egui::Color32,
     pub subtext: egui::Color32,
     /// 速率单位（`B/s`）、计数（`· 3`）这类「注脚」文字。
@@ -155,15 +159,17 @@ fn srgb(c: tm_core::Rgb) -> egui::Color32 {
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            panel: egui::Color32::from_rgb(28, 28, 32),
+            panel: egui::Color32::from_rgb(27, 29, 34),
+            surface: egui::Color32::from_rgb(35, 38, 44),
+            selection: egui::Color32::from_rgb(47, 65, 84),
             text: egui::Color32::from_rgb(238, 238, 242),
-            subtext: egui::Color32::from_rgb(148, 148, 156),
-            unit: egui::Color32::from_rgb(136, 136, 146),
+            subtext: egui::Color32::from_rgb(164, 171, 183),
+            unit: egui::Color32::from_rgb(148, 155, 168),
             accent: egui::Color32::from_rgb(94, 178, 255),
             download: srgb(tm_core::color::download(true)),
             upload: srgb(tm_core::color::upload(true)),
-            chip: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-            border: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+            chip: egui::Color32::from_rgb(28, 31, 37),
+            border: egui::Color32::from_rgb(54, 59, 69),
             warn: egui::Color32::from_rgb(240, 180, 90),
             switch_off: egui::Color32::from_rgb(66, 66, 72),
         }
@@ -172,17 +178,19 @@ pub fn palette(dark: bool) -> Palette {
         // 原来那套 (#787880 / 10% 底槽 / 10% 描边) 读起来像没画完。
         // 层次靠字号和颜色深浅区分，不靠「淡到几乎看不见」。
         Palette {
-            panel: egui::Color32::from_rgb(252, 252, 253),
+            panel: egui::Color32::from_rgb(246, 248, 251),
+            surface: egui::Color32::WHITE,
+            selection: egui::Color32::from_rgb(225, 238, 252),
             text: egui::Color32::from_rgb(24, 24, 28),
-            subtext: egui::Color32::from_rgb(92, 92, 101),
-            unit: egui::Color32::from_rgb(118, 118, 128),
+            subtext: egui::Color32::from_rgb(91, 101, 117),
+            unit: egui::Color32::from_rgb(105, 115, 130),
             accent: egui::Color32::from_rgb(20, 110, 200),
             download: srgb(tm_core::color::download(false)),
             upload: srgb(tm_core::color::upload(false)),
             // 底槽 = 分段控件的轨道：太淡就看不出「这是一组可选项」
-            chip: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22),
+            chip: egui::Color32::from_rgb(237, 240, 245),
             // 描边同时用于行卡片、分隔线和面板外框，26/255 在浅底上几乎没有边
-            border: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 36),
+            border: egui::Color32::from_rgb(221, 226, 234),
             warn: egui::Color32::from_rgb(166, 96, 8),
             switch_off: egui::Color32::from_rgb(184, 184, 192),
         }

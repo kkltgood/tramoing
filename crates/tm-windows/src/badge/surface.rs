@@ -11,6 +11,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA
 // 覆盖率，背景与真实任务栏最多相差一个色阶，整块控件仍接收原生鼠标消息。
 const HIT_ALPHA: u32 = 1;
 
+// 12px 字号下保留最宽四字符（如 999M）的空间，收紧箭头列及左右留白。
+pub(super) const WIDTH_DIP: i32 = 44;
+const ARROW_LEFT_DIP: i32 = 2;
+const ARROW_RIGHT_DIP: i32 = 10;
+const NUMBER_LEFT_DIP: i32 = 11;
+const RIGHT_PADDING_DIP: i32 = 2;
+
 pub(super) unsafe fn present(hwnd: HWND, content: &Content) -> Result<(), &'static str> {
     let rect = client_rect(hwnd).ok_or("无法读取网速控件尺寸")?;
     let size = SIZE {
@@ -155,8 +162,18 @@ unsafe fn rasterize(
     {
         // 箭头的列宽和位置独立于数字；数字单独右对齐，单位切换也不会挤动箭头。
         for (text, left, right, align) in [
-            (*arrow, 5 * dpi / 96, 17 * dpi / 96, DT_CENTER),
-            (number.trim(), 20 * dpi / 96, width - 5 * dpi / 96, DT_RIGHT),
+            (
+                *arrow,
+                ARROW_LEFT_DIP * dpi / 96,
+                ARROW_RIGHT_DIP * dpi / 96,
+                DT_CENTER,
+            ),
+            (
+                number.trim(),
+                NUMBER_LEFT_DIP * dpi / 96,
+                width - RIGHT_PADDING_DIP * dpi / 96,
+                DT_RIGHT,
+            ),
         ] {
             let text = wide(text);
             let mut rect = RECT {
@@ -220,10 +237,10 @@ mod tests {
 
     #[test]
     fn transparent_raster_keeps_arrows_fixed_across_rates_and_dpi() {
-        for dpi in [96, 144, 192] {
+        for dpi in [96, 120, 144, 192] {
             for light in [false, true] {
                 for colored in [false, true] {
-                    let width = 60 * dpi / 96;
+                    let width = WIDTH_DIP * dpi / 96;
                     let height = 48 * dpi / 96;
                     let mut baseline = None;
                     for (down, up) in [("  0B", "  9B"), ("1.6K", "875B"), ("999M", "1.5G")] {
@@ -253,7 +270,9 @@ mod tests {
                         .all(|c| *c <= p >> 24)));
                         let arrows: Vec<_> = pixels
                             .chunks_exact(width as usize)
-                            .flat_map(|row| row[..(20 * dpi / 96) as usize].iter().copied())
+                            .flat_map(|row| {
+                                row[..(NUMBER_LEFT_DIP * dpi / 96) as usize].iter().copied()
+                            })
                             .collect();
                         assert!(arrows.iter().any(|p| p >> 24 > HIT_ALPHA));
                         if let Some(expected) = &baseline {

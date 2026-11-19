@@ -128,7 +128,7 @@ impl TaskbarBadge {
     unsafe fn layout(&mut self) -> Result<(), &'static str> {
         let band = client_rect(self.shell).ok_or("无法读取任务栏布局")?;
         let dpi = GetDpiForWindow(self.shell).max(96) as i32;
-        let width = 60 * dpi / 96;
+        let width = surface::WIDTH_DIP * dpi / 96;
         let gap = 4 * dpi / 96;
         let tray = FindWindowExW(
             self.shell,
