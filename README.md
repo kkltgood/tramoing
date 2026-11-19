@@ -574,6 +574,53 @@ comctl32 **v6** 里，没有应用清单的程序会被加载 5.82，静态导�
 
 
 
+### 6.14 本轮修复（切页过渡 / 设置页底部圆角）
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 设置页的底部圆角比主面板小一档，看着像直角 | **`egui::Frame` 的底板是跟着内容长的**：`Frame::paint()` 用 `content_ui.min_rect()` 算背景矩形（egui-0.33.3 `containers/frame.rs`）。设置页的内容比可视区高出约 3pt（`add_space` / `separator` 各自都会再插一次 `item_spacing`，`pad` 永远摊不平），整块底板就被顶到窗口下面，14pt 的圆角滑出窗口，屏幕上只剩圆弧最上面那一小截 | 底板不再交给 `Frame` 画：改成 `ctx.layer_painter(LayerId::background()).rect(ctx.content_rect(), 14, …)` 钉死在窗口矩形上，`Frame` 只留 `inner_margin`。设置页底部块也改成「一次分配剩余矩形 + 在底边上定位」，内容高度不再影响底板 |
+| 从设置页退回主面板「啪」一下就换了，没有任何过渡 | `self.view` 是直接赋值的，两页之间没有状态 | 新增 `goto(view)` + `transition: Option<(from, Instant)>`：190ms 内两页同时画 —— 旧页前 45% 淡出并同向挪 1/3 行程，新页从 25% 起淡入、从 64pt 外滑进来。方向跟去向绑：进设置从右侧推入，返回从左侧推回 |
+
+两个实现细节（都踩过）：
+
+- **必须自己 `request_repaint()`**。空闲时面板只有 1Hz 心跳，190ms 的动画会被压成两帧
+  （看起来就是「跳了一下」）。`update()` 里加 `transitioning()` 判断，播完自动回到心跳。
+- **两页的 `Ui` 要用不同 `id_salt`**（`page-main` / `page-settings`）。egui 的控件 id 由
+  `ui.id()` 派生，两页共用一个 id 时开关/滑块的 `animate_*` 状态会串。
+- 不做「两页同时交叉淡化」：两页都是密集小字，重叠那几帧会互相透出来，读起来像重影。
+  错开后中间只有一瞬空底板，反而像翻过一页。
+
+验证：`scripts/grab.py`（或用 DPI 感知的 PrintWindow 抓 528×617 物理像素）对比两页底部
+40×32 区域，**逐像素相同**；过渡中间帧能看到旧页左移淡出、新页从右侧半透明滑入。
+
+### 6.15 任务栏贴片：跟任务栏一起隐藏（全屏游戏 / 右键菜单）
+
+贴片是**独立的一级窗口**（`WS_EX_LAYERED` 颜色键 + TOPMOST），系统不会替它收，
+所以要自己判断「这块地方现在该不该有它」—— 判据都在 `tm_windows::badge::taskbar_shown()`：
+
+| 症状 | 原因 | 修法 |
+|---|---|---|
+| 启动全屏游戏后，任务栏没了，网速还挂在原来的位置 | 只算了坐标，没管任务栏的可见性 | `IsWindowVisible(Shell_TrayWnd)` 为假（全屏应用把任务栏收了）就直接 `Visible(false)`，游戏退出后自动回来 |
+| 任务栏设成自动隐藏时，屏幕底边留一条突兀的数字 | 自动隐藏是把任务栏**滑出屏幕**，窗口还「可见」 | 拿任务栏矩形和**同一 DPI 上下文**的显示器矩形比，露出不到 3/4 就算藏起来（`GetSystemMetrics` 在别的 DPI 上下文里给的是另一套坐标，实测会误判成「已经滑走」） |
+| 任务栏右键菜单被网速数字压住（「任务栏设置」上叠着 `↓117M`） | 菜单是一级窗口、弹在任务栏上方，而贴片 TOPMOST | 有可见的 `#32768`（Win32 弹出菜单的类名）/ `XamlExplorerHostIslandWindow` 窗口**与任务栏矩形相交**时隐藏贴片；只按相交判断，别的程序弹的小菜单不会把贴片吓跑 |
+
+踩过的两个坑：
+
+- **别把 `Windows.UI.Core.CoreWindow` 算进「浮层」**：系统里常年有几个「可见但透明」
+  的实例铺满整块屏幕，算进来贴片就永远不显示（实测）。
+- **`GetSystemMetrics` 和 `GetWindowRect` 可能不在同一套坐标里**（线程/进程 DPI 感知
+  不同）。判断「有没有出屏」必须用 `MonitorFromWindow` + `GetMonitorInfoW`，两边都是
+  同一套窗口坐标。
+
+**为什么不做成 `Shell_TrayWnd` 的真子窗口**（更彻底的方案，已验证行不通）：
+
+- Win11 的任务栏内容是一层 XAML（`Windows.UI.Composition.DesktopWindowContentBridge`）。
+  **GDI 子窗口画在父窗口的表面上，被那层 XAML 整块盖住** —— 子窗口可见、z 序也排第一，
+  屏幕上却一个字都看不见（只剩 1~2 级亮度的渗色）；
+- 唯一能盖在 XAML 岛上面的是分层窗口，而「跨进程 + `WS_EX_LAYERED` + 创建时指定任务栏
+  为父窗口」在本机直接建不出来（`CreateWindowExW` 返回 NULL、连错误码都是 0），
+  事后用 `SetWindowLongPtrW` 补 `WS_EX_LAYERED` 又不会重新进合成器 —— 还是不显示。
+
 ---
 
 ## 7. 配置与数据文件

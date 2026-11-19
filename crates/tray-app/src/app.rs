@@ -109,6 +109,25 @@ const HIDE_DEBOUNCE: Duration = Duration::from_millis(320);
 /// 底部提示条显示多久
 const TOAST_TTL: Duration = Duration::from_secs(6);
 
+/// 面板圆角（点）。
+///
+/// 底板由 [`App::draw`] 自己画，**不用 `egui::Frame`**：`Frame` 的背景矩形是
+/// 跟着内容的 `min_rect` 走的，内容只要比可视区高出一点点，整块底板就被顶到
+/// 窗口外面，底部圆角被裁掉 —— 表现就是「设置页的底部圆角比主面板小/像直角」。
+const PANEL_RADIUS: u8 = 14;
+
+/// 主面板 ↔ 设置页的切换时长。
+///
+/// 0.19s 是「看得出是推过去的，又不至于等着它」的那一档：比面板展开的
+/// 0.13s 略长，因为这里有两页同时在动。
+const VIEW_ANIM: Duration = Duration::from_millis(190);
+
+/// 切页时两页横向错开的距离（点）。
+///
+/// 不按整页宽推：352pt 的面板整页平移显得很笨重，一小段位移配淡入淡出
+/// 就够读出「换了一页」，也和这个弹窗的体量相称。
+const VIEW_SLIDE: f32 = 64.0;
+
 /// 时间窗口。界面上的分段控件就是它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
@@ -209,6 +228,11 @@ pub struct App {
     font_lang: Lang,
     /// 当前是主面板还是设置页
     view: View,
+    /// 切页动画：`(从哪一页切过来的, 开始时刻)`，播完就清空。
+    ///
+    /// 只有 `view` 停不住的地方才需要它：切页那一帧两页都得画 ——
+    /// 旧页往左淡出、新页从右侧淡入，见 [`App::draw_page`]。
+    transition: Option<(View, Instant)>,
     /// 底部临时提示（导出结果、自启切换结果），`(文案, 起始时间)`
     toast: Option<(String, Instant)>,
     /// 列表滚动位置（点）。自己存一份是为了在滚动停下后吸附到整行：
@@ -238,7 +262,7 @@ pub struct App {
     /// 上次检查系统主题的时间。注册表读一次是微秒级，但也没必要每帧读。
     #[cfg(windows)]
     theme_check_at: Instant,
-    /// 任务栏上方的网速贴片（Windows 专属，见 [`crate::badge_window`]）
+    /// 任务栏上的网速贴片（Windows 专属，见 [`crate::badge_window`]）
     #[cfg(windows)]
     badge: crate::badge_window::Badge,
     /// 第几帧（只给 `TM_TRACE_FRAMES` 诊断用）
@@ -353,6 +377,8 @@ impl App {
             } else {
                 View::Main
             },
+            // 首帧不播过渡：从托盘点开就直接是目标页
+            transition: None,
             settings,
             retention,
             // 调试用：TM_TOAST="导出 12 行" 让页脚一上来就带着提示，方便核对排版
@@ -636,9 +662,19 @@ impl App {
     ///
     /// 贴片现在嵌在任务栏条里，和面板（从任务栏上方弹出来）不重叠，
     /// 所以面板展开时不必让它让位——一直显示反而更像任务栏自己的东西。
+    ///
+    /// **任务栏被藏起来时贴片必须一起消失**：全屏游戏会把任务栏收走
+    /// （`IsWindowVisible(Shell_TrayWnd)` 为假），自动隐藏则把它滑到屏幕外。
+    /// 这两种情况下贴片都不能还挂在原来的坐标上——它是独立窗口，系统不会替它收。
     #[cfg(windows)]
     fn sync_badge(&mut self, ctx: &egui::Context) {
         use crate::badge_window::BadgeState;
+
+        // 任务栏不在了 / 藏起来了 / 滑出屏幕了：这一帧直接不显示
+        if !tm_windows::badge::taskbar_shown() {
+            self.badge.show(ctx, None);
+            return;
+        }
 
         let state = match (&self.latest, self.tray_icon_rect(ctx)) {
             (Some(snap), Some(icon))
@@ -809,8 +845,8 @@ impl eframe::App for App {
 
         self.draw(ctx);
 
-        // 展开动画（约 0.3s）期间要连续重绘，之后回到 1s 心跳
-        if self.reveal_secs() < 0.4 {
+        // 展开动画（约 0.3s）和切页动画期间要连续重绘，之后回到 1s 心跳
+        if self.reveal_secs() < 0.4 || self.transitioning() {
             ctx.request_repaint();
         }
 
@@ -825,23 +861,133 @@ impl App {
         let lang = self.lang;
         let alpha = self.open_alpha();
 
-        let frame = egui::Frame::new()
-            .inner_margin(egui::Margin::same(14))
+        // 切页进度。播完就把状态清掉，之后按静止的单页画。
+        let mut trans = None;
+        if let Some((from, at)) = self.transition {
+            let p = at.elapsed().as_secs_f32() / VIEW_ANIM.as_secs_f32();
+            if p < 1.0 {
+                trans = Some((from, p.max(0.0)));
+            } else {
+                self.transition = None;
+            }
+        }
+
+        // 底板自己画，不用 `egui::Frame`。
+        //
+        // `Frame` 的背景矩形 = 内容的 `min_rect` 加内边距（egui frame.rs: `paint(content_rect)`），
+        // 也就是说**内容多高，底板就多高**。设置页的行距一改、多一行、
+        // 或者行高随字体变一点，底板就会比窗口高出几个点，底部圆角整个滑到
+        // 窗口外被裁掉，看起来就是「设置页底部圆角比主面板小一档」。
+        // 钉在窗口矩形上画，圆角就永远是圆的。
+        let panel = ctx.content_rect();
+        ctx.layer_painter(egui::LayerId::background()).rect(
+            panel,
+            CornerRadius::same(PANEL_RADIUS),
             // 面板本身也要参与淡入，否则会出现「背景先出现、内容后浮现」
-            .fill(palette.panel.gamma_multiply(alpha))
-            .stroke(Stroke::new(0.5, palette.border.gamma_multiply(alpha)))
-            .corner_radius(CornerRadius::same(14));
+            palette.panel.gamma_multiply(alpha),
+            Stroke::new(0.5, palette.border.gamma_multiply(alpha)),
+            egui::StrokeKind::Inside,
+        );
+
+        // 只留内边距，不再让 Frame 画任何东西
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(14));
+        let inner = panel.shrink(14.0);
 
         egui::CentralPanel::default()
             .frame(frame)
-            .show(ctx, |ui| {
-                ui.set_opacity(alpha);
-                ui.set_width(WINDOW_W - 28.0);
-                match self.view {
-                    View::Main => self.main_body(ui, &palette, lang),
-                    View::Settings => self.settings_body(ui, &palette, lang),
+            .show(ctx, |ui| match trans {
+                // 静止态：只画当前页，位移和额外透明度都是 0
+                None => {
+                    let view = self.view;
+                    self.draw_page(ui, inner, 0.0, alpha, &palette, lang, view);
+                }
+                // 切页态：两页错开画 —— 旧页先退干净，新页再接上。
+                //
+                // 不做「两页同时交叉淡入淡出」：两页都是密集的小字，叠在
+                // 一起的那几帧会互相透出来，读起来像重影。错开之后中间
+                // 只有一瞬空底板，反而像翻过一页。
+                Some((from, p)) => {
+                    let view = self.view;
+                    // 方向跟着「去哪儿」走：进设置是往左推（新页从右边来），
+                    // 返回是往右推（新页从左边回来）——和系统里「进入子页 / 退回上一页」
+                    // 的手感一致，也让来回切换不会看起来是同一个动作。
+                    let dir = if matches!(view, View::Settings) { 1.0 } else { -1.0 };
+
+                    // 旧页：前 45% 淡出，同时往同方向挪一小段（1/3 行程）
+                    let out_p = (p / 0.45).clamp(0.0, 1.0);
+                    // 新页：从 25% 起淡入，占满剩下的 75%
+                    let in_p = ((p - 0.25) / 0.75).clamp(0.0, 1.0);
+                    let k = ease_out_cubic(in_p);
+
+                    self.draw_page(
+                        ui,
+                        inner,
+                        -ease_out_cubic(out_p) * VIEW_SLIDE * 0.35 * dir,
+                        alpha * (1.0 - out_p),
+                        &palette,
+                        lang,
+                        from,
+                    );
+                    self.draw_page(
+                        ui,
+                        inner,
+                        (1.0 - k) * VIEW_SLIDE * dir,
+                        alpha * k,
+                        &palette,
+                        lang,
+                        view,
+                    );
                 }
             });
+    }
+
+    /// 画一页。`dx` 是横向临时位移，`opacity` 是整页不透明度。
+    ///
+    /// 页面内容统一在这里裁到内边距以内：切页时文字滑到面板边缘会被切掉，
+    /// 而不是飘到圆角外面的空白里。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        inner: egui::Rect,
+        dx: f32,
+        opacity: f32,
+        palette: &Palette,
+        lang: Lang,
+        view: View,
+    ) {
+        if opacity <= 0.001 {
+            return;
+        }
+        let rect = inner.translate(egui::vec2(dx, 0.0));
+        // id_salt 按页区分：两页的控件 id 不能撞车（否则开关/滑块的动画状态会串）
+        let salt = match view {
+            View::Main => "page-main",
+            View::Settings => "page-settings",
+        };
+        let mut page = ui.new_child(egui::UiBuilder::new().id_salt(salt).max_rect(rect));
+        page.set_clip_rect(inner);
+        page.set_opacity(opacity);
+        page.set_width(WINDOW_W - 28.0);
+        match view {
+            View::Main => self.main_body(&mut page, palette, lang),
+            View::Settings => self.settings_body(&mut page, palette, lang),
+        }
+    }
+
+    /// 换页。带过渡动画；已经在目标页就什么都不做（连点两次设置不会重播）。
+    fn goto(&mut self, view: View) {
+        if self.view == view {
+            return;
+        }
+        self.transition = Some((self.view, Instant::now()));
+        self.view = view;
+    }
+
+    /// 切页动画是否还在播（`update` 靠它决定这帧要不要连续重绘）。
+    fn transitioning(&self) -> bool {
+        self.transition
+            .is_some_and(|(_, at)| at.elapsed() < VIEW_ANIM)
     }
 
     /// 展开动画的进度 0..1（已缓动）。窗口没显示时恒为 0。
@@ -905,7 +1051,7 @@ impl App {
                 let back = icon_button(ui, rect, "settings-back", p, paint_back_icon)
                     .on_hover_text(lang.t("返回", "Back"));
                 if back.clicked() {
-                    self.view = View::Main;
+                    self.goto(View::Main);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
@@ -963,8 +1109,8 @@ impl App {
 
         // ---- 任务栏（只有 Windows 有这回事）----
         //
-        // Windows 的托盘图标是定死的方形槽，塞不进 `↓1.2M`；数字是画在图标
-        // 上方的独立贴片里的（`badge_window`）。所以这里的选项和 macOS 不同：
+        // Windows 的托盘图标是定死的方形槽，塞不进 `↓1.2M`；数字是画在任务栏里
+        // 的独立贴片（`badge_window`）。所以这里的选项和 macOS 不同：
         // 那边调的是「状态栏显示什么」，这边只有「贴片开不开」。
         #[cfg(windows)]
         {
@@ -1074,21 +1220,39 @@ impl App {
         ui.add_space(5.0);
         self.toast_line(ui, p);
 
-        // 面板高度固定，设置页内容比面板矮，剩下的那截全部塞在这里：
-        // 于是「开机自启」贴着面板底边，空白看着像刻意留的，而不是没排完。
-        let block_h = 1.0 + 5.0 + 32.0 + 5.0; // 分隔线 + 间距 + 开关行 + 行距
-        let pad = (ui.available_height() - block_h).max(0.0);
+        // 面板高度固定，设置页内容比面板矮，剩下的那截全部留给「底部块」。
+        //
+        // 这一块不能再拿 `add_space(pad)` 拼：`add_space`、`separator`、行之间
+        // 各自都会再插一次 `item_spacing`，算出来的 pad 永远差几个点，最后一行
+        // 就被推到面板底边之外 —— 底板跟着内容长（旧实现），底部圆角就这么没了。
+        // 现在把「剩下的矩形」一次分配掉，分隔线和开关行都在它的底边上定位，
+        // 无论行高/字体怎么变，都只会压缩上面的留白，不会溢出面板。
+        let rest = ui.available_rect_before_wrap();
+        ui.allocate_rect(rest, egui::Sense::hover());
         if std::env::var_os("TM_TRACE_LIST").is_some() {
-            eprintln!("[settings] avail={:.1} pad={pad:.1}", ui.available_height());
+            eprintln!("[settings] rest_h={:.1}", rest.height());
         }
-        ui.add_space(pad);
 
-        ui.separator();
-        ui.add_space(5.0);
+        // 分隔线压在「开关行 + 间距」之上 6pt 处，和主面板页脚的分隔线同一档留白。
+        // `max(rest.top())` 是兜底：以后真加了设置行、剩余高度不够时，
+        // 就地排在游标下面（溢出窗口，跟以前一样被裁掉），而不是压住上一行。
+        let line_y = (rest.bottom() - 38.0).max(rest.top());
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rest.left(), line_y),
+                egui::pos2(rest.right(), line_y + 1.0),
+            ),
+            0.0,
+            p.border,
+        );
+        let row = egui::Rect::from_min_max(
+            egui::pos2(rest.left(), line_y + 6.0),
+            egui::pos2(rest.right(), rest.bottom()),
+        );
 
         // ---- 开机自启（状态来自系统，不是配置文件）----
         let mut on = self.launch_at_login;
-        if toggle_row(ui, p, lang.t("开机自启", "Launch at login"), &mut on) {
+        if toggle_row_at(ui, row, p, lang.t("开机自启", "Launch at login"), &mut on) {
             match autostart::set_enabled(on) {
                 Ok(()) => {
                     self.launch_at_login = on;
@@ -1168,7 +1332,7 @@ impl App {
             });
         });
         if open_settings {
-            self.view = View::Settings;
+            self.goto(View::Settings);
         }
     }
 
@@ -1850,10 +2014,10 @@ fn option_row<T: Copy + PartialEq>(
 }
 
 /// 设置项：左边标签，右边一个开关。返回是否被点击。
-fn toggle_row(ui: &mut egui::Ui, p: &Palette, label: &str, on: &mut bool) -> bool {
-    const ROW_H: f32 = 32.0;
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_H), egui::Sense::hover());
+///
+/// 行矩形由调用方给定，不走流式布局：设置页底部那行要贴着面板底边定位
+/// （见 `settings_body` 的注释），位置不能再让游标决定。
+fn toggle_row_at(ui: &mut egui::Ui, rect: egui::Rect, p: &Palette, label: &str, on: &mut bool) -> bool {
     // 整行都能点，比只点那个小圆点好按
     let resp = ui.interact(rect, ui.id().with(("toggle", label)), egui::Sense::click());
 

@@ -43,13 +43,16 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, FindWindowW, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, LWA_COLORKEY, SetLayeredWindowAttributes, SetWindowLongW,
-    SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetWindowThreadProcessId, IsWindowVisible, LWA_COLORKEY, SetLayeredWindowAttributes,
+    SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::screen::Rect;
@@ -188,6 +191,100 @@ fn cursor_pos() -> (i32, i32) {
 
 fn left_down() -> bool {
     unsafe { GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000 != 0 }
+}
+
+/// 任务栏此刻该不该被看到。
+///
+/// 贴片是独立窗口，系统不会替它收，所以这几个状态得自己判：
+///
+/// * `IsWindowVisible` 为假 —— 全屏游戏/全屏应用把任务栏整个藏了；
+/// * 任务栏窗口还在，但已经被滑到屏幕外 —— 自动隐藏在「收起」状态时只剩两三个
+///   像素露在边上，贴片不该跟着露一截；
+/// * **任务栏正在弹菜单**（右键「任务管理器 / 任务栏设置」、托盘图标的右键菜单）——
+///   菜单是独立的一级窗口，就弹在任务栏上方，而贴片是 TOPMOST，不躲开就会把
+///   菜单压在下面（「任务栏设置」被网速数字盖住就是这个）。
+///
+/// 量不到任务栏（explorer 重启中）也算「不该显示」：这时候连贴哪儿都不知道。
+pub fn taskbar_shown() -> bool {
+    unsafe {
+        let class = wide("Shell_TrayWnd");
+        let shell = FindWindowW(class.as_ptr(), std::ptr::null());
+        if shell.is_null() || IsWindowVisible(shell) == 0 {
+            return false;
+        }
+        let Some(band) = rect_of(shell) else {
+            return false;
+        };
+
+        // 有菜单/浮层正压在这条任务栏上 ⇒ 贴片让位。
+        //
+        // 菜单和浮层都是一级窗口，就弹在任务栏上方，而贴片是 TOPMOST ——
+        // 不躲开就会把它们压在下面（「任务栏设置」被网速数字盖住就是这个）。
+        if popup_over(band) {
+            return false;
+        }
+
+        // 「滑出屏幕」要拿**同一个 DPI 上下文**里量的显示器矩形来比：
+        // `GetSystemMetrics` 在 DPI 感知不同的线程上会给出另一套坐标，
+        // 和 `GetWindowRect` 的数值对不上（实测过，会误判成「已经滑走了」）。
+        let mon = MonitorFromWindow(shell, MONITOR_DEFAULTTONEAREST);
+        if mon.is_null() {
+            return true;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut info) == 0 {
+            return true;
+        }
+        let m = info.rcMonitor;
+        // 露在显示器里的那部分（任务栏可以贴在上下左右任一边）
+        let vis_w = (band.x + band.w).min(m.right) - band.x.max(m.left);
+        let vis_h = (band.y + band.h).min(m.bottom) - band.y.max(m.top);
+        // 横向任务栏看高度，竖向（贴左/贴右）看宽度；留 3/4 的余量，
+        // 自动隐藏停住时那一条细边（2~3px）就过不了这一关
+        if band.w >= band.h {
+            vis_h >= band.h * 3 / 4
+        } else {
+            vis_w >= band.w * 3 / 4
+        }
+    }
+}
+
+/// 有没有「弹出来的东西」压在 `band` 上。
+///
+/// 三类都要认：
+/// * `#32768` —— 所有 Win32 弹出菜单（任务栏右键的「任务管理器 / 任务栏设置」、
+///   托盘图标右键菜单）；
+/// * `XamlExplorerHostIslandWindow` —— Win11 开始菜单那层 XAML 浮层。
+///
+/// 只认**可见**且和任务栏矩形相交的：别的程序弹个小菜单、只要没压到任务栏，
+/// 就不该把贴片吓跑。
+fn popup_over(band: Rect) -> bool {
+    // 只留「真的是一块弹出来的界面」的类。
+    // `Windows.UI.Core.CoreWindow` 看着像 XAML 浮层，其实系统里常年有
+    // 几个「可见但透明」的实例铺满整块屏幕，把它算进来贴片就永远不显示了
+    // （实测踩过）。
+    const CLASSES: &[&str] = &["#32768", "XamlExplorerHostIslandWindow"];
+    unsafe {
+        let (l, t) = (band.x, band.y);
+        let (r, b) = (band.x + band.w, band.y + band.h);
+        for name in CLASSES {
+            let cls = wide(name);
+            let mut h =
+                FindWindowExW(std::ptr::null_mut(), std::ptr::null_mut(), cls.as_ptr(), std::ptr::null());
+            while !h.is_null() {
+                if IsWindowVisible(h) != 0 {
+                    if let Some(m) = rect_of(h) {
+                        if m.x < r && m.x + m.w > l && m.y < b && m.y + m.h > t {
+                            return true;
+                        }
+                    }
+                }
+                h = FindWindowExW(std::ptr::null_mut(), h, cls.as_ptr(), std::ptr::null());
+            }
+        }
+        false
+    }
 }
 
 /// 量任务栏和托盘区。拿不到（explorer 正在重启、任务栏被换成第三方实现）
