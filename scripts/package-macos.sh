@@ -125,5 +125,5 @@ if [[ -d "$APP" ]]; then
   echo "  $APP  ($(du -sh "$APP" | cut -f1))"
 fi
 if [[ $MAKE_DMG -eq 1 ]]; then
-  echo "  $DIST/TrafficMonitor-$VERSION.dmg"
+  echo "  $DIST/$APP_NAME-$VERSION.dmg"
 fi
