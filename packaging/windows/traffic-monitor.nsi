@@ -35,6 +35,24 @@ Unicode true
   !define APP_VERSION "0.1.0"
 !endif
 
+; 覆盖安装时正在运行的 exe 会被 Windows 锁住，File 直接覆盖会弹 NSIS 原生
+; 错误框（中止/重试/忽略），用户点「忽略」就会装出「主程序新版、助手旧版」
+; 的半成品。所以写文件前先把旧 exe 删掉，让 File 变成全新写入；真删不掉就
+; 中止并给出明确指引，绝不静默跳过。
+!macro PREPARE_OVERWRITE FILE LABEL
+  IfFileExists "${FILE}" 0 ${LABEL}_done
+    ClearErrors
+    Delete "${FILE}"
+    IfErrors 0 ${LABEL}_done
+      ; taskkill 返回后文件句柄可能还没释放，再给一次机会
+      Sleep 800
+      ClearErrors
+      Delete "${FILE}"
+      IfErrors 0 ${LABEL}_done
+        Abort "无法替换文件：${FILE}$\r$\n$\r$\n请先在任务管理器里结束 tramoing.exe / tramoing-helper.exe（或重启电脑），然后重新运行安装包。$\r$\n$\r$\n不要选「忽略」，否则新版本不会被完整安装。"
+  ${LABEL}_done:
+!macroend
+
 Name "${APP_NAME}"
 BrandingText "${APP_NAME} ${APP_VERSION}"
 OutFile "..\..\dist\${APP_NAME}-${APP_VERSION}-setup.exe"
@@ -61,6 +79,32 @@ UninstPage uninstConfirm
 UninstPage instfiles
 
 ; ---------- 安装 ----------
+
+; 升级准备必须排在文件写入之前：NSIS 按脚本顺序执行选中的 section。
+; 隐藏 section（名字以 - 开头）+ SectionIn RO，保证每次安装都会跑。
+Section "-升级准备：关闭旧进程" SEC_PRE
+  SectionIn RO
+  DetailPrint "正在关闭旧的 Tramoing 进程..."
+
+  ; 计划任务在登录时以最高权限拉起助手，先让它退下来，避免拷贝期间
+  ; 任务调度器又把旧 exe 拉起来重新占住文件。
+  ExecWait 'schtasks /End /TN "TrafficMonitorHelper"' $0
+
+  ExecWait 'taskkill /IM "${HELPER_EXE}" /F' $0
+  ExecWait 'taskkill /IM "${APP_EXE}" /F' $0
+  ; 改名前的 exe 也可能还在跑，一样停掉
+  ExecWait 'taskkill /IM "traffic-monitor.exe" /F' $0
+  ExecWait 'taskkill /IM "tm-helper.exe" /F' $0
+
+  ; taskkill 返回后进程对象可能还没完全释放句柄，等一下再删
+  Sleep 700
+  ExecWait 'taskkill /IM "${HELPER_EXE}" /F' $0
+  Sleep 300
+
+  !insertmacro PREPARE_OVERWRITE "$INSTDIR\${APP_EXE}" prep_main
+  !insertmacro PREPARE_OVERWRITE "$INSTDIR\${HELPER_EXE}" prep_helper
+  !insertmacro PREPARE_OVERWRITE "$INSTDIR\uninstall.exe" prep_uninst
+SectionEnd
 
 Section "托盘程序（必需）" SEC_MAIN
   SectionIn RO
