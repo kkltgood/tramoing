@@ -15,6 +15,7 @@
 - **版本**：0.1.0
 - **技术栈**：纯 Rust + egui / eframe，无 Electron、无 Python、无外部运行时
 - **当前状态**：已修复统计、采集生命周期和原生任务栏挂接；Windows 本机测试与 macOS 两种架构的源码检查见 [本轮验证记录](docs/verification-2026-11-19.md)。macOS 原生构建与交互需要 Mac 验收。
+- **任务栏显示修复**：透明背景和固定箭头列的实现、实机截图与测试见 [2026-11-20 验证记录](docs/taskbar-transparency-2026-11-20.md)。
 
 ![主面板](docs/screenshot-panel.png)
 
@@ -36,12 +37,13 @@
 
 数字由 `Shell_TrayWnd` 下的原生 `WS_CHILD` 控件绘制，已移除独立 egui 置顶窗口和鼠标轮询。
 
-- 两行上下行速率，支持系统明暗主题和彩色/单色。
+- 两行上下行速率，支持系统明暗主题和彩色/单色。箭头固定在独立列，数字右对齐，速率变化不会带动箭头。
+- 逐像素透明背景透出真实任务栏底色，文字使用灰度抗锯齿，避免实色方块和颜色键黑边。
 - 点击整块网速区域打开面板；点击事件以控件自己的位置作为锚点。
 - 随任务栏移动和隐藏；Explorer 重建后自动重新挂接。
 - Win10 经典任务栏预留按钮区空间，禁用或退出时恢复。
 - Win11 在托盘左侧的已知空位挂接，避开任务按钮及第三方子窗口。空间不足或布局无法识别时隐藏控件并在面板提示。
-- Win11 没有公开的任意文本任务栏扩展 API；本实现不承诺所有系统版本、第三方任务栏和任务按钮布局都支持。背景使用跟随主题的实色，尚未复现系统亚克力材质。
+- Win11 没有公开的任意文本任务栏扩展 API；本实现不承诺所有系统版本、第三方任务栏和任务按钮布局都支持。
 
 ### 1.2 弹出面板
 
@@ -71,7 +73,7 @@
 | 数据面板 | ![面板](docs/screenshot-panel.png) |
 | 加载骨架屏 | ![加载](docs/screenshot-loading.png) |
 | 设置页 | ![设置](docs/screenshot-settings.png) |
-| Windows 原生任务栏网速（150% DPI，演示流量） | ![任务栏](docs/screenshot-native-taskbar.png) |
+| Windows 原生任务栏网速（150% DPI，演示流量） | ![任务栏](docs/screenshot-transparent-taskbar.png) |
 
 ---
 
@@ -159,7 +161,7 @@ Windows:
 | 下载绿、上传蓝，且**定义只有一份** | 绿色表示「进来」，和多数网络工具的直觉一致。上下行色同时出现在面板、macOS 菜单栏两行小字、Windows 任务栏贴片三处，所以颜色定义放在 `tm_core::color`（`download(on_dark)` / `upload(on_dark)`），三处各自转成 `Color32` / `NSColor`。以前是各写各的，面板改了色菜单栏不跟着变 |
 | Windows 拆成两个进程 | ETW 按进程统计必须提权；助手提权跑，托盘程序始终普通权限 |
 | Windows 网速数字不画进托盘图标，另开一个贴片窗口 | `Shell_NotifyIcon` 只接受方形小图标，`↓1.2M` 塞进去会被系统缩成一团糊；图标槽的 rect 是壳定死的，撑开 HICON 也没用 |
-| 贴片用**颜色键**抠背景，不用逐像素 alpha | eframe 的 GL 配置在这台机器上没有 alpha 通道（`Cannot create transparent window`），`UpdateLayeredWindow` 那套用不上；纯黑颜色键既能抠干净，又顺带让鼠标穿透。详见 [6.13](#613-windows-任务栏网速贴片) |
+| 任务栏子窗口使用**逐像素 alpha** | GDI 绘制灰度字形覆盖率，转换为预乘 BGRA，再由 `UpdateLayeredWindow` 与任务栏合成；不依赖 egui 的 GL alpha 通道。空白处仅保留 1/255 覆盖率，使整块区域仍可点击。详见 [6.13](#613-windows-原生任务栏网速) |
 
 ---
 
@@ -519,6 +521,8 @@ winit 就不再派发 `RedrawRequested`，eframe 的 `update()` 整个停摆 —
 
 实现位于 `tm-windows/src/badge.rs`，界面只下发文字和颜色。控件在创建时即指定 `Shell_TrayWnd` 为父窗口，使用 `WS_CHILD`，没有 `WS_EX_TOPMOST`、颜色键透明或额外的 egui viewport。
 
+绘制位于 `tm-windows/src/badge/surface.rs`：32bpp 位图保存文字覆盖率，灰度抗锯齿经预乘 alpha 与真实任务栏底色合成。背景仅保留原生命中测试所需的 1/255 alpha，理论上最多改变一个色阶，不再填充深灰/浅灰矩形。上下箭头占据固定列，数值在旁边单独右对齐。
+
 布局使用任务栏自身 DPI 和客户区坐标。经典任务栏通过缩小 ReBar 的任务按钮区域预留位置，销毁时只恢复仍由本控件修改的矩形。Win11 的 XAML 区域不能用旧 ReBar 强行预留，因此只接受可识别的现有空位；无法放置时明确显示原因。
 
 点击使用 `WM_LBUTTONDOWN/UP` 与鼠标捕获；空白区域也属于控件。窗口句柄失效后重建，关闭设置会销毁子窗口并释放预留空间。
@@ -550,33 +554,11 @@ cargo test -p tm-windows native_child_lifecycle_and_clicks -- --ignored --nocapt
 验证：`scripts/grab.py`（或用 DPI 感知的 PrintWindow 抓 528×617 物理像素）对比两页底部
 40×32 区域，**逐像素相同**；过渡中间帧能看到旧页左移淡出、新页从右侧半透明滑入。
 
-### 6.15 任务栏贴片：跟任务栏一起隐藏（全屏游戏 / 右键菜单）
+### 6.15 任务栏子窗口：合成与可见性
 
-贴片是**独立的一级窗口**（`WS_EX_LAYERED` 颜色键 + TOPMOST），系统不会替它收，
-所以要自己判断「这块地方现在该不该有它」—— 判据都在 `tm_windows::badge::taskbar_shown()`：
+当前控件由任务栏父窗口控制移动和可见性，不再保留旧浮窗的置顶、菜单检测和全局鼠标轮询逻辑。实际 Explorer 重启、自动隐藏动画和全屏游戏仍属于需要逐平台人工验收的场景。
 
-| 症状 | 原因 | 修法 |
-|---|---|---|
-| 启动全屏游戏后，任务栏没了，网速还挂在原来的位置 | 只算了坐标，没管任务栏的可见性 | `IsWindowVisible(Shell_TrayWnd)` 为假（全屏应用把任务栏收了）就直接 `Visible(false)`，游戏退出后自动回来 |
-| 任务栏设成自动隐藏时，屏幕底边留一条突兀的数字 | 自动隐藏是把任务栏**滑出屏幕**，窗口还「可见」 | 拿任务栏矩形和**同一 DPI 上下文**的显示器矩形比，露出不到 3/4 就算藏起来（`GetSystemMetrics` 在别的 DPI 上下文里给的是另一套坐标，实测会误判成「已经滑走」） |
-| 任务栏右键菜单被网速数字压住（「任务栏设置」上叠着 `↓117M`） | 菜单是一级窗口、弹在任务栏上方，而贴片 TOPMOST | 有可见的 `#32768`（Win32 弹出菜单的类名）/ `XamlExplorerHostIslandWindow` 窗口**与任务栏矩形相交**时隐藏贴片；只按相交判断，别的程序弹的小菜单不会把贴片吓跑 |
-
-踩过的两个坑：
-
-- **别把 `Windows.UI.Core.CoreWindow` 算进「浮层」**：系统里常年有几个「可见但透明」
-  的实例铺满整块屏幕，算进来贴片就永远不显示（实测）。
-- **`GetSystemMetrics` 和 `GetWindowRect` 可能不在同一套坐标里**（线程/进程 DPI 感知
-  不同）。判断「有没有出屏」必须用 `MonitorFromWindow` + `GetMonitorInfoW`，两边都是
-  同一套窗口坐标。
-
-**为什么不做成 `Shell_TrayWnd` 的真子窗口**（更彻底的方案，已验证行不通）：
-
-- Win11 的任务栏内容是一层 XAML（`Windows.UI.Composition.DesktopWindowContentBridge`）。
-  **GDI 子窗口画在父窗口的表面上，被那层 XAML 整块盖住** —— 子窗口可见、z 序也排第一，
-  屏幕上却一个字都看不见（只剩 1~2 级亮度的渗色）；
-- 唯一能盖在 XAML 岛上面的是分层窗口，而「跨进程 + `WS_EX_LAYERED` + 创建时指定任务栏
-  为父窗口」在本机直接建不出来（`CreateWindowExW` 返回 NULL、连错误码都是 0），
-  事后用 `SetWindowLongPtrW` 补 `WS_EX_LAYERED` 又不会重新进合成器 —— 还是不显示。
+Win11 的任务栏使用 DirectComposition，普通 GDI 子窗口可能被 XAML 表面覆盖。原生子窗口使用 `WS_EX_LAYERED` 获得自己的合成表面，并在应用清单中声明 Windows 8+ 兼容性；缺少该声明时，创建分层子窗口可能失败。当前逐像素合成实现和验证方法见 [6.13](#613-windows-原生任务栏网速)。
 
 ---
 

@@ -3,6 +3,8 @@
 //! Win10 缩小任务按钮宿主给控件留位，禁用/退出恢复原尺寸。Win11 的 XAML
 //! 任务栏没有公开的任意文字扩展接口，仅在已知布局存在空位时挂接；不支持的
 //! 布局返回状态给 UI。Explorer 重建后下一次 update 自动重新挂接。
+mod surface;
+
 use crate::screen::Rect;
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
@@ -29,6 +31,7 @@ struct WindowState {
     content: RefCell<Content>,
     click: fn(Option<Rect>),
     pressed: Cell<bool>,
+    needs_paint: Cell<bool>,
 }
 
 struct Reservation {
@@ -56,6 +59,7 @@ impl TaskbarBadge {
                 }),
                 click,
                 pressed: Cell::new(false),
+                needs_paint: Cell::new(true),
             }),
             shell: null_mut(),
             reservation: None,
@@ -70,6 +74,9 @@ impl TaskbarBadge {
         };
         let changed = *self.state.content.borrow() != content;
         *self.state.content.borrow_mut() = content;
+        if changed {
+            self.state.needs_paint.set(true);
+        }
         unsafe {
             let shell = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
             if shell.is_null() {
@@ -81,8 +88,8 @@ impl TaskbarBadge {
                 register_class();
                 let hwnd = CreateWindowExW(
                     // Win11 的任务栏由 DirectComposition 绘制，普通 GDI 子窗口
-                    // 会被它的合成表面覆盖。常量 alpha=255 给子窗口独立表面，
-                    // 无颜色键/点击穿透，父窗口仍然是任务栏。
+                    // 会被它的合成表面覆盖。使用逐像素 alpha 合成，
+                    // 背景透出任务栏，父窗口仍然是任务栏。
                     WS_EX_NOACTIVATE | WS_EX_LAYERED,
                     wide(CLASS).as_ptr(),
                     wide("Tramoing Speed").as_ptr(),
@@ -101,17 +108,18 @@ impl TaskbarBadge {
                 }
                 self.shell = shell;
                 self.state.hwnd.set(hwnd);
-                if SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) == 0 {
-                    self.detach();
-                    return Err("当前系统无法合成任务栏网速窗口");
-                }
+                self.state.needs_paint.set(true);
             }
-            let result = self.layout();
+            let result = self.layout().and_then(|()| {
+                if self.state.needs_paint.get() {
+                    surface::present(self.state.hwnd.get(), &self.state.content.borrow())?;
+                    self.state.needs_paint.set(false);
+                }
+                Ok(())
+            });
             if result.is_err() {
                 ShowWindow(self.state.hwnd.get(), SW_HIDE);
                 self.restore();
-            } else if changed {
-                InvalidateRect(self.state.hwnd.get(), null(), 0);
             }
             result
         }
@@ -324,7 +332,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState).as_ref();
     match (msg, state) {
         (WM_PAINT, Some(state)) => {
-            paint(hwnd, &state.content.borrow());
+            // UpdateLayeredWindow 管理合成表面；验证重绘区，下一次 update 再提交。
+            let mut ps = std::mem::zeroed();
+            BeginPaint(hwnd, &mut ps);
+            EndPaint(hwnd, &ps);
+            state.needs_paint.set(true);
             0
         }
         (WM_ERASEBKGND, _) => 1,
@@ -356,89 +368,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        (WM_THEMECHANGED | WM_DPICHANGED | WM_SIZE, _) => {
-            InvalidateRect(hwnd, null(), 0);
+        (WM_THEMECHANGED | WM_DPICHANGED | WM_SIZE, Some(state)) => {
+            state.needs_paint.set(true);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
-unsafe fn paint(hwnd: HWND, data: &Content) {
-    let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let dc = BeginPaint(hwnd, &mut ps);
-    let r = client_rect(hwnd).unwrap_or(RECT {
-        left: 0,
-        top: 0,
-        right: 60,
-        bottom: 48,
-    });
-    let bg = if data.light {
-        rgb(243, 243, 243)
-    } else {
-        rgb(32, 32, 32)
-    };
-    let brush = CreateSolidBrush(bg);
-    FillRect(dc, &r, brush);
-    DeleteObject(brush);
-    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-    let font = CreateFontW(
-        -12 * dpi / 96,
-        0,
-        0,
-        0,
-        500,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET as u32,
-        OUT_DEFAULT_PRECIS as u32,
-        CLIP_DEFAULT_PRECIS as u32,
-        CLEARTYPE_QUALITY as u32,
-        DEFAULT_PITCH as u32,
-        wide("Segoe UI").as_ptr(),
-    );
-    let old = SelectObject(dc, font);
-    SetBkMode(dc, TRANSPARENT as i32);
-    let line = (14 * dpi / 96).min(r.bottom / 2);
-    let top = (r.bottom - line * 2) / 2;
-    for (i, (arrow, number)) in [("↓", &data.down), ("↑", &data.up)].iter().enumerate() {
-        let color = if data.colored {
-            let c = if i == 0 {
-                tm_core::color::download(!data.light)
-            } else {
-                tm_core::color::upload(!data.light)
-            };
-            rgb(c.0, c.1, c.2)
-        } else if data.light {
-            rgb(24, 24, 28)
-        } else {
-            rgb(238, 238, 242)
-        };
-        SetTextColor(dc, color);
-        let text = wide(&format!("{arrow} {number}"));
-        let mut line_rect = RECT {
-            left: 3 * dpi / 96,
-            right: r.right - 3 * dpi / 96,
-            top: top + i as i32 * line,
-            bottom: top + (i as i32 + 1) * line,
-        };
-        DrawTextW(
-            dc,
-            text.as_ptr(),
-            (text.len() - 1) as i32,
-            &mut line_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-    }
-    SelectObject(dc, old);
-    DeleteObject(font);
-    EndPaint(hwnd, &ps);
-}
-
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    r as u32 | (g as u32) << 8 | (b as u32) << 16
-}
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -528,11 +465,24 @@ mod tests {
             assert_ne!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CHILD, 0);
             assert_eq!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_POPUP, 0);
             assert_eq!(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST, 0);
+            assert_ne!(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED, 0);
+            assert_eq!(
+                GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT,
+                0
+            );
             assert_ne!(IsWindowVisible(hwnd), 0);
             let r = relative_rect(hwnd, badge.shell).unwrap();
             let band = client_rect(badge.shell).unwrap();
             assert!(r.left >= 0 && r.top >= 0 && r.right <= band.right && r.bottom <= band.bottom);
             UpdateWindow(hwnd);
+            let screen = screen_rect(hwnd).unwrap();
+            assert_eq!(
+                WindowFromPoint(POINT {
+                    x: screen.x + 3,
+                    y: screen.y + 3
+                }),
+                hwnd
+            );
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, 4 | (4 << 16));
             SendMessageW(hwnd, WM_LBUTTONUP, 0, 4 | (4 << 16));
             assert_eq!(CLICKS.load(Ordering::Relaxed), 1);

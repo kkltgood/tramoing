@@ -27,6 +27,8 @@ public static class TramoingRuntimeProbe {
  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h,int n);
  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+ [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int command);
+ [DllImport("dwmapi.dll")] public static extern int DwmFlush();
  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point point);
  [DllImport("user32.dll")] public static extern bool GetLayeredWindowAttributes(IntPtr h,out uint key,out byte alpha,out uint flags);
  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p,IntPtr l);
@@ -54,24 +56,44 @@ try {
     [uint32]$colorKey = 0
     [byte]$alpha = 0
     [uint32]$layerFlags = 0
-    if (-not [TramoingRuntimeProbe]::GetLayeredWindowAttributes($badge, [ref]$colorKey, [ref]$alpha, [ref]$layerFlags) -or $alpha -ne 255 -or $layerFlags -ne 2) { throw 'Expected opaque child composition without color key' }
+    if (([TramoingRuntimeProbe]::GetWindowLong($badge, -20) -band 0x80000) -eq 0) { throw 'Missing layered child composition' }
+    if ([TramoingRuntimeProbe]::GetLayeredWindowAttributes($badge, [ref]$colorKey, [ref]$alpha, [ref]$layerFlags) -and $layerFlags -ne 0) { throw 'Expected per-pixel composition without global alpha/color key' }
     $hitRect = New-Object TramoingRuntimeProbe+Rect
     [TramoingRuntimeProbe]::GetWindowRect($badge, [ref]$hitRect) | Out-Null
     $point = New-Object TramoingRuntimeProbe+Point
     $point.X = $hitRect.L + 3
     $point.Y = $hitRect.T + 3
     if ([TramoingRuntimeProbe]::WindowFromPoint($point) -ne $badge) { throw 'Blank area does not receive native hit testing (or is occluded)' }
-    if ($Screenshot) {
-        Start-Sleep -Milliseconds 1500
-        Add-Type -AssemblyName System.Drawing
-        $rect = New-Object TramoingRuntimeProbe+Rect
-        [TramoingRuntimeProbe]::GetWindowRect($badge, [ref]$rect) | Out-Null
-        $image = New-Object Drawing.Bitmap ($rect.R - $rect.L), ($rect.B - $rect.T)
-        $graphics = [Drawing.Graphics]::FromImage($image)
-        try {
-            $graphics.CopyFromScreen($rect.L, $rect.T, 0, 0, $image.Size)
-            $image.Save([IO.Path]::GetFullPath($Screenshot), [Drawing.Imaging.ImageFormat]::Png)
-        } finally { $graphics.Dispose(); $image.Dispose() }
+    Start-Sleep -Milliseconds 1500
+    Add-Type -AssemblyName System.Drawing
+    $rect = New-Object TramoingRuntimeProbe+Rect
+    [TramoingRuntimeProbe]::GetWindowRect($badge, [ref]$rect) | Out-Null
+    $image = New-Object Drawing.Bitmap ($rect.R - $rect.L), ($rect.B - $rect.T)
+    $background = New-Object Drawing.Bitmap $image.Width, $image.Height
+    $graphics = [Drawing.Graphics]::FromImage($image)
+    $backgroundGraphics = [Drawing.Graphics]::FromImage($background)
+    try {
+        [TramoingRuntimeProbe]::DwmFlush() | Out-Null
+        $graphics.CopyFromScreen($rect.L, $rect.T, 0, 0, $image.Size)
+        # Briefly hide only the test process's own child to sample the real taskbar.
+        [TramoingRuntimeProbe]::ShowWindow($badge, 0) | Out-Null
+        [TramoingRuntimeProbe]::DwmFlush() | Out-Null
+        $backgroundGraphics.CopyFromScreen($rect.L, $rect.T, 0, 0, $image.Size)
+        $backgroundMaxDelta = 0
+        foreach ($x in @(3, [int]($image.Width / 2), ($image.Width - 4))) {
+            foreach ($y in @(3, ($image.Height - 4))) {
+                $actual = $image.GetPixel($x, $y)
+                $expected = $background.GetPixel($x, $y)
+                foreach ($channel in @('R','G','B')) {
+                    $backgroundMaxDelta = [Math]::Max($backgroundMaxDelta, [Math]::Abs([int]$actual.$channel - [int]$expected.$channel))
+                }
+            }
+        }
+        if ($backgroundMaxDelta -gt 2) { throw "Background is not transparent; maximum channel delta: $backgroundMaxDelta" }
+        if ($Screenshot) { $image.Save([IO.Path]::GetFullPath($Screenshot), [Drawing.Imaging.ImageFormat]::Png) }
+    } finally {
+        [TramoingRuntimeProbe]::ShowWindow($badge, 8) | Out-Null
+        $graphics.Dispose(); $backgroundGraphics.Dispose(); $image.Dispose(); $background.Dispose()
     }
     $second = Start-Process -FilePath $Executable -ArgumentList '--mock' -WindowStyle Hidden -PassThru
     if (-not $second.WaitForExit(5000)) {
@@ -81,7 +103,7 @@ try {
     }
     if ($second.ExitCode -ne 0) { throw 'Second instance failed' }
     if (Test-Path -LiteralPath $env:TM_DB_PATH) { throw 'Mock wrote a persistent database' }
-    [pscustomobject]@{NativeChild=$true;Topmost=$false;OpaqueComposition=$true;BlankAreaHitTest=$true;SingleInstance=$true;MockIsolated=$true;DataDirectory=$testRoot;Screenshot=$Screenshot} | ConvertTo-Json
+    [pscustomobject]@{NativeChild=$true;Topmost=$false;PerPixelComposition=$true;BackgroundMaxChannelDelta=$backgroundMaxDelta;BlankAreaHitTest=$true;SingleInstance=$true;MockIsolated=$true;DataDirectory=$testRoot;Screenshot=$Screenshot} | ConvertTo-Json
 } finally {
     if ($testProcess) {
         $main = [TramoingRuntimeProbe]::Main($testProcess.Id)
