@@ -1309,7 +1309,12 @@ impl App {
                     .color(p.text),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if sliders_button(ui, p).clicked() {
+                let entry = sliders_button(ui, p)
+                    .on_hover_text(lang.t("设置", "Settings"));
+                // 按下就算数，不等松开：面板里只有这一个入口，手感要「一碰就进」，
+                // 也免得按下后指针漂几个像素、松开时 click 被判成拖拽而失效。
+                if entry.clicked() || (entry.hovered() && ui.input(|i| i.pointer.primary_pressed()))
+                {
                     open_settings = true;
                 }
                 ui.add_space(4.0);
@@ -1393,7 +1398,7 @@ impl App {
                 ui.label(
                     RichText::new(format!("· {count}"))
                         .size(11.0)
-                        .color(p.subtext.gamma_multiply(0.75)),
+                        .color(p.unit),
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1716,7 +1721,7 @@ impl App {
             r.rx_bps,
             12.0,
             p.download,
-            p.subtext.gamma_multiply(0.8),
+            p.unit,
         );
         rate_cell(
             painter,
@@ -1725,7 +1730,7 @@ impl App {
             r.tx_bps,
             10.5,
             p.subtext,
-            p.subtext.gamma_multiply(0.7),
+            p.unit,
         );
     }
 
@@ -2051,11 +2056,27 @@ fn toggle_row_at(ui: &mut egui::Ui, rect: egui::Rect, p: &Palette, label: &str, 
 
 /// 设置入口图标：三条带滑块的横线。手画而不是用 ⚙ 字符，
 /// 是因为 Arial Unicode 里未必有这个字形，缺字会变成方块。
+///
+/// 点击区比图形大一圈（16pt 的画，26×22pt 的判定）：100% 缩放下图标只有
+/// 16 个像素，面板里又只有这一个入口，点空一个像素就等于「设置点不动」。
 fn sliders_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+    // 判定区往外扩：左右各 5pt、往下 6pt。往上不扩 —— 页面的裁剪矩形就是
+    // 内边距以内，多出来的那半截会被裁掉，白白让点击区看起来更大。
+    let hit = egui::Rect::from_min_max(
+        rect.min - egui::vec2(5.0, 0.0),
+        rect.max + egui::vec2(5.0, 6.0),
+    );
+    let resp = ui.interact(hit, ui.id().with("settings-entry"), egui::Sense::click());
     let hovered = resp.hovered();
     let color = if hovered { p.text } else { p.subtext };
+
     let painter = ui.painter();
+    if hovered {
+        // 悬停给一块底，先让人看出「这是能点的」，再谈点不点得中
+        painter.rect_filled(rect.expand(3.0), CornerRadius::same(5), p.chip);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     for i in 0..3 {
         let y = rect.top() + 3.0 + i as f32 * 5.0;
         painter.line_segment(
@@ -2252,12 +2273,14 @@ fn empty_note(ui: &mut egui::Ui, text: &str, area_h: f32, p: &Palette) {
 /// 亮一档的字」，远看是彩色标记，近看又不抢应用名。
 fn badge(painter: &egui::Painter, rect: egui::Rect, name: &str, dark: bool) {
     let c = icons::tile_color(name);
-    let bg = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if dark { 46 } else { 30 });
+    // 浅色底上原来的 12% 淡底 + 本色字母，10pt 的字几乎糊在面板里；
+    // 底色加深一档、字再压暗一点，远看仍是彩色标记，近看才认得出字母
+    let bg = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if dark { 46 } else { 56 });
     painter.rect_filled(rect, CornerRadius::same(6), bg);
     let fg = if dark {
         mix(c, Color32::WHITE, 0.30)
     } else {
-        c
+        mix(c, Color32::BLACK, 0.22)
     };
     let initial = name
         .chars()
@@ -2268,7 +2291,7 @@ fn badge(painter: &egui::Painter, rect: egui::Rect, name: &str, dark: bool) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(10.0),
         fg,
     );
 }

@@ -124,6 +124,11 @@ pub struct Palette {
     pub panel: egui::Color32,
     pub text: egui::Color32,
     pub subtext: egui::Color32,
+    /// 速率单位（`B/s`）、计数（`· 3`）这类「注脚」文字。
+    ///
+    /// 以前是 `subtext * 0.7~0.8` 算出来的：浅底上叠两次变淡，10pt 的字
+    /// 直接糊成一片浅灰。注脚该比正文淡，但不该淡到读不出来 —— 单独一档。
+    pub unit: egui::Color32,
     /// 界面强调色：悬停描边、开关轨道。**不参与**上下行的语义
     pub accent: egui::Color32,
     /// 下行（下载）速率：绿。绿色的语义是「进来」
@@ -153,6 +158,7 @@ pub fn palette(dark: bool) -> Palette {
             panel: egui::Color32::from_rgb(28, 28, 32),
             text: egui::Color32::from_rgb(238, 238, 242),
             subtext: egui::Color32::from_rgb(148, 148, 156),
+            unit: egui::Color32::from_rgb(136, 136, 146),
             accent: egui::Color32::from_rgb(94, 178, 255),
             download: srgb(tm_core::color::download(true)),
             upload: srgb(tm_core::color::upload(true)),
@@ -162,17 +168,23 @@ pub fn palette(dark: bool) -> Palette {
             switch_off: egui::Color32::from_rgb(66, 66, 72),
         }
     } else {
+        // 浅色底上的每一档灰都往上压了一格：11pt 的中文在纯白面板上，
+        // 原来那套 (#787880 / 10% 底槽 / 10% 描边) 读起来像没画完。
+        // 层次靠字号和颜色深浅区分，不靠「淡到几乎看不见」。
         Palette {
             panel: egui::Color32::from_rgb(252, 252, 253),
             text: egui::Color32::from_rgb(24, 24, 28),
-            subtext: egui::Color32::from_rgb(120, 120, 128),
+            subtext: egui::Color32::from_rgb(92, 92, 101),
+            unit: egui::Color32::from_rgb(118, 118, 128),
             accent: egui::Color32::from_rgb(20, 110, 200),
             download: srgb(tm_core::color::download(false)),
             upload: srgb(tm_core::color::upload(false)),
-            chip: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
-            border: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 26),
-            warn: egui::Color32::from_rgb(176, 106, 12),
-            switch_off: egui::Color32::from_rgb(198, 198, 204),
+            // 底槽 = 分段控件的轨道：太淡就看不出「这是一组可选项」
+            chip: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22),
+            // 描边同时用于行卡片、分隔线和面板外框，26/255 在浅底上几乎没有边
+            border: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 36),
+            warn: egui::Color32::from_rgb(166, 96, 8),
+            switch_off: egui::Color32::from_rgb(184, 184, 192),
         }
     }
 }
