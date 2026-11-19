@@ -3,6 +3,9 @@
 //! 取图标要走 LaunchServices，冷启动一次可能几十毫秒。放在界面线程里会让
 //! 弹窗打开时卡一下，所以拆成「后台取图 + 每帧 poll」：拿不到先用首字母色块
 //! 顶上，到了再替换。
+//!
+//! 系统服务（`mDNSResponder` / `netbiosd` 这类没有 `.app` 的守护进程）压根
+//! 没有图标可取，走 [`IconSet::service_icon`] 的齿轮，不占后台队列。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,6 +15,9 @@ use eframe::egui;
 
 /// 列表里图标的显示边长（pt）。位图按 2x 渲染，见 `tm_macos::ICON_SIDE`。
 pub const ICON_PT: f32 = 18.0;
+
+/// 齿轮纹理的像素边长：18pt 在 2x 屏上的尺寸，和 `tm_macos::ICON_SIDE` 对齐。
+const SERVICE_SIDE: u32 = (ICON_PT as u32) * 2;
 
 /// 首字母色块的底色。挑的都是和面板配色不冲突的中低饱和色。
 const TILE_COLORS: [egui::Color32; 8] = [
@@ -36,6 +42,8 @@ pub struct IconSet {
     frame: u64,
     /// 键 → 最后一次被列表请求的帧号
     seen: HashMap<String, u64>,
+    /// 系统服务的齿轮，进程一生只烘一次
+    service: Option<egui::TextureHandle>,
     req_tx: Sender<String>,
     res_rx: Receiver<(String, Option<egui::ColorImage>)>,
 }
@@ -71,6 +79,7 @@ impl IconSet {
             missing: HashSet::new(),
             frame: 0,
             seen: HashMap::new(),
+            service: None,
             req_tx,
             res_rx,
         }
@@ -116,6 +125,23 @@ impl IconSet {
             }
         }
         None
+    }
+
+    /// 系统服务的齿轮纹理。形状见 [`crate::icon::gear`]，只烘一次、所有服务共用。
+    ///
+    /// 图是纯白 + 透明底：颜色交给 `painter.image` 的 tint，明暗两套主题共用
+    /// 同一张纹理，切换主题不用重新烘。
+    pub fn service_icon(&mut self) -> egui::TextureHandle {
+        if let Some(t) = &self.service {
+            return t.clone();
+        }
+        let (rgba, w, h) = crate::icon::gear(SERVICE_SIDE);
+        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        let tex = self
+            .ctx
+            .load_texture("service-gear", img, egui::TextureOptions::LINEAR);
+        self.service = Some(tex.clone());
+        tex
     }
 }
 

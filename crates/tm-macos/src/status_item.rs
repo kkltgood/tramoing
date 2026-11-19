@@ -92,14 +92,16 @@ fn is_dark(button: &objc2_app_kit::NSStatusBarButton) -> bool {
 }
 
 /// 语义色调 → 实际颜色。
+///
+/// 颜色本身**不在这里定义**：面板、这里、Windows 贴片共用
+/// `tm_core::color` 那一份，改一次三处一起变。
 fn tone_color(tone: Tone, dark: bool) -> Retained<NSColor> {
-    let (r, g, b) = match (tone, dark) {
-        (Tone::Down, true) => (0.44, 0.71, 1.00),
-        (Tone::Up, true) => (0.44, 0.85, 0.56),
-        (Tone::Down, false) => (0.09, 0.41, 0.77),
-        (Tone::Up, false) => (0.11, 0.50, 0.27),
-        (Tone::Plain, _) => return NSColor::labelColor(),
+    let rgb = match tone {
+        Tone::Down => tm_core::color::download(dark),
+        Tone::Up => tm_core::color::upload(dark),
+        Tone::Plain => return NSColor::labelColor(),
     };
+    let (r, g, b) = rgb.to_f64();
     NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
 }
 

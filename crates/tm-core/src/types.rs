@@ -96,6 +96,30 @@ pub fn format_speed(bps: f64) -> String {
     }
 }
 
+/// 是否是「系统服务」：待在自己目录里、没有 `.app` 外壳的可执行文件。
+///
+/// ```text
+/// /usr/sbin/mDNSResponder   -> true
+/// /usr/libexec/netbiosd     -> true
+/// /System/Library/...       -> true
+/// /System/Applications/Finder.app -> false（是 app，有自己的图标）
+/// /opt/homebrew/bin/node    -> false（用户装的东西，不是系统的一部分）
+/// ```
+///
+/// 这类进程 macOS 从来没给它们画过图标 —— Finder、活动监视器里也是一片空白，
+/// `NSWorkspace` 更是只能从 `.app` 里取图。列表里统一发一只齿轮，比首字母色块
+/// 更能说明「这行不是某个 app，是系统在跑的服务」。
+///
+/// 判断只看路径前缀，不看进程名：`mDNSResponder` 这种名字换个目录就未必是系统进程，
+/// 而 `/usr/sbin` 下的东西一定是。`/usr/bin` 不算 —— 那是用户随手敲的 CLI（`curl`、
+/// `ssh`），把它们全画成齿轮反而淹没了真正的后台服务。
+pub fn is_system_service(key: &str) -> bool {
+    /// 系统守护进程住的目录。macOS 的 launchd 从这几处拉起后台服务。
+    const DIRS: [&str; 4] = ["/usr/sbin/", "/usr/libexec/", "/sbin/", "/System/Library/"];
+
+    !key.ends_with(".app") && DIRS.iter().any(|d| key.starts_with(d))
+}
+
 /// 从归并键里取展示名。
 ///
 /// ```text
@@ -164,5 +188,25 @@ mod tests {
         assert_eq!(pretty_name("mDNSResponder"), "mDNSResponder");
         // 带点的进程名不能被切
         assert_eq!(pretty_name("com.docker.backend"), "com.docker.backend");
+    }
+
+    #[test]
+    fn system_services_are_recognized_by_path() {
+        assert!(is_system_service("/usr/sbin/mDNSResponder"));
+        assert!(is_system_service("/usr/libexec/netbiosd"));
+        assert!(is_system_service("/System/Library/CoreServices/foo"));
+    }
+
+    #[test]
+    fn apps_and_user_binaries_are_not_system_services() {
+        // `/System/` 下面也有 app，它们有真图标，不能吃掉
+        assert!(!is_system_service("/System/Applications/Utilities/Terminal.app"));
+        assert!(!is_system_service("/Applications/Google Chrome.app"));
+        // 用户装的 / 敲的
+        assert!(!is_system_service("/opt/homebrew/bin/node"));
+        assert!(!is_system_service("/usr/bin/curl"));
+        // 只拿到名字时无法判断，宁可退回首字母块也不要张冠李戴
+        assert!(!is_system_service("mDNSResponder"));
+        assert!(!is_system_service("pid 2043"));
     }
 }

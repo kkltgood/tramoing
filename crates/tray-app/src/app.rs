@@ -60,6 +60,8 @@ const PARKED_Y: f32 = -32000.0;
 const FOOTER_H: f32 = 20.0;
 /// 页脚带 = 空隙 + 分隔线 + 空隙 + 页脚
 const FOOTER_BAND: f32 = 8.0 + 1.0 + 4.0 + FOOTER_H;
+/// 页脚图标的点击区边长（图形本身约 14pt，四周留白算点击区）
+const FOOTER_ICON: f32 = 20.0;
 /// 近 10 分钟超量提醒行的高度（只在真的有提醒时占位）
 const ALERT_H: f32 = 24.0;
 /// 设置页里的临时提示行高度
@@ -353,7 +355,10 @@ impl App {
             },
             settings,
             retention,
-            toast: None,
+            // 调试用：TM_TOAST="导出 12 行" 让页脚一上来就带着提示，方便核对排版
+            toast: std::env::var("TM_TOAST")
+                .ok()
+                .map(|msg| (msg, Instant::now())),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
             list_scroll: std::env::var("TM_SCROLL")
                 .ok()
@@ -883,9 +888,9 @@ impl App {
             self.alert_line(ui, p, text);
         }
 
-        ui.add_space(8.0);
-        hairline(ui, p);
-        ui.add_space(4.0);
+        // 页脚自己按面板底边定位（含分隔线），这里不再补空隙：
+        // 以前是 add_space + hairline + add_space 拼出来的，加上 item_spacing
+        // 实际比 FOOTER_BAND 高出十来点，页脚就这样被顶出了面板底边
         self.footer(ui, p, lang);
     }
 
@@ -895,14 +900,10 @@ impl App {
         let mut changed = false;
 
         ui.horizontal(|ui| {
-                let back = ui.add(
-                    egui::Button::new(
-                        RichText::new(lang.t("‹ 返回", "‹ Back"))
-                            .size(12.0)
-                            .color(p.subtext),
-                    )
-                    .frame(false),
-                );
+                // 图标返回：和页脚的导出/退出同一套画法，标题栏里只留一个尖括号
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::hover());
+                let back = icon_button(ui, rect, "settings-back", p, paint_back_icon)
+                    .on_hover_text(lang.t("返回", "Back"));
                 if back.clicked() {
                     self.view = View::Main;
                 }
@@ -1190,7 +1191,7 @@ impl App {
         let col = ((ui.available_width() - METRIC_DIVIDER_W) / 2.0).max(60.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            metric(ui, col, H, "↓", lang.t("下载", "Down"), rx_text, p.accent, p.subtext);
+            metric(ui, col, H, "↓", lang.t("下载", "Down"), rx_text, p.download, p.subtext);
 
             let (r, _) = ui.allocate_exact_size(
                 Vec2::new(METRIC_DIVIDER_W, H),
@@ -1474,7 +1475,14 @@ impl App {
     /// - 行底那根占比条要垫在文字**下面**，只有先拿到整行 rect 才好画。
     fn row(&mut self, ui: &mut egui::Ui, r: &AppRate, p: &Palette) {
         let name = pretty_name(r.app.as_str());
-        let tex = self.icons.get(r.app.as_str());
+        // 系统守护进程没有 `.app`，NSWorkspace 什么都取不到：走齿轮，
+        // 也就不用把它们排进后台队列白跑一趟
+        let service = tm_core::is_system_service(r.app.as_str());
+        let tex = if service {
+            None
+        } else {
+            self.icons.get(r.app.as_str())
+        };
         let dark = p.panel.r() < 128;
 
         let width = ui.available_width();
@@ -1502,21 +1510,26 @@ impl App {
         // 数字不贴到描边上
         let right = rect.right() - ROW_PAD_X;
 
-        // 图标：真实图标直接贴；拿不到就用低饱和的字母块，比一坨纯色块轻
+        // 图标：真实图标直接贴；系统服务发齿轮；其余拿不到就用低饱和的字母块
         let icon = egui::Rect::from_min_size(
             egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - icons::ICON_PT / 2.0),
             Vec2::splat(icons::ICON_PT),
         );
-        match tex {
-            Some(t) => {
-                painter.image(
-                    t.id(),
-                    icon,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+        if service {
+            let gear = self.icons.service_icon();
+            service_badge(painter, icon, &gear, p, dark);
+        } else {
+            match tex {
+                Some(t) => {
+                    painter.image(
+                        t.id(),
+                        icon,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                None => badge(painter, icon, &name, dark),
             }
-            None => badge(painter, icon, &name, dark),
         }
 
         // 两列速率的右边界：先定数字，名字再去吃剩下的宽度
@@ -1538,7 +1551,7 @@ impl App {
             rect.center().y,
             r.rx_bps,
             12.0,
-            p.accent,
+            p.download,
             p.subtext.gamma_multiply(0.8),
         );
         rate_cell(
@@ -1597,6 +1610,13 @@ impl App {
         })
     }
 
+    /// 页脚：一条淡分隔线 + 两个图标按钮（导出历史 / 退出），临时提示画在中间。
+    ///
+    /// **整条带子只按面板底边定位、内容全靠 painter 落笔**。以前是一条流式的
+    /// `add_space(8) + hairline + add_space(4) + 两个 Button`：每次 `allocate_*`
+    /// 都会再插一次 `item_spacing`，加上按钮高度跟着字形走（中文 10.5pt 与英文
+    /// 字高不同），页脚实际高度比 [`FOOTER_BAND`] 多出十几点，把内容顶出了
+    /// 面板底边；换语言、换字号时还会变一次。现在高度恒等于 [`FOOTER_BAND`]。
     fn footer(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
         let zh = matches!(lang, Lang::Zh);
         if self
@@ -1609,49 +1629,64 @@ impl App {
         // 先拷一份：下面按钮要 &mut self，不能挂着对 toast 的借用
         let toast = self.toast.as_ref().map(|(msg, _)| msg.clone());
 
-        // 定高，页脚才永远贴着面板底边（面板高度固定，列表吃掉剩下的空间）
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), FOOTER_H),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                let export = ui.add(
-                    egui::Button::new(
-                        RichText::new(lang.t("导出", "Export"))
-                            .size(10.5)
-                            .color(p.subtext),
-                    )
-                    .frame(false),
-                );
-                if export.clicked() {
-                    self.export_history(zh);
-                }
-
-                // 临时提示直接画在页脚里：不另占一行，出现/消失时列表不会跳，
-                // 也不会在列表底下留一条永远空着的「提示槽」。
-                if let Some(msg) = &toast {
-                    let w = (ui.available_width() - 52.0).max(60.0);
-                    ui.add_sized(
-                        Vec2::new(w, FOOTER_H),
-                        egui::Label::new(
-                            RichText::new(msg.as_str()).size(10.0).color(p.subtext),
-                        )
-                        .truncate(),
-                    );
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let quit = ui.add(
-                        egui::Button::new(
-                            RichText::new(lang.t("退出", "Quit")).size(11.0).color(p.subtext),
-                        )
-                        .frame(false),
-                    );
-                    if quit.clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-            },
+        // 顶在面板底边：不跟游标走，列表怎么滚都不影响这条带子的位置
+        let full = ui.max_rect();
+        let band = egui::Rect::from_min_max(
+            egui::pos2(full.left(), full.bottom() - FOOTER_BAND),
+            full.max,
         );
+
+        let line_y = band.top() + 8.0;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(band.left(), line_y),
+                egui::pos2(band.right(), line_y + 1.0),
+            ),
+            0.0,
+            p.border,
+        );
+
+        // 图标那一行：分隔线下面空 4pt 起，到面板底边为止
+        let row = egui::Rect::from_min_max(
+            egui::pos2(band.left(), line_y + 1.0 + 4.0),
+            band.max,
+        );
+        let cy = row.center().y;
+
+        let export_rect = egui::Rect::from_center_size(
+            egui::pos2(row.left() + FOOTER_ICON / 2.0, cy),
+            Vec2::splat(FOOTER_ICON),
+        );
+        let export = icon_button(ui, export_rect, "footer-export", p, paint_export_icon)
+            .on_hover_text(lang.t("导出历史", "Export history"));
+        if export.clicked() {
+            self.export_history(zh);
+        }
+
+        // 临时提示直接画在页脚中间：不另占一行，出现/消失时列表不会跳
+        if let Some(msg) = &toast {
+            let left = export_rect.right() + 8.0;
+            let right = row.right() - FOOTER_ICON - 8.0;
+            if right - left > 40.0 {
+                ui.painter().text(
+                    egui::pos2((left + right) / 2.0, cy),
+                    egui::Align2::CENTER_CENTER,
+                    fit_name(msg, 52),
+                    egui::FontId::proportional(10.0),
+                    p.subtext,
+                );
+            }
+        }
+
+        let quit_rect = egui::Rect::from_center_size(
+            egui::pos2(row.right() - FOOTER_ICON / 2.0, cy),
+            Vec2::splat(FOOTER_ICON),
+        );
+        let quit = icon_button(ui, quit_rect, "footer-quit", p, paint_quit_icon)
+            .on_hover_text(lang.t("退出", "Quit"));
+        if quit.clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     /// 底部临时提示。过期后自动消失。
@@ -1916,6 +1951,98 @@ fn tildify(path: &str) -> String {
     path.to_owned()
 }
 
+/// 图标按钮：手画的形状 + 固定大小的点击区。页脚（导出/退出）和设置页的
+/// 返回共用。
+///
+/// 为什么不用 `egui::Button`：按钮尺寸 = 字形尺寸 + padding，中文和英文不一样，
+/// 换语言时会跟着变一点。页脚贴着面板底边，长高就会把内容顶出去；标题栏里的
+/// 返回如果带文字，也会把「设置」两字挤得不居中。这里只画字形，尺寸从一开始就定死。
+fn icon_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &str,
+    p: &Palette,
+    paint: fn(&egui::Painter, egui::Rect, Color32),
+) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(id), egui::Sense::click());
+    let color = if resp.hovered() { p.text } else { p.subtext };
+    paint(ui.painter(), rect, color);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// 导出：一个开口朝上的托盘，中间是往上走的箭头。
+///
+/// 不用「下载」那个向下箭头：导出是把数据**交出去**，箭头朝上更贴近语义，
+/// 也和老版本「导出」两个字的位置对得上。
+fn paint_export_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.35, color);
+    let half = 5.2;
+    let top = c.y + 0.9;
+    let bottom = c.y + 5.7;
+    // 托盘：三面开口的 U（底角不圆，1.3pt 的线在 14pt 里也看不出直角）
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x - half, top),
+            egui::pos2(c.x - half, bottom),
+            egui::pos2(c.x + half, bottom),
+            egui::pos2(c.x + half, top),
+        ],
+        stroke,
+    ));
+    // 箭头：竖杆 + 两撇，杆要从托盘里穿出去
+    painter.line_segment(
+        [egui::pos2(c.x, c.y + 3.6), egui::pos2(c.x, c.y - 5.9)],
+        stroke,
+    );
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x - 3.1, c.y - 2.9),
+            egui::pos2(c.x, c.y - 6.0),
+            egui::pos2(c.x + 3.1, c.y - 2.9),
+        ],
+        stroke,
+    ));
+}
+
+/// 退出：电源符号 —— 一圈留了缺口的圆 + 顶上那根竖线。
+fn paint_quit_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.35, color);
+    let r = 5.4;
+    let cy = c.y + 0.7;
+    // 缺口留在正上方：从 310° 顺着扫 280°，正好绕开 270° 那一小段
+    let mut pts = Vec::with_capacity(25);
+    for i in 0..=24 {
+        let a = (310.0 + 280.0 * i as f32 / 24.0).to_radians();
+        pts.push(egui::pos2(c.x + r * a.cos(), cy + r * a.sin()));
+    }
+    painter.add(egui::Shape::line(pts, stroke));
+    painter.line_segment(
+        [egui::pos2(c.x, c.y - 6.5), egui::pos2(c.x, c.y - 0.5)],
+        stroke,
+    );
+}
+
+/// 返回：一个左尖括号。
+///
+/// 不用「‹」字符：不同字体的字形宽度和基线都不一样，标题栏里会显得忽高忽低。
+fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.6, color);
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x + 3.4, c.y - 5.0),
+            egui::pos2(c.x - 3.2, c.y),
+            egui::pos2(c.x + 3.4, c.y + 5.0),
+        ],
+        stroke,
+    ));
+}
+
 /// 一条 1px 的淡分隔线。比 `ui.separator()` 轻，不会把面板切成几块。
 fn hairline(ui: &mut egui::Ui, p: &Palette) {
     let (rect, _) = ui.allocate_exact_size(
@@ -1979,6 +2106,32 @@ fn badge(painter: &egui::Painter, rect: egui::Rect, name: &str, dark: bool) {
         initial,
         egui::FontId::proportional(9.5),
         fg,
+    );
+}
+
+/// 系统服务的图标：中性灰底 + 齿轮。
+///
+/// 不走 [`badge`] 的彩色：那套颜色的语义是「某个应用」，系统服务恰恰要看起来
+/// 不属于任何应用。18pt 里能说清这件事的手段只剩「去饱和」—— 一圈灰底加一只
+/// 齿轮，扫一眼就知道这行是 `mDNSResponder` 那种后台东西，不是装的应用。
+fn service_badge(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    gear: &egui::TextureHandle,
+    p: &Palette,
+    dark: bool,
+) {
+    let bg = if dark {
+        Color32::from_white_alpha(16)
+    } else {
+        Color32::from_black_alpha(12)
+    };
+    painter.rect_filled(rect, CornerRadius::same(6), bg);
+    painter.image(
+        gear.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        mix(p.subtext, p.text, 0.35),
     );
 }
 

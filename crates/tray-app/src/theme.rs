@@ -124,7 +124,11 @@ pub struct Palette {
     pub panel: egui::Color32,
     pub text: egui::Color32,
     pub subtext: egui::Color32,
+    /// 界面强调色：悬停描边、开关轨道。**不参与**上下行的语义
     pub accent: egui::Color32,
+    /// 下行（下载）速率：绿。绿色的语义是「进来」
+    pub download: egui::Color32,
+    /// 上行（上传）速率：蓝
     pub upload: egui::Color32,
     pub border: egui::Color32,
     /// 分段控件的底槽
@@ -135,6 +139,14 @@ pub struct Palette {
     pub switch_off: egui::Color32,
 }
 
+/// `tm-core` 的语义色 → egui 颜色。
+///
+/// 上下行的颜色**只在 `tm_core::color` 里定义一份**：菜单栏和 Windows 贴片
+/// 也用同一份，改一处三处一起变（见 crates/tm-core/src/color.rs）。
+fn srgb(c: tm_core::Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
@@ -142,7 +154,8 @@ pub fn palette(dark: bool) -> Palette {
             text: egui::Color32::from_rgb(238, 238, 242),
             subtext: egui::Color32::from_rgb(148, 148, 156),
             accent: egui::Color32::from_rgb(94, 178, 255),
-            upload: egui::Color32::from_rgb(140, 200, 150),
+            download: srgb(tm_core::color::download(true)),
+            upload: srgb(tm_core::color::upload(true)),
             chip: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
             border: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
             warn: egui::Color32::from_rgb(240, 180, 90),
@@ -154,7 +167,8 @@ pub fn palette(dark: bool) -> Palette {
             text: egui::Color32::from_rgb(24, 24, 28),
             subtext: egui::Color32::from_rgb(120, 120, 128),
             accent: egui::Color32::from_rgb(20, 110, 200),
-            upload: egui::Color32::from_rgb(40, 130, 80),
+            download: srgb(tm_core::color::download(false)),
+            upload: srgb(tm_core::color::upload(false)),
             chip: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
             border: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 26),
             warn: egui::Color32::from_rgb(176, 106, 12),

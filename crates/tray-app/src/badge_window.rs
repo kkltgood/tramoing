@@ -313,22 +313,16 @@ fn draw(ctx: &egui::Context, data: &Arc<Mutex<BadgeData>>) {
     } else {
         Color32::from_rgb(238, 238, 242)
     };
-    // 彩色档跟面板里的强调色是同一套：下行蓝、上行绿
+    // 彩色档和面板、macOS 菜单栏共用 tm_core::color 那一份定义：
+    // 下行绿、上行蓝，改一处三处一起变
+    let tint = |c: tm_core::Rgb| Color32::from_rgb(c.0, c.1, c.2);
     let down = if data.colored {
-        if data.light {
-            Color32::from_rgb(20, 110, 200)
-        } else {
-            Color32::from_rgb(110, 184, 255)
-        }
+        tint(tm_core::color::download(!data.light))
     } else {
         fg
     };
     let up = if data.colored {
-        if data.light {
-            Color32::from_rgb(40, 130, 80)
-        } else {
-            Color32::from_rgb(134, 214, 164)
-        }
+        tint(tm_core::color::upload(!data.light))
     } else {
         fg
     };
