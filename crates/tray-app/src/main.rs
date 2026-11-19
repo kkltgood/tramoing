@@ -19,6 +19,7 @@ mod icon;
 mod icons;
 mod settings;
 mod theme;
+mod update;
 
 use eframe::egui;
 
@@ -61,6 +62,12 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--settings") {
         std::env::set_var("TM_SHOW_ON_START", "1");
         std::env::set_var("TM_VIEW", "settings");
+    }
+    // 立刻查一次更新并弹出面板（跳过启动延迟和 24 小时门槛）。
+    // 结果画在页脚；release 是 GUI 子系统，println 没有控制台可去。
+    if args.iter().any(|a| a == "--check-update") {
+        std::env::set_var("TM_FORCE_UPDATE", "1");
+        std::env::set_var("TM_SHOW_ON_START", "1");
     }
     // 无界面导出，方便脚本或定时任务调用：tramoing --export
     if args.iter().any(|a| a == "--export") {

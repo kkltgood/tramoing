@@ -61,6 +61,18 @@ pub struct Settings {
     /// Windows 的托盘图标是定死的方形，塞不进 `↓1.2M`，数字只能画在图标
     /// 上方那个自绘小窗口里；不想看的人可以在这里关掉。
     pub tray_badge: bool,
+    /// 启动后自动检查新版本。
+    ///
+    /// **默认关闭**（2026-11-19 决定先不上线）：清单地址还没定，
+    /// 开着只会让每台机器往一个占位地址发请求、再静默 404。
+    /// 想启用：用户自己在 `settings.conf` 写 `update_check=on`，
+    /// 或者在设置页点标题栏的版本号手动查一次（不改这个开关）。
+    pub update_check: bool,
+    /// 上次检查更新的时刻（Unix 秒）。0 表示从没查过。
+    ///
+    /// 存盘而不是只放内存：这个程序是常驻托盘的，用户可能几周不退出，
+    /// 每次启动都发一次请求既没必要，也会让「每天最多一次」失效。
+    pub last_check: i64,
 }
 
 impl Default for Settings {
@@ -74,6 +86,8 @@ impl Default for Settings {
             alert_mb: 0,
             tray_color: true,
             tray_badge: true,
+            update_check: false,
+            last_check: 0,
         }
     }
 }
@@ -160,6 +174,16 @@ impl Settings {
                     "off" | "false" | "0" => s.tray_badge = false,
                     _ => {}
                 },
+                "update_check" => match v {
+                    "on" | "true" | "1" => s.update_check = true,
+                    "off" | "false" | "0" => s.update_check = false,
+                    _ => {}
+                },
+                "last_check" => {
+                    if let Ok(n) = v.parse::<i64>() {
+                        s.last_check = n.max(0);
+                    }
+                }
                 _ => {} // 未知键忽略：旧版本写的字段不该让新版本报错
             }
         }
@@ -191,12 +215,16 @@ impl Settings {
              retention_days={}\n\
              alert_mb={}\n\
              tray_color={}\n\
-             tray_badge={}\n",
+             tray_badge={}\n\
+             update_check={}\n\
+             last_check={}\n",
             self.max_apps,
             self.retention_days,
             self.alert_mb,
             if self.tray_color { "on" } else { "off" },
-            if self.tray_badge { "on" } else { "off" }
+            if self.tray_badge { "on" } else { "off" },
+            if self.update_check { "on" } else { "off" },
+            self.last_check
         )
     }
 }
@@ -256,6 +284,8 @@ mod tests {
             alert_mb: 500,
             tray_color: false,
             tray_badge: false,
+            update_check: false,
+            last_check: 1_700_000_000,
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
@@ -304,5 +334,12 @@ mod tests {
     #[test]
     fn empty_file_is_default() {
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn update_check_is_off_by_default() {
+        // 2026-11-19 决定先不上线：新装用户不该有任何出网请求，
+        // 而不能指望「反正地址是占位的」——占位地址也是请求。
+        assert!(!Settings::default().update_check);
     }
 }

@@ -57,6 +57,8 @@ Windows 的托盘图标是定死的方形槽（150% DPI 下 24×24），塞不�
 - 标题栏显示最近 24 小时（或本次运行）累计流量
 - 近 10 分钟单应用流量超阈值时给一行提醒
 - 底部一条页脚：导出历史 / 退出两个图标按钮，导出结果就地显示在中间
+- 发现新版本时，页脚中间改为「v0.2.0 可用 · 点此下载」，下载完变成「点此安装」；
+  这一条不占额外高度，也不会把列表挤出去
 - 失焦自动收起，点击菜单栏图标可开可关
 - 深色 / 浅色 / 跟随系统三档外观，中文 / 英文 / 自动三档语言
 
@@ -93,9 +95,10 @@ tramoing/
 │   ├── tm-windows/                # Windows：ETW 助手、命名管道、进程路径、屏幕工作区
 │   ├── tm-store/                  # SQLite 历史库（rusqlite bundled）
 │   ├── tm-spike-mac/              # macOS 探针小程序（开发用）
-│   └── tray-app/                  # egui 面板 + 设置 + 自启 + 采样线程
+│   └── tray-app/                  # egui 面板 + 设置 + 自启 + 采样线程 + 更新检测
 ├── packaging/
 │   ├── macos/Info.plist
+│   ├── update/                    # make-manifest.ps1：算 sha256、生成 latest.json
 │   └── windows/                   # NSIS 安装包 + build.ps1
 ├── scripts/package-macos.sh       # macOS 打包：.app + DMG
 └── docs/screenshot-*.png
@@ -116,7 +119,7 @@ tramoing/
 | `tm-store` | SQLite 建表/写入/查询/清理/CSV 导出 | 否（SQLite 已 bundled） |
 | `tray-app` | 采样线程、界面、设置、自启、导出 | 平台相关部分用 cfg 隔离 |
 
-**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 114 个测试里有一半以上与平台无关的原因。
+**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 125 个测试里有一半以上与平台无关的原因。
 
 ### 3.2 数据流
 
@@ -695,9 +698,107 @@ Modern UI 2 —— 没引 MUI2 就永远不会有这一页，不是配置漏了�
 
 ---
 
-## 7. 配置与数据文件
+## 7. 更新检测与发布
 
-### 7.1 `settings.conf`
+> **当前默认关闭（2026-11-19 决定先不上线）。** 清单地址还是占位的，自动检查一开，
+> 每台机器都会往一个不存在的地址发请求、再静默 404。代码、发布脚本和联调步骤都保留，
+> 等 bucket 定好、把 `update.rs` 的 `DEFAULT_MANIFEST_URL` 换成真实地址，
+> 再把 `settings.conf` 的 `update_check` 设为 `on` 即可启用。以下描述均为**启用后**的行为。
+
+启用后，客户端每次启动**延迟 10 秒**去拉一个静态 JSON（`latest.json`），按 semver 比较版本；
+有新版本时页脚出现一行「v0.2.0 可用 · 点此下载」，点一下后台下载、校验 sha256，
+然后拉起安装包。失败一律静默，只写 `ui.log`。
+
+### 7.1 清单长什么样
+
+```json
+{
+  "version": "0.2.0",
+  "notes": "新增更新检测；修复设置页底部圆角被裁",
+  "pub_date": "2026-11-19",
+  "homepage": "https://example.com/tramoing",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://example.com/tramoing/Tramoing-0.2.0-setup.exe",
+      "sha256": "d84a82e6f71702bf44cabd6440389c763532b467c71ce98b4cc4b6adb1212780",
+      "size": 262144
+    }
+  }
+}
+```
+
+- `platforms` 的键必须和 `update.rs` 的 `PLATFORM` 常量一致（`windows-x86_64` / `macos-aarch64` / `macos-x86_64`）。
+  拼错一个字符，那个平台就**永远收不到更新**，而且没有任何报错。
+- `sha256` 长度不是 64 位十六进制时，客户端只提示不下载——没有校验的安装包不该被自动拉起。
+- 没有当前平台的条目时，点击会打开 `homepage`（浏览器兜底），而不是「点了没反应」。
+
+### 7.2 清单放哪里
+
+**不要放 `raw.githubusercontent.com`，也不要用 jsDelivr。** 本机实测（2026-11-19，
+直连与系统代理各一次）这两个域名的 HTTPS 请求全部 0 返回，`github.com` 已经到 6 秒超时边缘；
+而阿里云 OSS、腾讯云 COS 的默认域名 0.2 秒内响应。客户端是静默失败的，
+放在不可达的域名上，线上只会表现为「从来不提示更新」。
+
+推荐：**公有读的对象存储 bucket**（OSS / COS 均可），清单和安装包放同一个目录。
+默认域名就够用，不必备案，也不必单独买域名；几 MB 的包，流量费是分钱级。
+
+### 7.3 发布一步
+
+```powershell
+# 1. 改 Cargo.toml 的 version，然后打包
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
+
+# 2. 生成清单（会自动算 sha256 和 size）
+powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
+    -BaseUrl "https://<bucket>.<region>.aliyuncs.com/tramoing" `
+    -Notes "修复了 xxx"
+
+# 3. 把安装包和 dist\latest.json 一起传上去，然后**用浏览器打开一次清单地址**
+#    确认返回 JSON，而不是 AccessDenied / 404
+```
+
+第 3 步的「用浏览器打开一次」不是形式：403/404 在客户端是静默的，
+只有 `%LOCALAPPDATA%\TrafficMonitor\ui.log` 里会留一行 `[update] 检查更新失败：…`。
+
+### 7.4 客户端行为
+
+| 时机 | 行为 |
+|---|---|
+| 启动后 10 秒 | 仅当 `update_check=on` 时自动查一次（避开窗口创建和采样初始化）。**macOS 上是「第一次打开面板时」**——收起后 `update()` 停摆，那一段代码要等面板展开才跑 |
+| 之后 | 每 24 小时一次，`settings.conf` 的 `last_check` 落盘，重启不会重复查 |
+| 设置页标题栏的 `v0.1.0` | 点一下立刻查，不受上面的门槛限制 |
+| `tramoing.exe --check-update` | 同上，并弹出面板（release 没有控制台，结果只能画在界面上） |
+| 下载完成 | 存到 `…\TrafficMonitor\update\<version>\`，校验通过才改名去掉 `.part` |
+| 点「安装」 | 启动 NSIS 安装包，**不静默**：覆盖安装要停旧进程、可能要 UAC |
+
+**默认 `update_check=off`，启动时不会自动发任何请求。** 想启用就在 `settings.conf` 写 `update_check=on`。
+无论开关如何，点设置页标题栏的版本号、或加 `--check-update` 都能手动查一次。
+注意 `last_check`：联调或旧版本留下的时间戳会让「开启后第一次检查」一直等到 24 小时门槛，
+删掉这一行（或写成 `last_check=0`）即可立刻查。
+
+### 7.5 联调（不必真发一版）
+
+```bash
+cd target/update-test && python -m http.server 8765      # 放 latest.json + 假安装包
+TRAMOING_UPDATE_URL=http://127.0.0.1:8765/latest.json \
+  ./target/debug/tramoing.exe --mock --show --check-update
+```
+
+`TRAMOING_UPDATE_URL` 是**运行时**读的，换地址不用重新编译，内网部署也可以指向内部镜像。
+自动检查默认关闭，所以联调必须靠显式 `--check-update`（或点设置页版本号）触发。
+`--mock` 模式下更是只有显式 `--check-update` 才放行——否则离线演示时会一直往外连。
+
+### 7.6 macOS 的边界
+
+macOS 只做到「提示 + 下载」，不自动替换 `.app`：`/Applications` 下替换要提权，
+而且未公证的包被 Gatekeeper 拦下时没有任何可编程的反馈。
+真要做全自动，得上 Sparkle 或自己做提权助手，那是另一套工程量。
+
+---
+
+## 8. 配置与数据文件
+
+### 8.1 `settings.conf`
 
 位置：macOS `~/Library/Application Support/TrafficMonitor/`；Windows `%LOCALAPPDATA%\TrafficMonitor\`。
 
@@ -710,10 +811,12 @@ Modern UI 2 —— 没引 MUI2 就永远不会有这一页，不是配置漏了�
 | `retention_days` | 1~365 | `30` | 历史保留天数 |
 | `alert_mb` | 0~1048576 | `0` | 近 10 分钟单应用超阈值提醒，0 关闭 |
 | `tray_color` | `on` / `off` | `on` | 仅 macOS 有效 |
+| `update_check` | `on` / `off` | `off` | 启动后自动检查新版本；**默认关闭**，手动检查不受影响 |
+| `last_check` | Unix 秒 | `0` | 上次检查时刻，用来保证「一天最多一次」，重启不重置 |
 
 文件是 `key=value` 纯文本，解析永不失败：未知键和非法值直接忽略，用默认值兜底。
 
-### 7.2 数据文件
+### 8.2 数据文件
 
 | 文件 | 位置 | 说明 |
 |---|---|---|
@@ -721,26 +824,28 @@ Modern UI 2 —— 没引 MUI2 就永远不会有这一页，不是配置漏了�
 | `settings.conf` | 同上 | 用户设置 |
 | `helper.log` | 同上（Windows） | 采集助手运行日志 |
 | `etw-dump.log` | 同上（Windows） | 事件诊断日志，仅 `--dump-events` 时产生 |
+| `ui.log` | 同上 | 界面侧诊断日志：采集助手连接、更新检查结果 |
+| `update/<version>/` | 同上 | 下载好的安装包（校验通过才留在磁盘上） |
 | `Tramoing-<时间戳>.csv` | `Downloads`，失败退到应用目录下的 `exports/` | 导出结果 |
 
 `history.db` 可以用任何 SQLite 工具打开，例如 `sqlite3 history.db "select * from samples limit 5;"`。
 
 ---
 
-## 8. 测试与质量
+## 9. 测试与质量
 
-- **121 个单元测试全部通过**
+- **125 个单元测试全部通过**（跨平台合计；Windows 上实跑 90 个，`tm-macos` 的 36 个只在 macOS 上跑）
   - `tm-core` 28：速率差分、pid 复用、计数器回退、窗口补零、格式化、系统服务识别、上下行语义色
   - `tm-macos` 36：CSV 连接解析、回环配对与代理回填、TUN 隧道量守恒归属、应用归并（bundle / 全路径 / 名字三级）、pty 换行、状态栏渲染辅助
   - `tm-windows` 15：管道协议编解码、按 PID 聚合、方向表一致性
-  - `tray-app` 31：设置解析、自启 plist、CSV 导出、名称截断、齿轮位图
+  - `tray-app` 35：设置解析、自启 plist、CSV 导出、名称截断、齿轮位图、更新清单解析、semver 比较、sha256、更新开关默认值
   - `tm-store` 9：建表、upsert、范围查询、清理
   - `tm-sampler` 2：trait 与 Mock
 - `cargo check --target x86_64-pc-windows-msvc -p tm-core -p tm-sampler -p tm-windows` 通过——注意这只覆盖纯逻辑 crate，**不代表 Windows 系统调用部分已经编译验证过**。
 
 ---
 
-## 9. 提交前检查
+## 10. 提交前检查
 
 - `.gitignore` 已忽略 `target/`、`dist/`、`.workbuddy/`、`.DS_Store`
 - `docs/screenshot-*.png` 是随文档一起提交的截图
@@ -751,6 +856,6 @@ Modern UI 2 —— 没引 MUI2 就永远不会有这一页，不是配置漏了�
   git commit -m "feat: cross-platform menu bar traffic monitor v0.1.0"
   ```
 
-## 10. 许可
+## 11. 许可
 
 MIT（见根 `Cargo.toml` 的 `license` 字段）。

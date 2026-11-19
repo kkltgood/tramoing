@@ -66,6 +66,14 @@ const FOOTER_ICON: f32 = 20.0;
 const ALERT_H: f32 = 24.0;
 /// 设置页里的临时提示行高度
 const TOAST_H: f32 = 18.0;
+/// 启动后多久才去查更新。
+///
+/// 开机自启的机器上，前几秒要先建窗口、拉起采样线程、扫一遍应用图标，
+/// 再塞一个 DNS 解析进去，第一次点面板会明显迟滞。10 秒之后这些都已经安静了。
+const UPDATE_FIRST_DELAY: Duration = Duration::from_secs(10);
+/// 两次自动检查的最小间隔（秒）。一天一次足够——
+/// 这个程序常驻托盘，查太勤既费流量也让人烦。
+const UPDATE_INTERVAL_SECS: i64 = 86_400;
 
 /// 每一行的「盒子」高度（含 1px 描边）。
 ///
@@ -235,6 +243,15 @@ pub struct App {
     transition: Option<(View, Instant)>,
     /// 底部临时提示（导出结果、自启切换结果），`(文案, 起始时间)`
     toast: Option<(String, Instant)>,
+    /// 更新检测。网络动作全在后台线程，这里只是把事件攒成可画的状态。
+    update: crate::update::Updater,
+    /// 进程启动时刻。
+    ///
+    /// 自动检查要等启动 10 秒后再发请求：首帧那会儿还在建窗口、连采样线程，
+    /// 再塞一个 DNS 解析进去，开机自启的机器上第一次点面板会明显迟滞。
+    started_at: Instant,
+    /// `--check-update`：跳过「启动延迟 + 24 小时」两个门槛，立刻查一次。
+    force_update_check: bool,
     /// 列表滚动位置（点）。自己存一份是为了在滚动停下后吸附到整行：
     /// 触控板松手时偏移量常常停在半行上，视口上下就会各露半截行。
     list_scroll: f32,
@@ -385,6 +402,9 @@ impl App {
             toast: std::env::var("TM_TOAST")
                 .ok()
                 .map(|msg| (msg, Instant::now())),
+            update: crate::update::Updater::new(),
+            started_at: Instant::now(),
+            force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
             list_scroll: std::env::var("TM_SCROLL")
                 .ok()
@@ -416,6 +436,43 @@ impl App {
         app.ensure_tray();
 
         app
+    }
+
+    /// 到点就查一次更新。返回 true 表示这一帧刚发起请求。
+    ///
+    /// 判断放在每帧跑，而不是起一个定时线程：省一个线程，也让「关掉自动检查」
+    /// 这种改动立刻生效，不用等定时器下一轮。
+    ///
+    /// **macOS 上实际是「第一次打开面板时查」**：那边收起面板走
+    /// `Visible(false)`，隐藏后 eframe 不再调 `update()`（见 `park_window`），
+    /// 这一段自然也不会跑。不是 bug —— 用户点开面板那一刻正好能看到
+    /// 「正在检查更新…」，反而比在后台悄悄查更清楚。
+    fn maybe_check_update(&mut self) -> bool {
+        if self.update.is_busy() {
+            return false;
+        }
+        // `--mock` 是离线演示模式，不该悄悄往外发请求；
+        // 显式给了 --check-update 才放行，方便在假数据下核对进度条排版。
+        if std::env::var_os("TM_FORCE_MOCK").is_some() && !self.force_update_check {
+            return false;
+        }
+        let due = if self.force_update_check {
+            true
+        } else if !self.settings.update_check {
+            false
+        } else {
+            self.started_at.elapsed() >= UPDATE_FIRST_DELAY
+                && unix_now() - self.settings.last_check >= UPDATE_INTERVAL_SECS
+        };
+        if !due {
+            return false;
+        }
+        self.force_update_check = false;
+        // 先落盘再发请求：查的过程中进程被关掉，下次启动不该立刻再来一次。
+        self.settings.last_check = unix_now();
+        self.settings.save();
+        self.update.check();
+        true
     }
 
     /// 延迟创建状态栏图标，失败则过几秒重试。
@@ -761,6 +818,23 @@ impl eframe::App for App {
         self.sync_badge(ctx);
         self.icons.poll();
 
+        // ---- 更新检测 ----
+        //
+        // 网络动作全在后台线程，这里只吸收结果。失败是静默的（落 ui.log），
+        // 断网、公司防火墙这类事用户处理不了，弹出来只会让人以为程序坏了。
+        self.update.tick();
+        if self.update.poll() {
+            ctx.request_repaint();
+        }
+        if self.maybe_check_update() {
+            ctx.request_repaint();
+        }
+        if self.update.is_busy() {
+            // 下载进度挂在 1Hz 心跳上会像卡住，单独提一档；
+            // 只是检查时不必这么勤，8 秒总超时，一帧都不用多画。
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+
         // 调试模式：摆到屏幕右上角，方便截图核对排版
         if self.show_on_start && !self.visible {
             let ppp = ctx.pixels_per_point().max(1.0);
@@ -1054,6 +1128,24 @@ impl App {
                     self.goto(View::Main);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // 版本号兼「检查更新」入口。放在标题栏而不是设置行里：
+                    // 设置页的行距紧到再加一行就会把「开机自启」挤出面板
+                    // （见 PANEL_H 的注释），而标题栏右边本来就有空位。
+                    let ver = ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("v{}", crate::update::CURRENT))
+                                .size(10.0)
+                                .color(p.unit),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if ver
+                        .on_hover_text(lang.t("检查更新", "Check for updates"))
+                        .clicked()
+                    {
+                        self.update.check();
+                    }
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new(lang.t("设置", "Settings"))
                             .size(13.0)
@@ -1218,7 +1310,7 @@ impl App {
         // 提示行排在「底部块」上方：它的出现/消失只挤压中间的留白，
         // 不会把「开机自启」推上推下（toast_line 本身就是定高的）。
         ui.add_space(5.0);
-        self.toast_line(ui, p);
+        self.toast_line(ui, p, lang);
 
         // 面板高度固定，设置页内容比面板矮，剩下的那截全部留给「底部块」。
         //
@@ -1832,18 +1924,23 @@ impl App {
             self.export_history(zh);
         }
 
-        // 临时提示直接画在页脚中间：不另占一行，出现/消失时列表不会跳
-        if let Some(msg) = &toast {
-            let left = export_rect.right() + 8.0;
-            let right = row.right() - FOOTER_ICON - 8.0;
-            if right - left > 40.0 {
-                ui.painter().text(
-                    egui::pos2((left + right) / 2.0, cy),
-                    egui::Align2::CENTER_CENTER,
-                    fit_name(msg, 52),
-                    egui::FontId::proportional(10.0),
-                    p.subtext,
-                );
+        // 页脚中间这一条：有更新相关的事就显示更新，否则退回临时提示。
+        //
+        // 更新优先——用户点「检查更新」就是为了看结果，被一条三秒前的
+        // 「已导出 12 行」盖住，会像是点了没反应。
+        let left = export_rect.right() + 8.0;
+        let right = row.right() - FOOTER_ICON - 8.0;
+        if !self.update_strip(ui, p, lang, left, right, cy) {
+            if let Some(msg) = &toast {
+                if right - left > 40.0 {
+                    ui.painter().text(
+                        egui::pos2((left + right) / 2.0, cy),
+                        egui::Align2::CENTER_CENTER,
+                        fit_name(msg, 52),
+                        egui::FontId::proportional(10.0),
+                        p.subtext,
+                    );
+                }
             }
         }
 
@@ -1858,10 +1955,133 @@ impl App {
         }
     }
 
-    /// 底部临时提示。过期后自动消失。
+    /// 更新状态对应的文案。`None` 表示这一帧没有要显示的。
     ///
-    /// 同样**定高**：提示出现六秒后消失，不能让列表在那一瞬间长高一截。
-    fn toast_line(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// 抽出来是因为主面板页脚和设置页提示行都要画它：点设置页的版本号
+    /// 也能触发检查，那边如果什么都不显示，用户会以为按钮坏了。
+    fn update_text(&self, lang: Lang) -> Option<(String, bool)> {
+        use crate::update::Phase;
+        let zh = matches!(lang, Lang::Zh);
+        let (text, actionable) = match &self.update.phase {
+            Phase::Idle => return None,
+            Phase::Checking => (lang.t("正在检查更新…", "Checking…").to_owned(), false),
+            Phase::Latest => (lang.t("已是最新版本", "Up to date").to_owned(), false),
+            Phase::Available(a) => (
+                if zh {
+                    format!("v{} 可用 · 点此下载", a.version)
+                } else {
+                    format!("v{} available · click", a.version)
+                },
+                true,
+            ),
+            Phase::Downloading { version, pct } => (
+                if zh {
+                    format!("正在下载 v{} · {:.0}%", version, pct * 100.0)
+                } else {
+                    format!("Downloading v{} · {:.0}%", version, pct * 100.0)
+                },
+                false,
+            ),
+            Phase::Ready { version, .. } => (
+                if zh {
+                    format!("v{} 已就绪 · 点此安装", version)
+                } else {
+                    format!("v{} ready · click to install", version)
+                },
+                true,
+            ),
+            Phase::Error(e) => (e.clone(), false),
+        };
+        Some((text, actionable))
+    }
+
+    /// 点更新提示之后干什么。两个入口（页脚、设置页）共用。
+    fn update_action(&mut self) {
+        use crate::update::Phase;
+        // 先拷一份：下面要 &mut self，不能挂着对 phase 的借用
+        match &self.update.phase.clone() {
+            // 清单里没有本平台的包时退而求其次：打开下载页。
+            // 直接什么都不做的话，用户看到「可点」却点不动，比不提示更糟。
+            Phase::Available(a) if a.asset.is_none() => {
+                if let Err(e) = crate::update::open_url(&a.homepage) {
+                    self.toast = Some((e, Instant::now()));
+                }
+            }
+            Phase::Available(a) => self.update.download(a),
+            Phase::Ready { path, .. } => {
+                if let Err(e) = crate::update::run_installer(path) {
+                    self.toast = Some((e, Instant::now()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 页脚中间的更新提示。返回 `true` 表示这一帧它占用了提示区。
+    ///
+    /// 只有「有新版本 / 下载中 / 可安装 / 刚查完」才出现。这一条**不占额外高度**：
+    /// 面板高度是写死的，在列表上方加横幅会把最后一行挤出去；页脚中间本来是
+    /// 临时提示的位置，复用最安全。
+    ///
+    /// 可点的两种状态（可下载、可安装）才注册 click；其余用 `Sense::hover`，
+    /// 免得用户点「正在下载」反而把状态搅乱。
+    fn update_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        lang: Lang,
+        left: f32,
+        right: f32,
+        cy: f32,
+    ) -> bool {
+        use crate::update::Phase;
+        let Some((text, actionable)) = self.update_text(lang) else {
+            return false;
+        };
+        if right - left < 40.0 {
+            return true;
+        }
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(left, cy - FOOTER_H / 2.0),
+            egui::pos2(right, cy + FOOTER_H / 2.0),
+        );
+        let sense = if actionable {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let mut resp = ui.allocate_rect(rect, sense);
+        if actionable {
+            resp = resp.on_hover_text(lang.t("点击继续", "Click to continue"));
+        }
+        let color = if matches!(&self.update.phase, Phase::Error(_)) {
+            p.warn
+        } else if actionable && resp.hovered() {
+            // 可点的那两种状态用强调色：页脚平时全是灰字，
+            // 只有这里需要用户动手，值得抢一次注意力。
+            p.accent
+        } else {
+            p.subtext
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            fit_name(&text, 50),
+            egui::FontId::proportional(10.0),
+            color,
+        );
+
+        if actionable && resp.clicked() {
+            self.update_action();
+        }
+        true
+    }
+
+    /// 设置页的提示行。定高，过期自动消失。
+    ///
+    /// 更新状态优先于普通提示：版本号就挂在这一页的标题栏上，点完必须有个回声，
+    /// 否则用户不知道是「还在查」还是「按钮是假的」。
+    fn toast_line(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
         if self
             .toast
             .as_ref()
@@ -1869,10 +2089,43 @@ impl App {
         {
             self.toast = None;
         }
-        let (rect, _) = ui.allocate_exact_size(
+        let update = self.update_text(lang);
+        let actionable = update.as_ref().is_some_and(|(_, a)| *a);
+        let rect = egui::Rect::from_min_size(
+            ui.cursor().min,
             Vec2::new(ui.available_width(), TOAST_H),
-            egui::Sense::hover(),
         );
+        let sense = if actionable {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let mut resp = ui.allocate_rect(rect, sense);
+        if actionable {
+            resp = resp.on_hover_text(lang.t("点击继续", "Click to continue"));
+        }
+
+        if let Some((text, _)) = &update {
+            let color = if matches!(&self.update.phase, crate::update::Phase::Error(_)) {
+                p.warn
+            } else if actionable && resp.hovered() {
+                p.accent
+            } else {
+                p.subtext
+            };
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                fit_name(text, 54),
+                egui::FontId::proportional(10.0),
+                color,
+            );
+            if actionable && resp.clicked() {
+                self.update_action();
+            }
+            return;
+        }
+
         let Some((msg, _)) = &self.toast else { return };
         ui.painter().text(
             rect.left_center(),
@@ -2105,6 +2358,14 @@ fn resolve_lang(mode: LangMode, auto: Lang) -> Lang {
         LangMode::Zh => Lang::Zh,
         LangMode::En => Lang::En,
     }
+}
+
+/// 当前 Unix 秒。只用来和 `settings.last_check` 比间隔，不需要日历精度。
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn fit_name(name: &str, max_units: usize) -> String {
