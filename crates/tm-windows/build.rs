@@ -7,6 +7,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=../../assets/tramoing.ico");
+    println!("cargo:rerun-if-changed=../../packaging/windows/app.manifest");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -21,6 +22,8 @@ fn main() {
     }
 
     let mut res = winresource::WindowsResource::new();
+    // 测试宿主同样需要 Windows 8+ 兼容声明，才能创建合成子窗口。
+    res.set_manifest_file("../../packaging/windows/app.manifest");
     res.set_icon("../../assets/tramoing.ico");
     res.set_language(0x0804);
     res.set("ProductName", "Tramoing");
@@ -51,9 +54,12 @@ fn find_rc() -> Option<std::path::PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("10.")))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("10."))
+        })
         .collect();
-    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.sort_by_key(|a| version_key(a));
     for v in versions.iter().rev() {
         let rc = v.join("x64").join("rc.exe");
         if rc.exists() {

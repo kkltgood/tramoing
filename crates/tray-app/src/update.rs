@@ -87,7 +87,10 @@ pub enum Event {
     Checked(Option<Available>),
     Failed(String),
     Progress(f32),
-    Downloaded { version: String, path: PathBuf },
+    Downloaded {
+        version: String,
+        path: PathBuf,
+    },
     DownloadFailed(String),
 }
 
@@ -109,9 +112,15 @@ pub enum Phase {
     /// 已是最新。页脚短暂显示一下，让手动检查有反馈。
     Latest,
     Available(Available),
-    Downloading { version: String, pct: f32 },
+    Downloading {
+        version: String,
+        pct: f32,
+    },
     /// 下载并校验完了，等用户点「安装」
-    Ready { version: String, path: PathBuf },
+    Ready {
+        version: String,
+        path: PathBuf,
+    },
     Error(String),
 }
 
@@ -199,14 +208,12 @@ impl Updater {
             pct: 0.0,
         });
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            match download_and_verify(&asset, &version, &tx) {
-                Ok(path) => {
-                    let _ = tx.send(Event::Downloaded { version, path });
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::DownloadFailed(e));
-                }
+        std::thread::spawn(move || match download_and_verify(&asset, &version, &tx) {
+            Ok(path) => {
+                let _ = tx.send(Event::Downloaded { version, path });
+            }
+            Err(e) => {
+                let _ = tx.send(Event::DownloadFailed(e));
             }
         });
     }
@@ -237,10 +244,7 @@ impl Updater {
                 Event::Progress(pct) => {
                     if let Phase::Downloading { version, .. } = &self.phase {
                         let version = version.clone();
-                        self.set(Phase::Downloading {
-                            version,
-                            pct,
-                        });
+                        self.set(Phase::Downloading { version, pct });
                     }
                 }
                 Event::Downloaded { version, path } => {
@@ -332,7 +336,9 @@ fn download_and_verify(
     let mut written: u64 = 0;
     let mut last_pct = -1.0f32;
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("读流出错：{e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("读流出错：{e}"))?;
         if n == 0 {
             break;
         }
@@ -419,10 +425,7 @@ pub fn run_installer(path: &Path) -> Result<(), String> {
     {
         // 安装程序自己会 taskkill 旧进程（见 packaging/windows/traffic-monitor.nsi
         // 的 CheckRunning），所以这里只负责启动，不提前退出。
-        std::process::Command::new(path)
-            .spawn()
-            .map_err(|e| format!("启动安装包失败：{e}"))?;
-        Ok(())
+        tm_windows::launch::elevated(path)
     }
     #[cfg(target_os = "macos")]
     {

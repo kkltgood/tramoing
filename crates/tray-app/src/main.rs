@@ -17,6 +17,7 @@ mod badge_window;
 mod engine;
 mod icon;
 mod icons;
+mod instance;
 mod settings;
 mod theme;
 mod update;
@@ -37,7 +38,12 @@ impl log::Log for StderrLogger {
     }
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
+            eprintln!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
         }
     }
     fn flush(&self) {}
@@ -99,6 +105,15 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+
+    let _instance = match instance::Instance::acquire() {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            update::log_line(&format!("无法取得界面实例锁：{e}"));
+            return Err(eframe::Error::AppCreation(Box::new(e)));
+        }
+    };
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("Tramoing")

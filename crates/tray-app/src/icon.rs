@@ -180,22 +180,22 @@ mod tests {
     fn edges_are_antialiased() {
         // 超采样降采样后必须出现「半透明」的边缘像素，否则会是一锯齿
         let (buf, _, _) = waveform();
-        let soft = buf
-            .chunks(4)
-            .filter(|p| p[3] > 8 && p[3] < 247)
-            .count();
+        let soft = buf.chunks(4).filter(|p| p[3] > 8 && p[3] < 247).count();
         assert!(soft > 20, "只找到 {soft} 个过渡像素，抗锯齿没生效");
     }
 
     #[test]
-    fn tinted_variant_carries_color_and_keeps_shape() {        // Windows 的托盘图标不参与模板反色，颜色必须真的写进像素里
+    fn tinted_variant_carries_color_and_keeps_shape() {
+        // Windows 的托盘图标不参与模板反色，颜色必须真的写进像素里
         let (buf, w, h) = waveform_tinted(32, [255, 255, 255]);
         assert_eq!((w, h), (32, 32));
         assert_eq!(buf.len(), 32 * 32 * 4);
         let opaque: Vec<_> = buf.chunks(4).filter(|p| p[3] > 200).collect();
         assert!(!opaque.is_empty(), "缩到 32px 后波形没了");
         assert!(
-            opaque.iter().all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255),
+            opaque
+                .iter()
+                .all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255),
             "染色没有落到不透明像素上"
         );
         // 放大缩小后仍然只占画布的一小部分，不能糊成一块

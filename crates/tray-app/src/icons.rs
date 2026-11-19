@@ -92,9 +92,11 @@ impl IconSet {
             self.pending.remove(&key);
             match img {
                 Some(img) => {
-                    let tex = self
-                        .ctx
-                        .load_texture(format!("app-icon:{key}"), img, egui::TextureOptions::LINEAR);
+                    let tex = self.ctx.load_texture(
+                        format!("app-icon:{key}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
                     self.textures.insert(key, tex);
                 }
                 None => {
@@ -108,7 +110,8 @@ impl IconSet {
             // 面板每秒至少重绘一次，600 帧≈10 分钟没上过榜的图标可以丢掉
             self.textures
                 .retain(|k, _| now.saturating_sub(*self.seen.get(k).unwrap_or(&0)) < 600);
-            self.seen.retain(|k, _| self.textures.contains_key(k) || self.pending.contains(k));
+            self.seen
+                .retain(|k, _| self.textures.contains_key(k) || self.pending.contains(k));
         }
     }
 
@@ -119,10 +122,11 @@ impl IconSet {
         if let Some(t) = self.textures.get(key) {
             return Some(t.clone());
         }
-        if !self.pending.contains(key) && !self.missing.contains(key) {
-            if self.req_tx.send(key.to_owned()).is_ok() {
-                self.pending.insert(key.to_owned());
-            }
+        if !self.pending.contains(key)
+            && !self.missing.contains(key)
+            && self.req_tx.send(key.to_owned()).is_ok()
+        {
+            self.pending.insert(key.to_owned());
         }
         None
     }
@@ -160,10 +164,10 @@ fn load(key: &str) -> Option<egui::ColorImage> {
     #[cfg(target_os = "macos")]
     {
         let bmp = tm_macos::app_icon(key)?;
-        return Some(egui::ColorImage::from_rgba_unmultiplied(
+        Some(egui::ColorImage::from_rgba_unmultiplied(
             [bmp.width as usize, bmp.height as usize],
             &bmp.rgba,
-        ));
+        ))
     }
 
     #[cfg(windows)]

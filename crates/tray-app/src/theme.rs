@@ -197,9 +197,7 @@ mod tests {
     fn accepts_collections_but_not_garbage() {
         // .ttc（字体集合）要收：Windows 的中文字体几乎都是集合，
         // egui 的 FontData 带 index，取第 0 个字面就行
-        assert!(looks_like_font(
-            b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00\x00"
-        ));
+        assert!(looks_like_font(b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00\x00"));
         assert!(looks_like_font(&[
             0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
         ]));

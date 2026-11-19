@@ -29,6 +29,8 @@ pub struct RateCalculator {
     last_at: Option<Instant>,
     /// 两次更新间隔小于此值就丢弃这一帧，防止采样抖动导致速率被放大。
     min_dt: Duration,
+    deltas: Vec<(AppKey, u64, u64)>,
+    new_counters_start_at_zero: bool,
 }
 
 impl Default for RateCalculator {
@@ -56,6 +58,8 @@ impl RateCalculator {
             alpha: alpha.clamp(0.05, 1.0),
             last_at: None,
             min_dt: Duration::from_millis(100),
+            deltas: Vec::new(),
+            new_counters_start_at_zero: false,
         }
     }
 
@@ -67,6 +71,7 @@ impl RateCalculator {
     /// 那会把全部进程都列出来（本机 26 个），下一帧只剩真正有流量的几个，
     /// 列表在一秒内从 26 行塌到 3 行，比空白更晃眼。
     pub fn update(&mut self, now: Instant, samples: &[ProcSample]) -> Vec<AppRate> {
+        self.deltas.clear();
         let dt = match self.last_at {
             None => {
                 self.rebuild_baseline(samples);
@@ -82,6 +87,7 @@ impl RateCalculator {
 
         // 1) 逐进程差分，并按 app 累加
         let mut per_app: HashMap<&AppKey, (f64, f64)> = HashMap::new();
+        let mut deltas: HashMap<AppKey, (u64, u64)> = HashMap::new();
         for s in samples {
             let (drx, dtx) = match self.prev.get(&s.pid) {
                 Some(p) if p.app == s.app => (
@@ -92,17 +98,27 @@ impl RateCalculator {
                     counter_delta(s.tx_total, p.tx),
                 ),
                 // 首次见到的 pid，或 pid 被复用：本帧无基线，不计增量
-                _ => (0.0, 0.0),
+                _ if self.new_counters_start_at_zero => (s.rx_total, s.tx_total),
+                _ => (0, 0),
             };
 
             let entry = per_app.entry(&s.app).or_insert((0.0, 0.0));
-            entry.0 += drx / dt;
-            entry.1 += dtx / dt;
+            entry.0 += drx as f64 / dt;
+            entry.1 += dtx as f64 / dt;
+            if drx > 0 || dtx > 0 {
+                let d = deltas.entry(s.app.clone()).or_default();
+                d.0 = d.0.saturating_add(drx);
+                d.1 = d.1.saturating_add(dtx);
+            }
 
             let sess = self.session.entry(s.app.clone()).or_insert((0, 0));
-            sess.0 = sess.0.saturating_add(drx as u64);
-            sess.1 = sess.1.saturating_add(dtx as u64);
+            sess.0 = sess.0.saturating_add(drx);
+            sess.1 = sess.1.saturating_add(dtx);
         }
+        self.deltas = deltas
+            .into_iter()
+            .map(|(app, (rx, tx))| (app, rx, tx))
+            .collect();
 
         // 2) EMA 平滑；本帧没出现的应用向 0 衰减，避免残留旧速度
         //    权重按实际间隔换算：间隔越长，越该相信这一帧的瞬时值。
@@ -158,6 +174,28 @@ impl RateCalculator {
         }
     }
 
+    /// 采集器自行从零累计的计数器：启动基线之后，新出现的进程首帧也是流量。
+    pub fn set_new_counters_start_at_zero(&mut self, value: bool) {
+        self.new_counters_start_at_zero = value;
+    }
+
+    /// 原始整数增量，独立于 EMA 和 UI 的最小显示阈值。
+    pub fn take_deltas(&mut self) -> Vec<(AppKey, u64, u64)> {
+        std::mem::take(&mut self.deltas)
+    }
+
+    /// 数据源重建后重新取基线，保留用户的本次累计。
+    pub fn reset_baseline(&mut self) {
+        self.prev.clear();
+        self.ema.clear();
+        self.deltas.clear();
+        self.last_at = None;
+    }
+
+    pub fn clear_rates(&mut self) {
+        self.ema.clear();
+    }
+
     /// 当前平滑后的快照，不推进时间。UI 在弹窗关闭期间可以反复取。
     pub fn snapshot(&self) -> Vec<AppRate> {
         let mut out: Vec<AppRate> = self
@@ -199,17 +237,38 @@ impl RateCalculator {
 
 /// 计数器差分。若新值小于旧值，说明底层计数器重置了，
 /// 此时把新值整体当作增量，而不是 saturating_sub 得 0 把这段流量丢掉。
-fn counter_delta(cur: u64, prev: u64) -> f64 {
+fn counter_delta(cur: u64, prev: u64) -> u64 {
     if cur >= prev {
-        (cur - prev) as f64
+        cur - prev
     } else {
-        cur as f64
+        cur
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_preserves_first_delta_and_sub_display_threshold_bytes() {
+        let mut c = RateCalculator::new();
+        let t = Instant::now();
+        c.update(t, &[s(1, "a", 0, 0)]);
+        c.update(t + Duration::from_secs(2), &[s(1, "a", 1, 0)]);
+        assert!(c.snapshot().is_empty());
+        assert_eq!(c.take_deltas(), vec![(AppKey::from("a"), 1, 0)]);
+        assert!(c.take_deltas().is_empty());
+    }
+
+    #[test]
+    fn source_owned_counters_include_new_app_first_bytes() {
+        let mut c = RateCalculator::new();
+        c.set_new_counters_start_at_zero(true);
+        let t = Instant::now();
+        c.update(t, &[]);
+        c.update(t + Duration::from_secs(1), &[s(2, "new", 10_000, 200)]);
+        assert_eq!(c.session_total(), (10_000, 200));
+    }
 
     fn s(pid: u32, app: &str, rx: u64, tx: u64) -> ProcSample {
         ProcSample::new(pid, app, rx, tx)
@@ -259,7 +318,11 @@ mod tests {
         let out = c.update(t0 + Duration::from_secs(1), &[s(1, "app", 100, 0)]);
 
         assert_eq!(out.len(), 1);
-        assert!((out[0].rx_bps - 100.0).abs() < 1.0, "得到 {}", out[0].rx_bps);
+        assert!(
+            (out[0].rx_bps - 100.0).abs() < 1.0,
+            "得到 {}",
+            out[0].rx_bps
+        );
     }
 
     #[test]
@@ -272,10 +335,7 @@ mod tests {
         assert!(out.is_empty(), "pid 复用帧应被跳过");
 
         // 下一帧才正常计算
-        let out = c.update(
-            t0 + Duration::from_secs(2),
-            &[s(42, "new", 9_001_000, 0)],
-        );
+        let out = c.update(t0 + Duration::from_secs(2), &[s(42, "new", 9_001_000, 0)]);
         assert_eq!(out.len(), 1);
         assert!((out[0].rx_bps - 1000.0).abs() < 1.0);
     }
@@ -303,7 +363,10 @@ mod tests {
         let mut c = RateCalculator::with_smoothing(0.7);
         let t0 = Instant::now();
         c.update(t0, &[s(1, "app", 0, 0), s(2, "idle", 0, 0)]);
-        c.update(t0 + Duration::from_secs(1), &[s(1, "app", 5000, 0), s(2, "idle", 0, 0)]);
+        c.update(
+            t0 + Duration::from_secs(1),
+            &[s(1, "app", 5000, 0), s(2, "idle", 0, 0)],
+        );
 
         let mut t = t0 + Duration::from_secs(1);
         for _ in 0..20 {
@@ -334,7 +397,11 @@ mod tests {
         let t0 = Instant::now();
         c.update(t0, &[s(1, "new", 0, 0)]);
         let out = c.update(t0 + Duration::from_secs(1), &[s(1, "new", 1000, 0)]);
-        assert!((out[0].rx_bps - 1000.0).abs() < 1.0, "得到 {}", out[0].rx_bps);
+        assert!(
+            (out[0].rx_bps - 1000.0).abs() < 1.0,
+            "得到 {}",
+            out[0].rx_bps
+        );
     }
 
     #[test]

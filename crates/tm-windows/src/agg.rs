@@ -73,7 +73,7 @@ impl Aggregator {
             })
             .collect();
         // 按总量降序，界面端即使不排序也大致是对的
-        procs.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx)));
+        procs.sort_by_key(|p| std::cmp::Reverse(p.rx.saturating_add(p.tx)));
         Frame {
             seq: self.seq,
             procs,
@@ -96,13 +96,97 @@ impl Aggregator {
 
     /// 只保留这些 pid，丢掉已退出的进程（防止长跑时无限增长）。
     pub fn retain_pids(&mut self, alive: &[u32]) {
+        let alive: std::collections::HashSet<_> = alive.iter().copied().collect();
         self.map.retain(|pid, _| alive.contains(pid));
+    }
+
+    /// 取走这一批原始增量；采样线程独立于管道连接，历史 PID 不在这里积累。
+    pub fn drain_with<F>(&mut self, name_of: F) -> Frame
+    where
+        F: FnMut(u32) -> String,
+    {
+        let frame = self.snapshot_with(name_of);
+        self.map.clear();
+        frame
+    }
+}
+
+/// 对外累计按应用，PID 只留在一秒的原始事件批次中。
+/// 合成 ID 在同一次助手运行里不复用，过期应用再次出现从零累计。
+#[derive(Default)]
+pub struct AppAccumulator {
+    apps: HashMap<String, (u32, Counter, u64)>,
+    next_id: u32,
+    seq: u64,
+}
+
+impl AppAccumulator {
+    pub fn update(&mut self, deltas: Frame) -> Frame {
+        self.seq += 1;
+        self.apps
+            .retain(|_, (_, _, seen)| self.seq.saturating_sub(*seen) <= 600);
+        for p in deltas.procs {
+            // 极端工作负载超过协议容量时保留总量，归到一个明确的汇总行。
+            let name = if !self.apps.contains_key(&p.name)
+                && self.apps.len() >= crate::proto::MAX_PROCS as usize - 1
+            {
+                "其他应用（采集容量上限）".to_owned()
+            } else {
+                p.name
+            };
+            let entry = self.apps.entry(name).or_insert_with(|| {
+                self.next_id = self.next_id.wrapping_add(1);
+                (self.next_id, Counter::default(), self.seq)
+            });
+            entry.1.rx = entry.1.rx.saturating_add(p.rx);
+            entry.1.tx = entry.1.tx.saturating_add(p.tx);
+            entry.2 = self.seq;
+        }
+        Frame {
+            seq: self.seq,
+            procs: self
+                .apps
+                .iter()
+                .map(|(name, (pid, c, _))| ProcEntry {
+                    pid: *pid,
+                    name: name.clone(),
+                    rx: c.rx,
+                    tx: c.tx,
+                })
+                .collect(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_churn_stays_bounded_and_preserves_final_bytes() {
+        let mut raw = Aggregator::new();
+        let mut apps = AppAccumulator::default();
+        for pid in 1..5000 {
+            raw.add(pid, Dir::Rx, 10);
+            let frame = apps.update(raw.drain_with(|_| "same.exe".into()));
+            assert!(raw.is_empty());
+            assert_eq!(frame.procs.len(), 1);
+            assert_eq!(frame.procs[0].rx, pid as u64 * 10);
+            assert!(Frame::decode(&frame.encode().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn application_capacity_never_generates_an_invalid_frame() {
+        let mut raw = Aggregator::new();
+        for pid in 1..5000 {
+            raw.add(pid, Dir::Rx, 1);
+        }
+        let mut apps = AppAccumulator::default();
+        let frame = apps.update(raw.drain_with(|pid| format!("{pid}.exe")));
+        assert_eq!(frame.procs.iter().map(|p| p.rx).sum::<u64>(), 4999);
+        assert!(Frame::decode(&frame.encode().unwrap()).is_ok());
+    }
 
     fn name_of(pid: u32) -> String {
         format!("proc{pid}.exe")

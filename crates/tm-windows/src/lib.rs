@@ -26,6 +26,10 @@ pub mod etw;
 #[cfg(windows)]
 pub mod icon;
 #[cfg(windows)]
+pub mod instance;
+#[cfg(windows)]
+pub mod launch;
+#[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
 pub mod proc;

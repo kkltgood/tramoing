@@ -14,6 +14,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=../../assets/tramoing.ico");
+    println!("cargo:rerun-if-changed=../../packaging/windows/app.manifest");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -29,6 +30,7 @@ fn main() {
     }
 
     let mut res = winresource::WindowsResource::new();
+    res.set_manifest_file("../../packaging/windows/app.manifest");
     res.set_icon("../../assets/tramoing.ico");
     // 0x0804 = 中文（简体）。语言 ID 决定文件属性里那几行的语言归属，
     // 不影响程序本身。
@@ -63,10 +65,13 @@ fn find_rc() -> Option<std::path::PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("10.")))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("10."))
+        })
         .collect();
     // 目录名是 SDK 版本号，逐段按数字比，取最新的那个
-    versions.sort_by(|a, b| version_key(a).cmp(&version_key(b)));
+    versions.sort_by_key(|a| version_key(a));
     for v in versions.iter().rev() {
         let rc = v.join("x64").join("rc.exe");
         if rc.exists() {

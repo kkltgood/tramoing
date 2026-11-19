@@ -33,7 +33,13 @@ pub fn process_name(pid: u32) -> Option<String> {
     }
     let mut buf = [0u8; BUF_LEN];
     // SAFETY: buf 是本栈上的连续内存，长度如实传入；proc_name 只会写入不超过该长度的字节。
-    let n = unsafe { proc_name(pid as c_int, buf.as_mut_ptr() as *mut c_void, BUF_LEN as u32) };
+    let n = unsafe {
+        proc_name(
+            pid as c_int,
+            buf.as_mut_ptr() as *mut c_void,
+            BUF_LEN as u32,
+        )
+    };
     if n <= 0 {
         return None;
     }
@@ -58,7 +64,13 @@ pub fn executable_path(pid: u32) -> Option<String> {
     }
     let mut buf = [0u8; PATH_BUF_LEN];
     // SAFETY: buf 是连续栈内存，长度如实传入；proc_pidpath 不会写入超过该长度的字节。
-    let n = unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_void, PATH_BUF_LEN as u32) };
+    let n = unsafe {
+        proc_pidpath(
+            pid as c_int,
+            buf.as_mut_ptr() as *mut c_void,
+            PATH_BUF_LEN as u32,
+        )
+    };
     if n <= 0 {
         return None;
     }

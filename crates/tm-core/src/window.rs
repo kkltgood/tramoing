@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::types::AppKey;
 
-/// 一个槽位存一秒的增量。u32 够用（单进程 4GB/s 不现实），省一半内存。
-type Slot = (u32, u32);
+/// 一个槽位存一秒的原始字节，保留 u64 精度以覆盖高速网卡和延迟采样。
+type Slot = (u64, u64);
 
 /// 最多记住 1 小时
 pub const MAX_SLOTS: usize = 3600;
@@ -24,6 +24,9 @@ pub struct WindowTracker {
     max_slots: usize,
     per_app: HashMap<AppKey, VecDeque>,
     total: VecDeque,
+    clock: Option<std::time::Instant>,
+    started: Option<std::time::Instant>,
+    elapsed: f64,
 }
 
 type VecDeque = std::collections::VecDeque<Slot>;
@@ -41,6 +44,9 @@ impl WindowTracker {
             max_slots,
             per_app: HashMap::new(),
             total: std::collections::VecDeque::with_capacity(max_slots),
+            clock: None,
+            started: None,
+            elapsed: 0.0,
         }
     }
 
@@ -51,7 +57,11 @@ impl WindowTracker {
         let mut total_tx = 0u64;
 
         for (app, rx, tx) in deltas {
-            let d = self.per_app.entry(app.clone()).or_default();
+            let history = self.total.len().min(self.max_slots.saturating_sub(1));
+            let d = self
+                .per_app
+                .entry(app.clone())
+                .or_insert_with(|| std::iter::repeat_n((0, 0), history).collect());
             push_slot(d, *rx, *tx, self.max_slots);
             seen.insert(app);
             total_rx = total_rx.saturating_add(*rx);
@@ -68,6 +78,50 @@ impl WindowTracker {
         push_slot(&mut self.total, total_rx, total_tx, self.max_slots);
     }
 
+    /// 按真实单调时钟推进；超时/休眠期间补空桶，同一秒的数据合并。
+    /// 输入为观测到的增量，无法从累计采样反推丢失期间的逐包时间。
+    pub fn push_at(&mut self, now: std::time::Instant, deltas: &[(AppKey, u64, u64)]) {
+        let started = *self.started.get_or_insert(now);
+        self.elapsed = now.saturating_duration_since(started).as_secs_f64();
+        let Some(clock) = self.clock else {
+            self.clock = Some(now);
+            self.push(deltas);
+            return;
+        };
+        let elapsed = now.saturating_duration_since(clock).as_secs();
+        if elapsed > 0 {
+            for _ in 0..elapsed.min(self.max_slots as u64) {
+                self.push(&[]);
+            }
+            self.clock = Some(clock + std::time::Duration::from_secs(elapsed));
+        }
+        for (app, rx, tx) in deltas {
+            let d = self
+                .per_app
+                .entry(app.clone())
+                .or_insert_with(|| std::iter::repeat_n((0, 0), self.total.len()).collect());
+            if let Some(slot) = d.back_mut() {
+                slot.0 = slot.0.saturating_add(*rx);
+                slot.1 = slot.1.saturating_add(*tx);
+            }
+            if let Some(slot) = self.total.back_mut() {
+                slot.0 = slot.0.saturating_add(*rx);
+                slot.1 = slot.1.saturating_add(*tx);
+            }
+        }
+    }
+
+    pub fn bytes(&self, secs: usize) -> Vec<(AppKey, u64, u64)> {
+        let n = secs.clamp(1, self.max_slots);
+        self.per_app
+            .iter()
+            .filter_map(|(app, d)| {
+                let (rx, tx) = sum_last(d, n);
+                (rx > 0 || tx > 0).then(|| (app.clone(), rx, tx))
+            })
+            .collect()
+    }
+
     /// 最近 `secs` 秒的平均速率（字节/秒），按总量降序。
     ///
     /// 分母取「实际攒到的秒数」和 `secs` 里小的那个：刚启动 5 秒时看「1小时」，
@@ -75,13 +129,13 @@ impl WindowTracker {
     /// 「最近 N 秒的平均」。
     pub fn rates(&self, secs: usize) -> Vec<(AppKey, f64, f64)> {
         let n = secs.clamp(1, self.max_slots);
+        let denom = self.denominator(n);
 
         let mut out: Vec<(AppKey, f64, f64)> = self
             .per_app
             .iter()
             .filter_map(|(app, d)| {
                 let (rx, tx) = sum_last(d, n);
-                let denom = n.min(d.len()).max(1) as f64;
                 let (rx, tx) = (rx as f64 / denom, tx as f64 / denom);
                 // 平均下来不到 1 B/s 的，界面上就是「0 B/s」，不占列表位置
                 if rx < 1.0 && tx < 1.0 {
@@ -103,7 +157,7 @@ impl WindowTracker {
     pub fn total_rate(&self, secs: usize) -> (f64, f64) {
         let n = secs.clamp(1, self.max_slots);
         let (rx, tx) = sum_last(&self.total, n);
-        let denom = n.min(self.total.len()).max(1) as f64;
+        let denom = self.denominator(n);
         (rx as f64 / denom, tx as f64 / denom)
     }
 
@@ -130,13 +184,18 @@ impl WindowTracker {
     pub fn app_count(&self) -> usize {
         self.per_app.len()
     }
+
+    fn denominator(&self, n: usize) -> f64 {
+        if self.started.is_some() {
+            self.elapsed.min(n as f64).max(1.0)
+        } else {
+            n.min(self.total.len()).max(1) as f64
+        }
+    }
 }
 
 fn push_slot(d: &mut VecDeque, rx: u64, tx: u64, max_slots: usize) {
-    d.push_back((
-        rx.min(u32::MAX as u64) as u32,
-        tx.min(u32::MAX as u64) as u32,
-    ));
+    d.push_back((rx, tx));
     while d.len() > max_slots {
         d.pop_front();
     }
@@ -146,8 +205,8 @@ fn sum_last(d: &VecDeque, n: usize) -> (u64, u64) {
     let mut rx = 0u64;
     let mut tx = 0u64;
     for (r, t) in d.iter().rev().take(n) {
-        rx += *r as u64;
-        tx += *t as u64;
+        rx = rx.saturating_add(*r);
+        tx = tx.saturating_add(*t);
     }
     (rx, tx)
 }
@@ -155,6 +214,42 @@ fn sum_last(d: &VecDeque, n: usize) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_app_uses_shared_window_and_retains_large_deltas() {
+        let mut w = WindowTracker::default();
+        for _ in 0..59 {
+            w.push(&[]);
+        }
+        w.push(&[(app("late"), 6000, 0)]);
+        assert_eq!(w.rates(60)[0].1, 100.0);
+        assert_eq!(w.total_rate(60).0, 100.0);
+        w.push(&[(app("large"), 1u64 << 34, 0)]);
+        assert!(w.bytes(1).contains(&(app("large"), 1u64 << 34, 0)));
+    }
+
+    #[test]
+    fn elapsed_time_expires_traffic_even_without_samples() {
+        let mut w = WindowTracker::new(60);
+        let t = std::time::Instant::now();
+        w.push_at(t, &[(app("a"), 1000, 0)]);
+        w.push_at(t + std::time::Duration::from_secs(61), &[]);
+        assert!(w.bytes(60).is_empty());
+        assert_eq!(w.total_rate(60), (0.0, 0.0));
+    }
+
+    #[test]
+    fn timestamp_baseline_does_not_add_a_phantom_second() {
+        let mut w = WindowTracker::default();
+        let t = std::time::Instant::now();
+        w.push_at(t, &[]);
+        w.push_at(
+            t + std::time::Duration::from_secs(1),
+            &[(app("a"), 1000, 0)],
+        );
+        assert_eq!(w.rates(60)[0].1, 1000.0);
+        assert_eq!(w.bytes(600)[0].1, 1000);
+    }
 
     fn app(s: &str) -> AppKey {
         AppKey::new(s.to_owned())

@@ -14,7 +14,7 @@
 
 - **版本**：0.1.0
 - **技术栈**：纯 Rust + egui / eframe，无 Electron、无 Python、无外部运行时
-- **当前状态**：macOS 已完成并打包验证；Windows 代码完成、`tray-app` 与 `tm-windows` 已通过交叉编译检查（0 警告），**等待真机功能测试与 ETW 事件表校准**（见 [第 6 节](#6-windows-真机测试指南)，本轮修复见 [6.8](#68-本轮修复windows-面板定位等)）
+- **当前状态**：已修复统计、采集生命周期和原生任务栏挂接；Windows 本机测试与 macOS 两种架构的源码检查见 [本轮验证记录](docs/verification-2026-11-19.md)。macOS 原生构建与交互需要 Mac 验收。
 
 ![主面板](docs/screenshot-panel.png)
 
@@ -32,21 +32,16 @@
 - 可选「单色」模式，全部文字跟随系统色
 - 鼠标悬停显示完整数值（菜单栏里只放得下缩写）
 
-**Windows（任务栏贴片）**
+**Windows（原生任务栏网速）**
 
-Windows 的托盘图标是定死的方形槽（150% DPI 下 24×24），塞不进 `↓1.2M`，
-所以数字画在一个**独立的小窗口**里，位置落在任务栏条内、系统托盘区左侧：
+数字由 `Shell_TrayWnd` 下的原生 `WS_CHILD` 控件绘制，已移除独立 egui 置顶窗口和鼠标轮询。
 
-- 两行缩写：`↓ 7.5M` / `↑ 841K`，长度恒为 4 个字符，数字列不会左右跳。
-  方向图标是**手绘的细箭头**（竖杆 + 三角头），高度按数字字高对齐
-- 背景是**抠出来的**（纯黑颜色键），所以看起来就是任务栏自己的一部分，
-  不是浮在上面的小方块
-- **点贴片等于点托盘图标**：面板没开就打开、开着就收起（抠出来的区域收不到
-  鼠标消息，所以点击是自己轮询认的，见 [6.13](#613-windows-任务栏网速贴片)）
-- 任务栏上有别的同类工具（TrafficMonitor 之类）时自动让到它左边，两边的字不会叠在一起
-- 设置里可关（「任务栏网速」），也可以切「网速配色」彩色/单色
-
-![任务栏贴片](docs/screenshot-tray-badge.png)
+- 两行上下行速率，支持系统明暗主题和彩色/单色。
+- 点击整块网速区域打开面板；点击事件以控件自己的位置作为锚点。
+- 随任务栏移动和隐藏；Explorer 重建后自动重新挂接。
+- Win10 经典任务栏预留按钮区空间，禁用或退出时恢复。
+- Win11 在托盘左侧的已知空位挂接，避开任务按钮及第三方子窗口。空间不足或布局无法识别时隐藏控件并在面板提示。
+- Win11 没有公开的任意文本任务栏扩展 API；本实现不承诺所有系统版本、第三方任务栏和任务按钮布局都支持。背景使用跟随主题的实色，尚未复现系统亚克力材质。
 
 ### 1.2 弹出面板
 
@@ -76,7 +71,7 @@ Windows 的托盘图标是定死的方形槽（150% DPI 下 24×24），塞不�
 | 数据面板 | ![面板](docs/screenshot-panel.png) |
 | 加载骨架屏 | ![加载](docs/screenshot-loading.png) |
 | 设置页 | ![设置](docs/screenshot-settings.png) |
-| Windows 任务栏贴片 | ![任务栏](docs/screenshot-tray-badge.png) |
+| Windows 原生任务栏网速（150% DPI，演示流量） | ![任务栏](docs/screenshot-native-taskbar.png) |
 
 ---
 
@@ -520,62 +515,21 @@ winit 就不再派发 `RedrawRequested`，eframe 的 `update()` 整个停摆 —
 打开时窗口在 `(2127, 973)`，收起时回到 `-32000` 屏幕外，面板内容完整渲染。
 `TM_TRACE_FRAMES=1` 可以看到收起后 `[ui] frame=` 依旧每 30 帧打一次（说明 update 没停）。
 
-### 6.13 Windows 任务栏网速贴片
+### 6.13 Windows 原生任务栏网速
 
-**目标**：像 TrafficMonitor 那样，把上下行速率直接显示在**任务栏条里**，
-而不是浮在任务栏上方的一块小卡片。
+实现位于 `tm-windows/src/badge.rs`，界面只下发文字和颜色。控件在创建时即指定 `Shell_TrayWnd` 为父窗口，使用 `WS_CHILD`，没有 `WS_EX_TOPMOST`、颜色键透明或额外的 egui viewport。
 
-**为什么不能画进托盘图标**：`Shell_NotifyIcon` 只接受方形小图标（150% DPI
-下 24×24），`↓1.2M` 这种宽内容会被系统等比缩成一团糊；图标槽的 rect 由壳
-决定，撑大 HICON 也没用。所以数字必须由**另一个窗口**来画。
+布局使用任务栏自身 DPI 和客户区坐标。经典任务栏通过缩小 ReBar 的任务按钮区域预留位置，销毁时只恢复仍由本控件修改的矩形。Win11 的 XAML 区域不能用旧 ReBar 强行预留，因此只接受可识别的现有空位；无法放置时明确显示原因。
 
-**位置**：`Shell_TrayWnd`（任务栏整条）→ `TrayNotifyWnd`（托盘区）→ 贴片
-放在托盘区左缘再往左 `GAP` 处，纵向按任务栏高度居中。任务栏上如果已经插着
-别的同类工具（`Shell_TrayWnd` 里不属于系统类的子窗口，TrafficMonitor 就是
-一个 `#32770`），贴片继续往左让，避免两边文字叠在一起。
+点击使用 `WM_LBUTTONDOWN/UP` 与鼠标捕获；空白区域也属于控件。窗口句柄失效后重建，关闭设置会销毁子窗口并释放预留空间。
 
-**方向图标**：手绘的细箭头（竖杆 + 三角头），不用 `↓`/`↑` 字符（字体缺字形
-就是个方块）；箭头高度按数字的**字高**对齐，不要更高——11pt 那种高度试过，
-两个箭头会把视觉重心全抢走，数字显得又小又灰。箭头比文字基线再上提 0.5pt，
-因为 `layout_no_wrap` 量出来的中心含了下沉部。
+交互桌面回归（会短暂创建测试控件并自动清理）：
 
-**点击**：点贴片和点托盘图标完全等价（`toggle`），但**锚点不同**：点贴片时
-面板以**贴片自己**为锚点（`TrayEvent::BadgeClick`），不是托盘图标。贴片和托盘
-图标之间常常隔着一整个第三方插件（TrafficMonitor 那种），按托盘图标摆的话，
-点最左边的数字、面板却从右边托盘上方冒出来，偏出去三百多像素。这里有个反直觉的坑：
+```powershell
+cargo test -p tm-windows native_child_lifecycle_and_clicks -- --ignored --nocapture
+```
 
-| 现象 | 原因 | 修法 |
-|---|---|---|
-| 只有笔画本身能点，箭头/数字之间的留白点不到 | 颜色键分层窗口的命中测试是**按像素**走的，抠掉的像素在系统眼里根本不属于这个窗口；`WM_NCHITTEST` 返回 `HTCLIENT` 也没用（那一步在窗口过程之前就做完了，实测无效），`SetWindowRgn` 覆盖整块矩形也没用 | 后台线程每 12ms 读一次 `GetCursorPos` + `GetAsyncKeyState(VK_LBUTTON)`，按下和抬起都落在贴片矩形里就算一次点击（按住超过 900ms 或者中途拖出去不算）。贴片周围留 40px 的「快速区」也用 12ms 采样，否则一次 30ms 的快速点击可能整个落在两次慢轮询之间 |
-
-不用全局鼠标钩子（`WH_MOUSE_LL`）：那会进到系统输入链路里，我们这条线程
-一卡，整机的鼠标都跟着卡。也别想靠 `SetWindowSubclass` 做命中测试——它只在
-comctl32 **v6** 里，没有应用清单的程序会被加载 5.82，静态导入的结果是整个
-进程起不来（退出码 127 / `ERROR_PROC_NOT_FOUND`，一行日志都没有）。
-
-矩形由轮询线程自己按窗口句柄 `GetWindowRect`，**不要**从主循环传过去：
-`update()` 空闲时只有 1Hz，而贴片的落位是子 viewport 自己自校正的，刚启动
-或任务栏重排那一两秒会点不中（踩过一次，点下去完全没反应）。
-
-**渲染的四个坑（都踩过，勿回退）**
-
-| 现象 | 原因 | 修法 |
-|---|---|---|
-| 窗口位置、样式、Z 序全对，就是一个像素都不显示 | 用 `show_viewport_immediate` 建子 viewport：它的 `swap_buffers` 走父窗口那一帧的 GL 上下文切换，画完屏幕上什么都没有（连不透明洋红测试块都看不见） | 换成 `show_viewport_deferred`（走和主窗口相同的渲染通道）。代价是回调必须 `'static + Send + Sync`，数据走 `Arc<Mutex<BadgeData>>` |
-| 贴片是一块黑方块 | 窗口是 GL 画的，而 eframe 拿到的 GL 配置**没有 alpha 通道**（启动日志 `Cannot create transparent window: the GL config does not support it`），`glClear(0,0,0,0)` 的 alpha 被丢掉 | `WS_EX_LAYERED` + `SetLayeredWindowAttributes(hwnd, 0, 0, LWA_COLORKEY)`：把纯黑整片抠成透明。抗锯齿过渡像素是「文字色×覆盖率」不是纯黑，不会被误抠。顺带抠掉的区域鼠标也穿透 |
-| 一开始完全不显示 / 后来又能显示 | 想用 `with_mouse_passthrough(true)` 做穿透，winit 那条路加的是 `WS_EX_TRANSPARENT \| WS_EX_LAYERED`，而**没有分层属性的分层窗口不会被合成** | 不碰 `with_mouse_passthrough`，穿透交给颜色键 |
-| 贴片毫无征兆地消失，过一会儿又出现 | 任务栏自己也是 TOPMOST，它每次重绘（时间跳一分钟、托盘图标变化）都会把自己重新提到最前 | `tune()` 每次更新都 `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` 重新申明一次；样式位也一样会被 winit 按 `WindowFlags` 重算掉，所以 `tune()` 是幂等的、每帧都调 |
-
-**进不进 Alt+Tab / 抢不抢焦点**：`WS_EX_TOOLWINDOW`（不进 Alt+Tab）、
-`WS_EX_NOACTIVATE`（点了不激活）。这两个位 winit 也会覆盖，同样靠幂等的
-`tune()` 每秒补一次。
-
-**排查**：`TM_TRACE_BADGE=1` 会打贴片的 `screen/inner/outer` 和实际缩放；
-`TM_LOG=1` 把 eframe/winit 的内部日志接到 stderr（`swap_buffers failed`
-这类错误平时是静默的）。`scripts/grab.py` 是 DPI 感知的屏幕抓图小工具，
-截图核对时用它，别用 DPI 无感的截图（3840×2160@150% 下会差 1.5 倍）。
-
-
+测试验证父窗口、子窗口样式、非置顶、位置、点击、窗口丢失后恢复以及禁用清理。真实 Explorer 重启、自动隐藏动画、全屏和混合 DPI 多屏仍需人工验收。
 
 ### 6.14 本轮修复（切页过渡 / 设置页底部圆角）
 
@@ -834,27 +788,23 @@ macOS 只做到「提示 + 下载」，不自动替换 `.app`：`/Applications` 
 
 ## 9. 测试与质量
 
-- **125 个单元测试全部通过**（跨平台合计；Windows 上实跑 90 个，`tm-macos` 的 36 个只在 macOS 上跑）
-  - `tm-core` 28：速率差分、pid 复用、计数器回退、窗口补零、格式化、系统服务识别、上下行语义色
-  - `tm-macos` 36：CSV 连接解析、回环配对与代理回填、TUN 隧道量守恒归属、应用归并（bundle / 全路径 / 名字三级）、pty 换行、状态栏渲染辅助
-  - `tm-windows` 15：管道协议编解码、按 PID 聚合、方向表一致性
-  - `tray-app` 35：设置解析、自启 plist、CSV 导出、名称截断、齿轮位图、更新清单解析、semver 比较、sha256、更新开关默认值
-  - `tm-store` 9：建表、upsert、范围查询、清理
-  - `tm-sampler` 2：trait 与 Mock
-- `cargo check --target x86_64-pc-windows-msvc -p tm-core -p tm-sampler -p tm-windows` 通过——注意这只覆盖纯逻辑 crate，**不代表 Windows 系统调用部分已经编译验证过**。
+`.github/workflows/ci.yml` 在 Windows 和 macOS 上执行格式检查、workspace 测试、严格 Clippy 与 release 构建，并在 Mac 上检查 Apple Silicon/Intel 两种目标。
 
----
+```text
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release -p tray-app -p tm-windows --locked
+```
+
+macOS 连接解析/记账模块在所有平台都参与测试，系统 API 模块仍只在对应平台编译。本机执行结果和未验证项目见 [验证记录](docs/verification-2026-11-19.md)。
 
 ## 10. 提交前检查
 
 - `.gitignore` 已忽略 `target/`、`dist/`、`.workbuddy/`、`.DS_Store`
 - `docs/screenshot-*.png` 是随文档一起提交的截图
 - `assets/AppIcon.icns` 已生成并提交，打包脚本在文件存在时不会重新生成
-- 当前仓库还没有任何 commit，所有源码均为未跟踪状态；首次提交建议：
-  ```bash
-  git add .
-  git commit -m "feat: cross-platform menu bar traffic monitor v0.1.0"
-  ```
+- 提交前检查工作区差异，并按上面的命令执行测试。
 
 ## 11. 许可
 

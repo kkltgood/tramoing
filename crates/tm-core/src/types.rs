@@ -183,7 +183,10 @@ mod tests {
 
     #[test]
     fn pretty_name_strips_bundle_and_exe() {
-        assert_eq!(pretty_name("/Applications/Google Chrome.app"), "Google Chrome");
+        assert_eq!(
+            pretty_name("/Applications/Google Chrome.app"),
+            "Google Chrome"
+        );
         assert_eq!(pretty_name(r"C:\Program Files\Google\chrome.exe"), "chrome");
         assert_eq!(pretty_name("mDNSResponder"), "mDNSResponder");
         // 带点的进程名不能被切
@@ -200,7 +203,9 @@ mod tests {
     #[test]
     fn apps_and_user_binaries_are_not_system_services() {
         // `/System/` 下面也有 app，它们有真图标，不能吃掉
-        assert!(!is_system_service("/System/Applications/Utilities/Terminal.app"));
+        assert!(!is_system_service(
+            "/System/Applications/Utilities/Terminal.app"
+        ));
         assert!(!is_system_service("/Applications/Google Chrome.app"));
         // 用户装的 / 敲的
         assert!(!is_system_service("/opt/homebrew/bin/node"));

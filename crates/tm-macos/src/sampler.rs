@@ -56,6 +56,7 @@ pub struct NettopSampler {
     last_seen: HashMap<AppKey, u64>,
     interval: Duration,
     frames: u64,
+    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl NettopSampler {
@@ -73,12 +74,10 @@ impl NettopSampler {
         let args: Vec<&str> = vec!["-x", "-n", "-L", "0", "-s", delay.as_str()];
 
         let mut cmd = Command::new(&bin);
-        cmd.args(&args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::null());
 
         // 关键：stdout 必须是 pty，否则 nettop 走全缓冲，3 秒才吐一批
-        let (child, source): (Child, Box<dyn Read + Send>) = match pty::open(PTY_COLS, PTY_ROWS)
+        let (mut child, source): (Child, Box<dyn Read + Send>) = match pty::open(PTY_COLS, PTY_ROWS)
         {
             Ok((master, slave)) => {
                 cmd.stdout(Stdio::from(slave));
@@ -99,7 +98,7 @@ impl NettopSampler {
         };
 
         let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
+        let reader = thread::Builder::new()
             .name("nettop-reader".to_owned())
             .spawn(move || {
                 let reader = BufReader::new(source);
@@ -114,7 +113,11 @@ impl NettopSampler {
                     }
                 }
             })
-            .map_err(SamplerError::Spawn)?;
+            .map_err(|e| {
+                let _ = child.kill();
+                let _ = child.wait();
+                SamplerError::Spawn(e)
+            })?;
 
         Ok(Self {
             rx,
@@ -127,6 +130,7 @@ impl NettopSampler {
             last_seen: HashMap::new(),
             interval,
             frames: 0,
+            reader: Some(reader),
         })
     }
 
@@ -169,7 +173,7 @@ impl Sampler for NettopSampler {
             last_seen.insert(app, frame);
         }
 
-        if frame % CACHE_GC_FRAMES == 0 {
+        if frame.is_multiple_of(CACHE_GC_FRAMES) {
             let alive: Vec<u32> = rows.iter().map(|r| r.pid).collect();
             self.resolver.retain_only(&alive);
 
@@ -179,6 +183,7 @@ impl Sampler for NettopSampler {
                 .retain(|app, _| *self.last_seen.get(app).unwrap_or(&0) >= cut);
             let keep = self.cum.keys().cloned().collect::<Vec<_>>();
             self.last_seen.retain(|app, _| keep.contains(app));
+            self.synth.retain(|app, _| keep.contains(app));
         }
 
         // 每帧都下发全部应用：RateCalculator 的基线是按帧重建的，
@@ -207,6 +212,10 @@ impl Sampler for NettopSampler {
     fn interval(&self) -> Duration {
         self.interval
     }
+
+    fn counters_start_at_zero(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for NettopSampler {
@@ -214,6 +223,9 @@ impl Drop for NettopSampler {
         // 一定要杀子进程，否则 nettop 会一直留着
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 

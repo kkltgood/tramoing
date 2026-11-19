@@ -1,413 +1,550 @@
-//! 给自绘的贴片窗口补窗口样式，并量出任务栏的位置。
+//! 真正的任务栏子窗口：原生 GDI 绘制、普通鼠标消息，无置顶浮窗或全局鼠标轮询。
 //!
-//! egui 建出来的是**普通一级窗口**：会出现在 Alt+Tab 列表里、被点到会抢走
-//! 焦点。这两件事得在窗口建好之后按 Win32 的方式补上，`ViewportBuilder`
-//! 没有对应的开关：
-//!
-//! - `WS_EX_TOOLWINDOW`：不进 Alt+Tab、不上任务栏；
-//! - `WS_EX_NOACTIVATE`：点了也不激活（贴片不该抢焦点）。
-//!
-//! ## 分层是为了颜色键，不是为了穿透
-//!
-//! `WS_EX_LAYERED | WS_EX_TRANSPARENT` 是「点击穿透」最顺手的写法，但那样
-//! 这个窗口**连画面都不显示**——egui 的 `with_mouse_passthrough(true)` 走的
-//! 就是这条路（winit 的 `set_cursor_hittest(false)` 加的正好是这两个位），
-//! 贴片一开始怎么都不显示就是它造成的。这里的 `WS_EX_LAYERED` 只用来挂
-//! 颜色键（把纯黑抠成透明），不能带 `WS_EX_TRANSPARENT`。
-//!
-//! ## 样式必须反复补
-//!
-//! egui 每次给这个窗口下发 `Visible` / `WindowLevel` 之类的命令，winit 都会
-//! 按自己记的 `WindowFlags` 重算一遍 `WS_EX_*`，把这里加的位覆盖掉（收一次
-//! 面板再打开，贴片就变回会抢焦点的普通窗口）。所以 [`tune`] 是幂等的，
-//! 调用方每帧都可以调：内部先读现有值再比，已经对了就只花一次 FindWindow。
-//!
-//! ## 点击
-//!
-//! 贴片是**颜色键**分层窗口：抠掉的像素在系统的命中测试里根本不属于它，
-//! 鼠标会直接漏给下面的任务栏。`WM_NCHITTEST` 也救不回来——那一步在窗口
-//! 过程之前就做完了（实测返回 `HTCLIENT` 也没用），所以只有笔画本身能点，
-//! 中间大片留白点不到。
-//!
-//! 与其把整块贴片糊成不透明（任务栏有亚克力，任何纯色底都会露出来一块），
-//! 不如自己看鼠标：一个后台线程每 12ms 读一次光标位置和左键状态，按下和
-//! 抬起都落在贴片矩形里就算一次点击。这比全局鼠标钩子便宜得多（两次
-//! `GetCursorPos`/`GetAsyncKeyState`，一次都不会进到系统输入链路里），
-//! 也不会拖慢别处的鼠标响应。
-//!
-//! 顺带：颜色键抠掉的区域点下去仍然是任务栏的，所以「点贴片空白处」在
-//! 视觉上依然会落到任务栏上——只是我们同时也收到了一次点击。
-
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::{Mutex, Once};
-use std::time::{Duration, Instant};
-
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, LWA_COLORKEY, SetLayeredWindowAttributes,
-    SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-};
-
+//! Win10 缩小任务按钮宿主给控件留位，禁用/退出恢复原尺寸。Win11 的 XAML
+//! 任务栏没有公开的任意文字扩展接口，仅在已知布局存在空位时挂接；不支持的
+//! 布局返回状态给 UI。Explorer 重建后下一次 update 自动重新挂接。
 use crate::screen::Rect;
+use std::cell::{Cell, RefCell};
+use std::ptr::{null, null_mut};
+use std::sync::Once;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-/// 任务栏和托盘区的位置。
-pub struct Taskbar {
-    /// 任务栏整条（`Shell_TrayWnd`）
-    pub band: Rect,
-    /// 托盘区（`TrayNotifyWnd`）。贴片贴在它**左边**——那是任务栏里
-    /// 正常空着的区域，托盘图标本身是壳按顺序排的，插不进去。
-    pub tray: Rect,
-    /// 任务栏上**别的程序**插进来的窗口（TrafficMonitor 之类）。
-    /// 这些窗口占着的横向区间不能让我们的贴片盖上去，否则两边文字叠在一起。
-    pub plugins: Vec<Rect>,
+const CLASS: &str = "Tramoing.TaskbarSpeed";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Content {
+    pub down: String,
+    pub up: String,
+    pub light: bool,
+    pub colored: bool,
 }
 
-/// 任务栏自己的子窗口类名。除此之外的子窗口都算「别的程序插进来的」。
-const SYSTEM_CLASSES: &[&str] = &[
-    "Windows.UI.Composition.DesktopWindowContentBridge",
-    "Windows.UI.Core.CoreWindow",
-    "TrayNotifyWnd",
-    "TrayDummySearchControl",
-    "ReBarWindow32",
-    "MSTaskSwWClass",
-    "MSTaskListWClass",
-    "Start",
-    "Shell_TrayWnd",
-    "tooltips_class32",
-];
+struct WindowState {
+    hwnd: Cell<HWND>,
+    content: RefCell<Content>,
+    click: fn(Option<Rect>),
+    pressed: Cell<bool>,
+}
 
-/// 点一下贴片时调用的函数。参数是贴片自身的屏幕矩形（物理像素），
-/// 给面板落位兜底——托盘图标被折进 Win11 的溢出区时拿不到图标位置，
-/// 那时至少还能按贴片摆。
-///
-/// 只存裸函数指针：调用方是 `tray-app` 里的一个普通 fn（事件最终进它自己
-/// 的 channel），不需要捕获环境，也就不必装箱。
-static ON_CLICK: Mutex<Option<fn(Option<Rect>)>> = Mutex::new(None);
+struct Reservation {
+    hwnd: HWND,
+    original: RECT,
+    applied: RECT,
+}
 
-/// 贴片的窗口句柄（`0` = 还不知道）。[`tune`] 每帧刷新。
-static BADGE_HWND: AtomicIsize = AtomicIsize::new(0);
+pub struct TaskbarBadge {
+    state: Box<WindowState>,
+    shell: HWND,
+    reservation: Option<Reservation>,
+}
 
+impl TaskbarBadge {
+    pub fn new(click: fn(Option<Rect>)) -> Self {
+        Self {
+            state: Box::new(WindowState {
+                hwnd: Cell::new(null_mut()),
+                content: RefCell::new(Content {
+                    down: "0".into(),
+                    up: "0".into(),
+                    light: false,
+                    colored: false,
+                }),
+                click,
+                pressed: Cell::new(false),
+            }),
+            shell: null_mut(),
+            reservation: None,
+        }
+    }
 
-/// 注册贴片的点击回调。重复调用以最后一次为准。
-pub fn on_click(f: fn(Option<Rect>)) {
-    if let Ok(mut slot) = ON_CLICK.lock() {
-        *slot = Some(f);
+    /// None 表示禁用。成功时窗口的 GetParent 必须是当前 Shell_TrayWnd。
+    pub fn update(&mut self, content: Option<Content>) -> Result<(), &'static str> {
+        let Some(content) = content else {
+            self.detach();
+            return Ok(());
+        };
+        let changed = *self.state.content.borrow() != content;
+        *self.state.content.borrow_mut() = content;
+        unsafe {
+            let shell = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+            if shell.is_null() {
+                self.detach();
+                return Err("等待 Windows 任务栏恢复");
+            }
+            if self.shell != shell || IsWindow(self.state.hwnd.get()) == 0 {
+                self.detach();
+                register_class();
+                let hwnd = CreateWindowExW(
+                    // Win11 的任务栏由 DirectComposition 绘制，普通 GDI 子窗口
+                    // 会被它的合成表面覆盖。常量 alpha=255 给子窗口独立表面，
+                    // 无颜色键/点击穿透，父窗口仍然是任务栏。
+                    WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                    wide(CLASS).as_ptr(),
+                    wide("Tramoing Speed").as_ptr(),
+                    WS_CHILD | WS_CLIPSIBLINGS,
+                    0,
+                    0,
+                    0,
+                    0,
+                    shell,
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    (&*self.state as *const WindowState).cast(),
+                );
+                if hwnd.is_null() {
+                    return Err("无法挂接 Windows 任务栏");
+                }
+                self.shell = shell;
+                self.state.hwnd.set(hwnd);
+                if SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) == 0 {
+                    self.detach();
+                    return Err("当前系统无法合成任务栏网速窗口");
+                }
+            }
+            let result = self.layout();
+            if result.is_err() {
+                ShowWindow(self.state.hwnd.get(), SW_HIDE);
+                self.restore();
+            } else if changed {
+                InvalidateRect(self.state.hwnd.get(), null(), 0);
+            }
+            result
+        }
+    }
+
+    unsafe fn layout(&mut self) -> Result<(), &'static str> {
+        let band = client_rect(self.shell).ok_or("无法读取任务栏布局")?;
+        let dpi = GetDpiForWindow(self.shell).max(96) as i32;
+        let width = 60 * dpi / 96;
+        let gap = 4 * dpi / 96;
+        let tray = FindWindowExW(
+            self.shell,
+            null_mut(),
+            wide("TrayNotifyWnd").as_ptr(),
+            null(),
+        );
+        let tray_rect = relative_rect(tray, self.shell).ok_or("当前任务栏布局不支持网速区域")?;
+        let modern = !FindWindowExW(
+            self.shell,
+            null_mut(),
+            wide("Windows.UI.Composition.DesktopWindowContentBridge").as_ptr(),
+            null(),
+        )
+        .is_null();
+        let vertical = band.bottom > band.right;
+        let mut target = if vertical {
+            RECT {
+                left: 0,
+                top: tray_rect.top - 36 * dpi / 96 - gap,
+                right: band.right,
+                bottom: tray_rect.top - gap,
+            }
+        } else {
+            RECT {
+                left: tray_rect.left - width - gap,
+                top: 0,
+                right: tray_rect.left - gap,
+                bottom: band.bottom,
+            }
+        };
+        // 避开任务栏上的第三方子窗口。XAML/系统窗口单独处理。
+        let mut obstacles = Vec::new();
+        let mut child = FindWindowExW(self.shell, null_mut(), null(), null());
+        while !child.is_null() {
+            let class = class_name(child);
+            if child != self.state.hwnd.get()
+                && IsWindowVisible(child) != 0
+                && !matches!(
+                    class.as_str(),
+                    "Windows.UI.Composition.DesktopWindowContentBridge"
+                        | "Windows.UI.Core.CoreWindow"
+                        | "TrayNotifyWnd"
+                        | "TrayDummySearchControl"
+                        | "ReBarWindow32"
+                        | "MSTaskSwWClass"
+                        | "MSTaskListWClass"
+                        | "Start"
+                        | "tooltips_class32"
+                )
+            {
+                if let Some(r) = relative_rect(child, self.shell) {
+                    obstacles.push(r);
+                }
+            }
+            child = FindWindowExW(self.shell, child, null(), null());
+        }
+        for _ in 0..obstacles.len() + 1 {
+            let mut moved = false;
+            for r in &obstacles {
+                if intersects(target, *r) {
+                    if vertical {
+                        let h = target.bottom - target.top;
+                        target.bottom = r.top - gap;
+                        target.top = target.bottom - h;
+                    } else {
+                        target.right = r.left - gap;
+                        target.left = target.right - width;
+                    }
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        if target.left < gap
+            || target.top < 0
+            || target.right > band.right
+            || target.bottom > band.bottom
+        {
+            // 纵向 left=0 是合法的。
+            if !(vertical && target.top >= gap && target.bottom <= band.bottom) {
+                return Err("任务栏空间不足，无法放入网速区域");
+            }
+        }
+        let rebar = FindWindowExW(
+            self.shell,
+            null_mut(),
+            wide("ReBarWindow32").as_ptr(),
+            null(),
+        );
+        let task_rect = relative_rect(rebar, self.shell).ok_or("当前任务栏布局不支持网速区域")?;
+        if modern {
+            self.restore();
+            // 新任务栏的按钮实际由 XAML 绘制，不能靠缩小旧 ReBar 假装预留成功。
+            if vertical || task_rect.right + gap > target.left {
+                return Err("任务栏按钮已占满网速区域，请减少固定按钮");
+            }
+        } else {
+            if let Some(reservation) = &self.reservation {
+                if reservation.hwnd != rebar || !same_rect(task_rect, reservation.applied) {
+                    self.reservation = None; // Explorer 已重排，以它的新尺寸为准
+                }
+            }
+            let original = self
+                .reservation
+                .as_ref()
+                .map(|r| r.original)
+                .unwrap_or(task_rect);
+            let mut applied = original;
+            if vertical {
+                applied.bottom = target.top - gap;
+            } else {
+                applied.right = target.left - gap;
+            }
+            let (main_size, cross_size) = if vertical {
+                (applied.bottom - applied.top, applied.right - applied.left)
+            } else {
+                (applied.right - applied.left, applied.bottom - applied.top)
+            };
+            if main_size < 100 * dpi / 96 || cross_size < 20 {
+                return Err("任务栏空间不足，无法放入网速区域");
+            }
+            if !same_rect(task_rect, applied) && !move_child(rebar, applied) {
+                return Err("无法为网速区域预留任务栏空间");
+            }
+            self.reservation = Some(Reservation {
+                hwnd: rebar,
+                original,
+                applied,
+            });
+        }
+        // HWND_TOP 仅调整兄弟子窗口顺序，不会进入顶层 TOPMOST 序列。
+        if SetWindowPos(
+            self.state.hwnd.get(),
+            HWND_TOP,
+            target.left,
+            target.top,
+            target.right - target.left,
+            target.bottom - target.top,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        ) == 0
+        {
+            return Err("任务栏网速区域定位失败");
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            unsafe {
+                // 只恢复仍由我们修改的矩形；不覆盖系统/其他插件之后的新布局。
+                if relative_rect(reservation.hwnd, self.shell)
+                    .is_some_and(|r| same_rect(r, reservation.applied))
+                {
+                    move_child(reservation.hwnd, reservation.original);
+                }
+            }
+        }
+    }
+
+    fn detach(&mut self) {
+        self.restore();
+        let hwnd = self.state.hwnd.replace(null_mut());
+        unsafe {
+            if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+                DestroyWindow(hwnd);
+            }
+        }
+        self.shell = null_mut();
     }
 }
 
-/// 光标在贴片里时的轮询间隔。12ms 比一个 120Hz 的帧还短，正常点击
-/// 不会漏；80 次/秒的 `GetCursorPos` 只是两次 syscall，开销可以忽略。
-const TICK_FAST: Duration = Duration::from_millis(12);
-/// 光标不在贴片附近：慢一点，只求及时发现它过来
-const TICK_IDLE: Duration = Duration::from_millis(40);
-/// 贴片周围这一圈也算「快速区」。
-///
-/// 鼠标是**移动**进来的：等光标真进了矩形才提速就晚了 —— 一次 30ms 的
-/// 快速点击可能整个落在两次慢轮询之间，按下和抬起都没看见。留一圈余量，
-/// 手往贴片这边挪的时候已经在用 12ms 采样了。
-const NEAR: i32 = 40;
-/// 按住超过这么久就不算点击（按住拖窗口/框选时路过贴片不该被当成点它）
-const LONG_PRESS: Duration = Duration::from_millis(900);
+impl Drop for TaskbarBadge {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
 
-/// 起一个线程专门判断「鼠标在贴片里点了一下」。幂等。
-///
-/// 为什么不用鼠标消息：贴片是颜色键分层窗口，抠掉的像素在系统命中测试里
-/// 不属于它（见模块注释「点击」），`WM_LBUTTONDOWN` 根本不会来。
-pub fn start_click_poller() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        std::thread::spawn(|| {
-            let mut was_down = false;
-            // 按下时记一笔（时间 + 当时的矩形）：抬起要还在这块地方才算
-            let mut armed: Option<(Instant, Rect)> = None;
-
-            loop {
-                // 位置和「该不该响应」都问窗口自己：子 viewport 的落位是它
-                // 自校正的，`update()` 空闲时只有 1Hz，从主循环传状态会慢
-                // 一整拍（实测刚启动那一下点不中）。不可见 = 用户关了贴片，
-                // 或者这一帧本来就没该显示。
-                let rect = {
-                    let h = BADGE_HWND.load(Ordering::Relaxed) as HWND;
-                    if h.is_null() || unsafe { IsWindowVisible(h) } == 0 {
-                        None
-                    } else {
-                        unsafe { rect_of(h) }
-                    }
-                };
-                let (x, y) = cursor_pos();
-                let down = left_down();
-                let inside = rect.is_some_and(|r| {
-                    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
-                });
-                let near = rect.is_some_and(|r| {
-                    x >= r.x - NEAR
-                        && x < r.x + r.w + NEAR
-                        && y >= r.y - NEAR
-                        && y < r.y + r.h + NEAR
-                });
-
-                if down && !was_down {
-                    armed = if inside {
-                        rect.map(|r| (Instant::now(), r))
-                    } else {
-                        None
-                    };
-                }
-                // 按住之后挪出贴片（拖选、拖窗口）就当没点过
-                if down && !inside {
-                    armed = None;
-                }
-                if !down && was_down {
-                    if let Some((at, r)) = armed.take() {
-                        if inside && at.elapsed() < LONG_PRESS {
-                            if let Ok(slot) = ON_CLICK.lock() {
-                                if let Some(f) = *slot {
-                                    f(Some(r));
-                                }
-                            }
-                        }
-                    }
-                }
-                was_down = down;
-
-                std::thread::sleep(if near || down { TICK_FAST } else { TICK_IDLE });
-            }
-        });
+fn register_class() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| unsafe {
+        let class = wide(CLASS);
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: GetModuleHandleW(null()),
+            hCursor: LoadCursorW(null_mut(), IDC_HAND),
+            lpszClassName: class.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&wc);
     });
 }
 
-fn cursor_pos() -> (i32, i32) {
-    let mut p = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut p) };
-    (p.x, p.y)
+unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let create = &*(lp as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+    }
+    let state = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState).as_ref();
+    match (msg, state) {
+        (WM_PAINT, Some(state)) => {
+            paint(hwnd, &state.content.borrow());
+            0
+        }
+        (WM_ERASEBKGND, _) => 1,
+        (WM_MOUSEACTIVATE, _) => MA_NOACTIVATE as isize,
+        (WM_LBUTTONDOWN, Some(state)) => {
+            state.pressed.set(true);
+            SetCapture(hwnd);
+            0
+        }
+        (WM_LBUTTONUP, Some(state)) => {
+            let pressed = state.pressed.replace(false);
+            ReleaseCapture();
+            let x = lp as i16 as i32;
+            let y = (lp >> 16) as i16 as i32;
+            if pressed
+                && client_rect(hwnd)
+                    .is_some_and(|r| x >= 0 && y >= 0 && x < r.right && y < r.bottom)
+            {
+                (state.click)(screen_rect(hwnd));
+            }
+            0
+        }
+        (WM_CAPTURECHANGED, Some(state)) => {
+            state.pressed.set(false);
+            0
+        }
+        (WM_NCDESTROY, Some(state)) => {
+            state.hwnd.set(null_mut());
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        (WM_THEMECHANGED | WM_DPICHANGED | WM_SIZE, _) => {
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
-fn left_down() -> bool {
-    unsafe { GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000 != 0 }
-}
-
-/// 任务栏此刻该不该被看到。
-///
-/// 贴片是独立窗口，系统不会替它收，所以这几个状态得自己判：
-///
-/// * `IsWindowVisible` 为假 —— 全屏游戏/全屏应用把任务栏整个藏了；
-/// * 任务栏窗口还在，但已经被滑到屏幕外 —— 自动隐藏在「收起」状态时只剩两三个
-///   像素露在边上，贴片不该跟着露一截；
-/// * **任务栏正在弹菜单**（右键「任务管理器 / 任务栏设置」、托盘图标的右键菜单）——
-///   菜单是独立的一级窗口，就弹在任务栏上方，而贴片是 TOPMOST，不躲开就会把
-///   菜单压在下面（「任务栏设置」被网速数字盖住就是这个）。
-///
-/// 量不到任务栏（explorer 重启中）也算「不该显示」：这时候连贴哪儿都不知道。
-pub fn taskbar_shown() -> bool {
-    unsafe {
-        let class = wide("Shell_TrayWnd");
-        let shell = FindWindowW(class.as_ptr(), std::ptr::null());
-        if shell.is_null() || IsWindowVisible(shell) == 0 {
-            return false;
-        }
-        let Some(band) = rect_of(shell) else {
-            return false;
-        };
-
-        // 有菜单/浮层正压在这条任务栏上 ⇒ 贴片让位。
-        //
-        // 菜单和浮层都是一级窗口，就弹在任务栏上方，而贴片是 TOPMOST ——
-        // 不躲开就会把它们压在下面（「任务栏设置」被网速数字盖住就是这个）。
-        if popup_over(band) {
-            return false;
-        }
-
-        // 「滑出屏幕」要拿**同一个 DPI 上下文**里量的显示器矩形来比：
-        // `GetSystemMetrics` 在 DPI 感知不同的线程上会给出另一套坐标，
-        // 和 `GetWindowRect` 的数值对不上（实测过，会误判成「已经滑走了」）。
-        let mon = MonitorFromWindow(shell, MONITOR_DEFAULTTONEAREST);
-        if mon.is_null() {
-            return true;
-        }
-        let mut info: MONITORINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(mon, &mut info) == 0 {
-            return true;
-        }
-        let m = info.rcMonitor;
-        // 露在显示器里的那部分（任务栏可以贴在上下左右任一边）
-        let vis_w = (band.x + band.w).min(m.right) - band.x.max(m.left);
-        let vis_h = (band.y + band.h).min(m.bottom) - band.y.max(m.top);
-        // 横向任务栏看高度，竖向（贴左/贴右）看宽度；留 3/4 的余量，
-        // 自动隐藏停住时那一条细边（2~3px）就过不了这一关
-        if band.w >= band.h {
-            vis_h >= band.h * 3 / 4
+unsafe fn paint(hwnd: HWND, data: &Content) {
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let r = client_rect(hwnd).unwrap_or(RECT {
+        left: 0,
+        top: 0,
+        right: 60,
+        bottom: 48,
+    });
+    let bg = if data.light {
+        rgb(243, 243, 243)
+    } else {
+        rgb(32, 32, 32)
+    };
+    let brush = CreateSolidBrush(bg);
+    FillRect(dc, &r, brush);
+    DeleteObject(brush);
+    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+    let font = CreateFontW(
+        -12 * dpi / 96,
+        0,
+        0,
+        0,
+        500,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        OUT_DEFAULT_PRECIS as u32,
+        CLIP_DEFAULT_PRECIS as u32,
+        CLEARTYPE_QUALITY as u32,
+        DEFAULT_PITCH as u32,
+        wide("Segoe UI").as_ptr(),
+    );
+    let old = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT as i32);
+    let line = (14 * dpi / 96).min(r.bottom / 2);
+    let top = (r.bottom - line * 2) / 2;
+    for (i, (arrow, number)) in [("↓", &data.down), ("↑", &data.up)].iter().enumerate() {
+        let color = if data.colored {
+            let c = if i == 0 {
+                tm_core::color::download(!data.light)
+            } else {
+                tm_core::color::upload(!data.light)
+            };
+            rgb(c.0, c.1, c.2)
+        } else if data.light {
+            rgb(24, 24, 28)
         } else {
-            vis_w >= band.w * 3 / 4
-        }
-    }
-}
-
-/// 有没有「弹出来的东西」压在 `band` 上。
-///
-/// 三类都要认：
-/// * `#32768` —— 所有 Win32 弹出菜单（任务栏右键的「任务管理器 / 任务栏设置」、
-///   托盘图标右键菜单）；
-/// * `XamlExplorerHostIslandWindow` —— Win11 开始菜单那层 XAML 浮层。
-///
-/// 只认**可见**且和任务栏矩形相交的：别的程序弹个小菜单、只要没压到任务栏，
-/// 就不该把贴片吓跑。
-fn popup_over(band: Rect) -> bool {
-    // 只留「真的是一块弹出来的界面」的类。
-    // `Windows.UI.Core.CoreWindow` 看着像 XAML 浮层，其实系统里常年有
-    // 几个「可见但透明」的实例铺满整块屏幕，把它算进来贴片就永远不显示了
-    // （实测踩过）。
-    const CLASSES: &[&str] = &["#32768", "XamlExplorerHostIslandWindow"];
-    unsafe {
-        let (l, t) = (band.x, band.y);
-        let (r, b) = (band.x + band.w, band.y + band.h);
-        for name in CLASSES {
-            let cls = wide(name);
-            let mut h =
-                FindWindowExW(std::ptr::null_mut(), std::ptr::null_mut(), cls.as_ptr(), std::ptr::null());
-            while !h.is_null() {
-                if IsWindowVisible(h) != 0 {
-                    if let Some(m) = rect_of(h) {
-                        if m.x < r && m.x + m.w > l && m.y < b && m.y + m.h > t {
-                            return true;
-                        }
-                    }
-                }
-                h = FindWindowExW(std::ptr::null_mut(), h, cls.as_ptr(), std::ptr::null());
-            }
-        }
-        false
-    }
-}
-
-/// 量任务栏和托盘区。拿不到（explorer 正在重启、任务栏被换成第三方实现）
-/// 就返回 `None`，调用方退回「贴着托盘图标」的位置。
-pub fn taskbar() -> Option<Taskbar> {
-    unsafe {
-        let class = wide("Shell_TrayWnd");
-        let shell = FindWindowW(class.as_ptr(), std::ptr::null());
-        if shell.is_null() {
-            return None;
-        }
-        let band = rect_of(shell)?;
-        // Win10 和 Win11 都有这个子窗口，名字一直没变
-        let tray_class = wide("TrayNotifyWnd");
-        let tray = FindWindowExW(
-            shell,
-            std::ptr::null_mut(),
-            tray_class.as_ptr(),
-            std::ptr::null(),
+            rgb(238, 238, 242)
+        };
+        SetTextColor(dc, color);
+        let text = wide(&format!("{arrow} {number}"));
+        let mut line_rect = RECT {
+            left: 3 * dpi / 96,
+            right: r.right - 3 * dpi / 96,
+            top: top + i as i32 * line,
+            bottom: top + (i as i32 + 1) * line,
+        };
+        DrawTextW(
+            dc,
+            text.as_ptr(),
+            (text.len() - 1) as i32,
+            &mut line_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
-        let tray = if tray.is_null() { band } else { rect_of(tray)? };
-
-        let mut plugins = Vec::new();
-        let mut child = FindWindowExW(shell, std::ptr::null_mut(), std::ptr::null(), std::ptr::null());
-        let mut guard = 0;
-        while !child.is_null() && guard < 40 {
-            guard += 1;
-            let mut name = [0u16; 96];
-            let n = GetClassNameW(child, name.as_mut_ptr(), name.len() as i32);
-            let class = String::from_utf16_lossy(&name[..n.max(0) as usize]);
-            if !SYSTEM_CLASSES.contains(&class.as_str()) {
-                if let Some(r) = rect_of(child) {
-                    if r.w > 8 && r.h > 8 {
-                        plugins.push(r);
-                    }
-                }
-            }
-            child = FindWindowExW(shell, child, std::ptr::null(), std::ptr::null());
-        }
-
-        Some(Taskbar {
-            band,
-            tray,
-            plugins,
-        })
     }
+    SelectObject(dc, old);
+    DeleteObject(font);
+    EndPaint(hwnd, &ps);
 }
 
-unsafe fn rect_of(hwnd: HWND) -> Option<Rect> {
-    let mut r: RECT = unsafe { std::mem::zeroed() };
-    if unsafe { GetWindowRect(hwnd, &mut r) } == 0 {
+fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    r as u32 | (g as u32) << 8 | (b as u32) << 16
+}
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+fn same_rect(a: RECT, b: RECT) -> bool {
+    (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
+}
+fn intersects(a: RECT, b: RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+unsafe fn move_child(hwnd: HWND, r: RECT) -> bool {
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+        SWP_NOACTIVATE | SWP_NOZORDER,
+    ) != 0
+}
+unsafe fn client_rect(hwnd: HWND) -> Option<RECT> {
+    let mut r = std::mem::zeroed();
+    (GetClientRect(hwnd, &mut r) != 0).then_some(r)
+}
+unsafe fn relative_rect(hwnd: HWND, parent: HWND) -> Option<RECT> {
+    if hwnd.is_null() {
         return None;
     }
-    Some(Rect {
+    let mut r: RECT = std::mem::zeroed();
+    if GetWindowRect(hwnd, &mut r) == 0 {
+        return None;
+    }
+    let mut point = POINT {
+        x: r.left,
+        y: r.top,
+    };
+    if ScreenToClient(parent, &mut point) == 0 {
+        return None;
+    }
+    Some(RECT {
+        left: point.x,
+        top: point.y,
+        right: point.x + r.right - r.left,
+        bottom: point.y + r.bottom - r.top,
+    })
+}
+unsafe fn screen_rect(hwnd: HWND) -> Option<Rect> {
+    let mut r: RECT = std::mem::zeroed();
+    (GetWindowRect(hwnd, &mut r) != 0).then_some(Rect {
         x: r.left,
         y: r.top,
         w: r.right - r.left,
         h: r.bottom - r.top,
     })
 }
-
-/// 把指定标题的窗口改成「工具窗口 + 不可激活」。
-///
-/// 找不到窗口（还没建出来）或那个窗口不属于本进程时返回 `false`，
-/// 调用方下一帧再试——贴片窗口是子 viewport 第一次渲染时才建的，
-/// 起手那几帧本来就找不到。
-pub fn tune(title: &str) -> bool {
-    let name = wide(title);
-    unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), name.as_ptr());
-        if hwnd.is_null() {
-            return false;
-        }
-        // 标题是全局可见的：别的程序完全可能也叫这个名字。只动自己的窗口。
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid != GetCurrentProcessId() {
-            return false;
-        }
-
-        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let want = ex
-            | WS_EX_TOOLWINDOW as i32
-            | WS_EX_NOACTIVATE as i32
-            | WS_EX_LAYERED as i32;
-        let mut flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-        if want != ex {
-            SetWindowLongW(hwnd, GWL_EXSTYLE, want);
-            // 扩展样式改完要让系统重算一次非客户区，否则新样式要等下次
-            // 尺寸变化才生效（贴片尺寸一直不变，等于永远不生效）。
-            flags |= SWP_FRAMECHANGED;
-        }
-        // **每次都重新申明 TOPMOST**。
-        //
-        // 任务栏自己也是 TOPMOST，而且它每次重绘（时间跳一分钟、托盘图标变化）
-        // 都会把自己重新提到最前，我们就被压到它下面 —— 表现是贴片毫无征兆地
-        // 消失，过一会儿又出现。SWP_NOACTIVATE 保证这一下不会抢焦点。
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
-
-        // 记下句柄，让轮询线程自己去查矩形（它 12ms 一次，比这里的
-        // 1Hz 心跳跟得紧）
-        BADGE_HWND.store(hwnd as isize, Ordering::Relaxed);
-
-        // 纯黑抠成透明。
-        //
-        // 贴片窗口是 GL 画的，而 eframe 拿到的 GL 配置**没有 alpha 通道**
-        // （启动日志里那句 `Cannot create transparent window: the GL config
-        // does not support it`），所以 glClear 的 alpha 被丢掉，窗口底色
-        // 永远是黑 —— 不处理的话它在任务栏上就是一块黑方块。
-        //
-        // 逐像素 alpha（`UpdateLayeredWindow`）轮不到我们用，能用的只有
-        // 颜色键：把纯黑整片抠掉，画在上面的字反而是原样。抗锯齿的过渡像素
-        // 是「文字色×覆盖率」，不是纯黑，所以不会被误抠，只是描边会偏深一档
-        // —— 在深色任务栏上看不出来，浅色任务栏上我们的字也是深色，同样不显。
-        //
-        // 顺带：颜色键抠掉的区域鼠标也会漏下去，贴片不挡住任务栏的点击。
-        // 落在这块地方的点击由 [`start_click_poller`] 另外认（系统的命中
-        // 测试不认，只能自己看鼠标）。
-        SetLayeredWindowAttributes(hwnd, 0, 0, LWA_COLORKEY);
-        true
-    }
+unsafe fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+    String::from_utf16_lossy(&buf[..n])
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CLICKS: AtomicUsize = AtomicUsize::new(0);
+
+    /// 需要交互式 Windows 桌面；不在无桌面的 CI 中修改 Explorer 布局。
+    #[test]
+    #[ignore = "requires interactive Windows taskbar"]
+    fn native_child_lifecycle_and_clicks() {
+        let mut badge = TaskbarBadge::new(|rect| {
+            assert!(rect.is_some());
+            CLICKS.fetch_add(1, Ordering::Relaxed);
+        });
+        let content = Content {
+            down: "12M".into(),
+            up: "3.4K".into(),
+            light: false,
+            colored: true,
+        };
+        badge.update(Some(content.clone())).unwrap();
+        unsafe {
+            let hwnd = badge.state.hwnd.get();
+            assert!(!hwnd.is_null());
+            assert_eq!(GetParent(hwnd), badge.shell);
+            assert_ne!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CHILD, 0);
+            assert_eq!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_POPUP, 0);
+            assert_eq!(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST, 0);
+            assert_ne!(IsWindowVisible(hwnd), 0);
+            let r = relative_rect(hwnd, badge.shell).unwrap();
+            let band = client_rect(badge.shell).unwrap();
+            assert!(r.left >= 0 && r.top >= 0 && r.right <= band.right && r.bottom <= band.bottom);
+            UpdateWindow(hwnd);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, 4 | (4 << 16));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, 4 | (4 << 16));
+            assert_eq!(CLICKS.load(Ordering::Relaxed), 1);
+            // 模拟原生子窗口丢失，验证下一帧恢复，不重启用户的 Explorer。
+            DestroyWindow(hwnd);
+            assert!(badge.state.hwnd.get().is_null());
+            badge.update(Some(content)).unwrap();
+            let recovered = badge.state.hwnd.get();
+            assert_eq!(GetParent(recovered), badge.shell);
+            badge.update(None).unwrap();
+            assert_eq!(IsWindow(recovered), 0);
+            assert!(badge.reservation.is_none());
+        }
+    }
 }

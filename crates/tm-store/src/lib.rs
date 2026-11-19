@@ -130,6 +130,25 @@ impl Store {
         at: SystemTime,
         deltas: &[(AppKey, u64, u64)],
     ) -> Result<usize, StoreError> {
+        self.add_deltas_impl(at, deltas, None)
+    }
+
+    /// 恢复退出时保留的日志。每分钟提交一个递增标记，同一日志重复恢复不重复计费。
+    pub fn add_recovered_deltas(
+        &mut self,
+        at: SystemTime,
+        deltas: &[(AppKey, u64, u64)],
+        token: &str,
+    ) -> Result<usize, StoreError> {
+        self.add_deltas_impl(at, deltas, Some(token))
+    }
+
+    fn add_deltas_impl(
+        &mut self,
+        at: SystemTime,
+        deltas: &[(AppKey, u64, u64)],
+        recovery_token: Option<&str>,
+    ) -> Result<usize, StoreError> {
         let secs = system_secs(at);
         let minute = secs - secs % 60;
 
@@ -145,6 +164,16 @@ impl Store {
         }
 
         let txn = self.conn.transaction()?;
+        if let Some(token) = recovery_token {
+            // token 包含日志 ID 和分钟；与数据更新在同一事务内提交。
+            let changed = txn.execute(
+                "INSERT OR IGNORE INTO meta(k,v) VALUES (?1,'recovered')",
+                [format!("recovery:{token}")],
+            )?;
+            if changed == 0 {
+                return Ok(0);
+            }
+        }
         let mut rows = 0usize;
         {
             let mut stmt = txn.prepare_cached(
@@ -185,7 +214,12 @@ impl Store {
     }
 
     /// 按桶聚合总量，用来画曲线。`bucket_secs` 例如 60（1 小时视图）或 3600（24 小时视图）。
-    pub fn timeline(&self, from: i64, to: i64, bucket_secs: i64) -> Result<Vec<Bucket>, StoreError> {
+    pub fn timeline(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_secs: i64,
+    ) -> Result<Vec<Bucket>, StoreError> {
         let bucket = bucket_secs.max(1);
         let mut stmt = self.conn.prepare_cached(
             r#"SELECT (minute / ?3) * ?3 AS b, SUM(rx), SUM(tx) FROM samples
@@ -347,6 +381,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn recovery_replay_is_idempotent() {
+        let mut store = Store::open_memory().unwrap();
+        let delta = [(AppKey::from("app"), 123, 9)];
+        assert_eq!(
+            store
+                .add_recovered_deltas(at(60), &delta, "crash-1:60")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .add_recovered_deltas(at(60), &delta, "crash-1:60")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.totals_between(0, 120).unwrap()[0].rx, 123);
+    }
+
     fn at(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
@@ -359,8 +412,11 @@ mod tests {
     fn writes_and_reads_totals() {
         let mut s = Store::open_memory().unwrap();
         let now = 1_700_000_000;
-        s.add_deltas(at(now), &[(app("chrome"), 1000, 100), (app("slack"), 50, 5)])
-            .unwrap();
+        s.add_deltas(
+            at(now),
+            &[(app("chrome"), 1000, 100), (app("slack"), 50, 5)],
+        )
+        .unwrap();
 
         let totals = s.totals_between(now as i64 - 60, now as i64 + 60).unwrap();
         assert_eq!(totals.len(), 2);

@@ -13,7 +13,7 @@ use std::mem::size_of;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    BI_RGB, DIB_RGB_COLORS, HGDIOBJ, RGBQUAD,
 };
 use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
@@ -93,7 +93,7 @@ unsafe fn decode(info: &ICONINFO) -> Option<IconBitmap> {
     }
     let width = bm.bmWidth;
     let height = bm.bmHeight;
-    if width <= 0 || height == 0 || width > 1024 || height > 1024 {
+    if width <= 0 || height == 0 || width > 1024 || height.unsigned_abs() > 1024 {
         return None;
     }
     let (width, height) = (width as u32, height.unsigned_abs());
@@ -166,17 +166,20 @@ unsafe fn read_mask(bmp: HANDLE, width: u32, height: u32) -> Option<Vec<bool>> {
     if bmp.is_null() {
         return None;
     }
-    let stride = ((width as usize) + 31) / 32 * 4; // 1bpp 按 4 字节对齐
-    let mut bi: BITMAPINFO = std::mem::zeroed();
-    bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-    bi.bmiHeader.biWidth = width as i32;
-    bi.bmiHeader.biHeight = -(height as i32);
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 1;
-    bi.bmiHeader.biCompression = BI_RGB;
-    // 1bpp 的调色板不填也行：我们只关心返回的位（0=黑、1=透明），
-    // 不读调色板颜色。windows-sys 里 bmiColors 只有 1 个元素（柔性数组），
-    // 想塞两个色块得手动分配，没必要。
+    let stride = (width as usize).div_ceil(32) * 4;
+    // GetDIBits 总会写回两种颜色；BITMAPINFO 的柔性数组占位仅有一项。
+    #[repr(C)]
+    struct MonoBitmapInfo {
+        header: BITMAPINFOHEADER,
+        colors: [RGBQUAD; 2],
+    }
+    let mut bi: MonoBitmapInfo = std::mem::zeroed();
+    bi.header.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bi.header.biWidth = width as i32;
+    bi.header.biHeight = -(height as i32);
+    bi.header.biPlanes = 1;
+    bi.header.biBitCount = 1;
+    bi.header.biCompression = BI_RGB;
 
     let mut buf = vec![0u8; stride * height as usize];
     let hdc = GetDC(std::ptr::null_mut());
@@ -189,7 +192,7 @@ unsafe fn read_mask(bmp: HANDLE, width: u32, height: u32) -> Option<Vec<bool>> {
         0,
         height,
         buf.as_mut_ptr() as *mut c_void,
-        &mut bi,
+        &mut bi as *mut MonoBitmapInfo as *mut BITMAPINFO,
         DIB_RGB_COLORS,
     );
     ReleaseDC(std::ptr::null_mut(), hdc);
@@ -211,6 +214,22 @@ unsafe fn read_mask(bmp: HANDLE, width: u32, height: u32) -> Option<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_monochrome_mask_with_two_color_palette() {
+        use windows_sys::Win32::Graphics::Gdi::CreateBitmap;
+        unsafe {
+            let bits = [0x80u8, 0]; // DDB scanline is WORD aligned
+            let bitmap = CreateBitmap(8, 1, 1, 1, bits.as_ptr().cast());
+            assert!(!bitmap.is_null());
+            let result = read_mask(bitmap, 8, 1);
+            DeleteObject(bitmap);
+            assert_eq!(
+                result.unwrap(),
+                vec![true, false, false, false, false, false, false, false]
+            );
+        }
+    }
 
     #[test]
     fn placeholder_pid_has_no_icon() {

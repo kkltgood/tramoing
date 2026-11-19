@@ -55,8 +55,7 @@ impl FlowRow {
     }
 
     fn is_loopback(&self) -> bool {
-        self.iface == "lo0"
-            || (is_loopback_ip(&self.local_ip) && is_loopback_ip(&self.remote_ip))
+        self.iface == "lo0" || (is_loopback_ip(&self.local_ip) && is_loopback_ip(&self.remote_ip))
     }
 }
 
@@ -78,6 +77,7 @@ pub struct FlowParser {
     pub lines_seen: usize,
     /// 解析失败的连接行数
     pub unparsed: usize,
+    header_seen: bool,
 }
 
 impl FlowParser {
@@ -97,7 +97,7 @@ impl FlowParser {
 
         if is_header(t) {
             self.cur_pid = None;
-            if self.block.is_empty() {
+            if !std::mem::replace(&mut self.header_seen, true) {
                 return None; // 第一帧的表头
             }
             return Some(std::mem::take(&mut self.block));
@@ -237,8 +237,8 @@ pub struct Bytes {
 
 impl Bytes {
     fn add(&mut self, other: Bytes) {
-        self.rx += other.rx;
-        self.tx += other.tx;
+        self.rx = self.rx.saturating_add(other.rx);
+        self.tx = self.tx.saturating_add(other.tx);
     }
 
     fn is_zero(&self) -> bool {
@@ -283,6 +283,15 @@ pub struct FlowAccounting {
     last: std::collections::HashMap<FlowKey, (u64, u64, u64)>,
     /// 连接消失后还保留几帧，防止同一连接短暂缺席导致重复计基线
     keep_frames: u64,
+    ledgers: HashMap<u32, RelayLedger>,
+}
+
+/// 已先记到代理的外网字节用于抵消迟到的回环样本；先到的客户端样本等外网预算。
+#[derive(Debug, Default)]
+struct RelayLedger {
+    credited: Bytes,
+    pending: std::collections::BTreeMap<AppKey, Bytes>,
+    seen: u64,
 }
 
 impl Default for FlowAccounting {
@@ -297,6 +306,7 @@ impl FlowAccounting {
             frame: 0,
             last: std::collections::HashMap::new(),
             keep_frames: 8,
+            ledgers: HashMap::new(),
         }
     }
 
@@ -355,7 +365,8 @@ impl FlowAccounting {
                 // 已有基线：正常差分；计数器回退说明端口被复用，按「从 0 重计」处理
                 Some(&(prx, ptx, _)) => (counter_delta(cur_rx, prx), counter_delta(cur_tx, ptx)),
                 // 新连接：这一帧只建基线，避免把连接建立前的历史字节算进来
-                None => (0, 0),
+                None if self.frame == 1 => (0, 0),
+                None => (cur_rx, cur_tx),
             };
             self.last.insert(key, (cur_rx, cur_tx, self.frame));
 
@@ -385,18 +396,38 @@ impl FlowAccounting {
             }
         }
 
-        // 中继（系统代理）：在回环上服务本机客户端，并且有外网流量，
-        // 或者自己又连向下一级代理（链式代理的第一跳，本身没有外网流量）。
-        let mut relays: HashSet<u32> = acc
+        // 从连接拓扑判断代理，不能依赖两边恰好在同一秒都有增量。
+        let external: HashSet<u32> = rows
             .iter()
-            .filter(|(pid, a)| {
-                !a.srv.is_zero()
-                    && (!a.ext.is_zero() || cli_sum.get(*pid).is_some_and(|c| !c.is_zero()))
-            })
+            .filter(|r| !r.is_listen() && !r.is_loopback() && !r.is_tunnel())
+            .map(|r| r.pid)
+            .collect();
+        let mut upstream = HashMap::new();
+        for r in rows.iter().filter(|r| r.is_loopback() && !r.is_listen()) {
+            if !listeners.contains(&(r.pid, r.local_port)) {
+                if let Some(server) = owner.get(&(r.remote_ip.as_str(), r.remote_port)) {
+                    if listeners.contains(&(*server, r.remote_port)) {
+                        upstream.insert(r.pid, *server);
+                    }
+                }
+            }
+        }
+        let root_of = |mut pid: u32| -> Option<u32> {
+            let mut seen = HashSet::new();
+            while seen.insert(pid) {
+                if external.contains(&pid) {
+                    return Some(pid);
+                }
+                pid = *upstream.get(&pid)?;
+            }
+            None
+        };
+        let mut relays: HashSet<u32> = listeners
+            .iter()
             .map(|(pid, _)| *pid)
+            .filter(|pid| root_of(*pid).is_some())
             .collect();
 
-        // 隧道侧总量，以及是谁在转发它（TUN 模式的代理）
         let tunnel = acc.values().fold(Bytes::default(), |mut sum, a| {
             sum.add(a.tun);
             sum
@@ -408,52 +439,72 @@ impl FlowAccounting {
 
         let mut out: HashMap<AppKey, Bytes> = HashMap::new();
         let mut app_of = |pid: u32| resolve(pid, names.get(&pid).copied().unwrap_or(""));
-
-        for (pid, a) in &acc {
-            let bytes = if relays.contains(pid) {
-                // 中继：外网流量里被回填给客户端（回环）或隧道里 App 的那部分减掉，
-                // 剩下的才是它自己的（自更新、DNS、控制连接）。
-                let mut dup_rx = a.srv.tx;
-                let mut dup_tx = a.srv.rx;
-                if tunnel_owner == Some(*pid) {
-                    dup_rx = dup_rx.saturating_add(tunnel.rx);
-                    dup_tx = dup_tx.saturating_add(tunnel.tx);
-                }
-                Bytes {
-                    rx: a.ext.rx.saturating_sub(dup_rx),
-                    tx: a.ext.tx.saturating_sub(dup_tx),
-                }
-            } else {
-                a.ext
-            };
-            if !bytes.is_zero() {
-                out.entry(app_of(*pid)).or_default().add(bytes);
-            }
-        }
-
-        // 隧道侧的字节回填给各自的 App。
-        // 认不出转发进程时宁可不算：否则总量会凭空翻倍，比「只看到代理」更糟。
-        if tunnel_owner.is_some() {
+        let mut claims: Vec<(u32, AppKey, Bytes)> = Vec::new();
+        if let Some(root) = tunnel_owner {
             for (pid, a) in &acc {
                 if !a.tun.is_zero() {
-                    out.entry(app_of(*pid)).or_default().add(a.tun);
+                    claims.push((root, app_of(*pid), a.tun));
+                }
+            }
+        }
+        for (pid, server, d) in &client_side {
+            if !relays.contains(pid) {
+                if let Some(root) = server.and_then(root_of) {
+                    claims.push((root, app_of(*pid), *d));
                 }
             }
         }
 
-        for (pid, server, d) in &client_side {
-            // 只有「非中继客户端 → 中继」才回填：
-            // - 本机互访（浏览器 ↔ dev server）两端都不是中继，从来没上网卡，不计；
-            // - 链式代理里上一跳也是中继，它连下一跳的流量已经在最外层计过了，不计。
-            if !relays.contains(pid) && server.is_some_and(|s| relays.contains(&s)) {
-                out.entry(app_of(*pid)).or_default().add(*d);
+        // 任何回填都必须消耗同一代理的外网预算，总和始终等于物理接口增量。
+        // 外网先于回环到达时已经记到代理；后到的副本抵消 credit，不再新增总量。
+        // 无法仅凭累计采样可靠地撤回历史归属，这部分保留在代理名下。
+        claims.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        for (root, app, mut d) in claims {
+            let ledger = self.ledgers.entry(root).or_default();
+            ledger.seen = self.frame;
+            let old_rx = d.rx.min(ledger.credited.rx);
+            let old_tx = d.tx.min(ledger.credited.tx);
+            ledger.credited.rx -= old_rx;
+            ledger.credited.tx -= old_tx;
+            d.rx -= old_rx;
+            d.tx -= old_tx;
+            if !d.is_zero() {
+                ledger.pending.entry(app).or_default().add(d);
+            }
+        }
+        for (pid, a) in &acc {
+            let mut budget = a.ext;
+            if relays.contains(pid) || self.ledgers.contains_key(pid) {
+                let ledger = self.ledgers.entry(*pid).or_default();
+                ledger.seen = self.frame;
+                for (app, pending) in &mut ledger.pending {
+                    let take = Bytes {
+                        rx: budget.rx.min(pending.rx),
+                        tx: budget.tx.min(pending.tx),
+                    };
+                    budget.rx -= take.rx;
+                    budget.tx -= take.tx;
+                    pending.rx -= take.rx;
+                    pending.tx -= take.tx;
+                    if !take.is_zero() {
+                        out.entry(app.clone()).or_default().add(take);
+                    }
+                }
+                ledger.pending.retain(|_, d| !d.is_zero());
+                ledger.credited.add(budget);
+            }
+            if !budget.is_zero() {
+                out.entry(app_of(*pid)).or_default().add(budget);
             }
         }
 
         // 清理消失很久的连接
         let keep = self.keep_frames;
         let frame = self.frame;
-        self.last.retain(|_, (_, _, seen)| frame.saturating_sub(*seen) <= keep);
+        self.last
+            .retain(|_, (_, _, seen)| frame.saturating_sub(*seen) <= keep);
+        self.ledgers
+            .retain(|_, ledger| frame.saturating_sub(ledger.seen) <= keep);
 
         out.into_iter().collect()
     }
@@ -541,7 +592,8 @@ mod tests {
 
     #[test]
     fn parses_ipv6_dotted_port() {
-        let row = flow("14:22:45.601593,tcp6 ::1.8021<->*.*,lo0,Listen,,,,,,,,,,-,cubic,-,-,-,-,so,");
+        let row =
+            flow("14:22:45.601593,tcp6 ::1.8021<->*.*,lo0,Listen,,,,,,,,,,-,cubic,-,-,-,-,so,");
         assert_eq!(row.local_ip, "::1");
         assert_eq!(row.local_port, 8021);
         assert_eq!(row.remote_port, 0);
@@ -551,7 +603,8 @@ mod tests {
 
     #[test]
     fn parses_udp_wildcards() {
-        let row = flow("14:22:45.600351,udp4 *:67<->*:*,bridge100,,166841,900,,,,,786896,,CTL,,,,,,,so,");
+        let row =
+            flow("14:22:45.600351,udp4 *:67<->*:*,bridge100,,166841,900,,,,,786896,,CTL,,,,,,,so,");
         assert_eq!(row.local_ip, "");
         assert_eq!(row.local_port, 67);
         assert_eq!(row.rx, 166841);
@@ -602,6 +655,7 @@ mod tests {
 mod accounting_tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)] // CSV fixture mirrors the input columns.
     fn row(
         pid: u32,
         name: &str,
@@ -652,9 +706,42 @@ mod accounting_tests {
         let frame = |n: u64| {
             vec![
                 listen(9, "verge-mihomo", 7890),
-                row(100, "Chrome", "lo0", "Established", "127.0.0.1", 52344, "127.0.0.1", 7890, n, 0),
-                row(9, "verge-mihomo", "lo0", "Established", "127.0.0.1", 7890, "127.0.0.1", 52344, 0, n),
-                row(9, "verge-mihomo", "en7", "Established", "192.168.1.10", 40000, "93.184.216.34", 443, n, 0),
+                row(
+                    100,
+                    "Chrome",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    52344,
+                    "127.0.0.1",
+                    7890,
+                    n,
+                    0,
+                ),
+                row(
+                    9,
+                    "verge-mihomo",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    7890,
+                    "127.0.0.1",
+                    52344,
+                    0,
+                    n,
+                ),
+                row(
+                    9,
+                    "verge-mihomo",
+                    "en7",
+                    "Established",
+                    "192.168.1.10",
+                    40000,
+                    "93.184.216.34",
+                    443,
+                    n,
+                    0,
+                ),
             ]
         };
 
@@ -669,7 +756,18 @@ mod accounting_tests {
     fn direct_app_counts_its_external_traffic() {
         let mut acc = FlowAccounting::new();
         let frame = |n: u64| {
-            vec![row(7, "Safari", "en0", "Established", "192.168.1.10", 50000, "1.1.1.1", 443, n, n / 10)]
+            vec![row(
+                7,
+                "Safari",
+                "en0",
+                "Established",
+                "192.168.1.10",
+                50000,
+                "1.1.1.1",
+                443,
+                n,
+                n / 10,
+            )]
         };
         acc.update(&frame(0), resolve);
         let out = acc.update(&frame(4096), resolve);
@@ -683,8 +781,30 @@ mod accounting_tests {
         let frame = |n: u64| {
             vec![
                 listen(200, "node", 3000),
-                row(100, "Chrome", "lo0", "Established", "127.0.0.1", 52344, "127.0.0.1", 3000, n, 0),
-                row(200, "node", "lo0", "Established", "127.0.0.1", 3000, "127.0.0.1", 52344, 0, n),
+                row(
+                    100,
+                    "Chrome",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    52344,
+                    "127.0.0.1",
+                    3000,
+                    n,
+                    0,
+                ),
+                row(
+                    200,
+                    "node",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    3000,
+                    "127.0.0.1",
+                    52344,
+                    0,
+                    n,
+                ),
             ]
         };
         acc.update(&frame(0), resolve);
@@ -701,11 +821,66 @@ mod accounting_tests {
             vec![
                 listen(9, "mihomo", 7890),
                 listen(10, "surge", 7891),
-                row(100, "Chrome", "lo0", "Established", "127.0.0.1", 52344, "127.0.0.1", 7890, n, 0),
-                row(9, "mihomo", "lo0", "Established", "127.0.0.1", 7890, "127.0.0.1", 52344, 0, n),
-                row(9, "mihomo", "lo0", "Established", "127.0.0.1", 53000, "127.0.0.1", 7891, n, 0),
-                row(10, "surge", "lo0", "Established", "127.0.0.1", 7891, "127.0.0.1", 53000, 0, n),
-                row(10, "surge", "en7", "Established", "192.168.1.10", 40000, "93.184.216.34", 443, n, 0),
+                row(
+                    100,
+                    "Chrome",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    52344,
+                    "127.0.0.1",
+                    7890,
+                    n,
+                    0,
+                ),
+                row(
+                    9,
+                    "mihomo",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    7890,
+                    "127.0.0.1",
+                    52344,
+                    0,
+                    n,
+                ),
+                row(
+                    9,
+                    "mihomo",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    53000,
+                    "127.0.0.1",
+                    7891,
+                    n,
+                    0,
+                ),
+                row(
+                    10,
+                    "surge",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    7891,
+                    "127.0.0.1",
+                    53000,
+                    0,
+                    n,
+                ),
+                row(
+                    10,
+                    "surge",
+                    "en7",
+                    "Established",
+                    "192.168.1.10",
+                    40000,
+                    "93.184.216.34",
+                    443,
+                    n,
+                    0,
+                ),
             ]
         };
         acc.update(&frame(0), resolve);
@@ -723,9 +898,42 @@ mod accounting_tests {
         let frame = |srv: u64, ext: u64| {
             vec![
                 listen(9, "clash", 7890),
-                row(100, "Chrome", "lo0", "Established", "127.0.0.1", 52344, "127.0.0.1", 7890, srv, 0),
-                row(9, "clash", "lo0", "Established", "127.0.0.1", 7890, "127.0.0.1", 52344, 0, srv),
-                row(9, "clash", "en7", "Established", "192.168.1.10", 40000, "1.1.1.1", 443, ext, 0),
+                row(
+                    100,
+                    "Chrome",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    52344,
+                    "127.0.0.1",
+                    7890,
+                    srv,
+                    0,
+                ),
+                row(
+                    9,
+                    "clash",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    7890,
+                    "127.0.0.1",
+                    52344,
+                    0,
+                    srv,
+                ),
+                row(
+                    9,
+                    "clash",
+                    "en7",
+                    "Established",
+                    "192.168.1.10",
+                    40000,
+                    "1.1.1.1",
+                    443,
+                    ext,
+                    0,
+                ),
             ]
         };
         acc.update(&frame(0, 0), resolve);
@@ -742,7 +950,18 @@ mod accounting_tests {
         let mut acc = FlowAccounting::new();
         let frame = |bridge: u64, ap1: u64| {
             vec![
-                row(491, "mDNSResponder", "bridge100", "", "*", 5353, "*", 0, bridge, 0),
+                row(
+                    491,
+                    "mDNSResponder",
+                    "bridge100",
+                    "",
+                    "*",
+                    5353,
+                    "*",
+                    0,
+                    bridge,
+                    0,
+                ),
                 row(491, "mDNSResponder", "ap1", "", "*", 5353, "*", 0, ap1, 0),
             ]
         };
@@ -767,21 +986,113 @@ mod accounting_tests {
         assert_eq!(of(&out, "Chrome#3006").rx, 200);
     }
 
-    /// 新连接第一次出现时不能把它的历史累计值当成增量。
+    /// 启动基线之后出现的新连接必须保留第一批字节。
     #[test]
-    fn new_connection_starts_at_zero() {
+    fn new_connection_keeps_initial_bytes() {
         let mut acc = FlowAccounting::new();
         acc.update(&[listen(9, "clash", 7890)], resolve);
         let out = acc.update(
             &[
                 listen(9, "clash", 7890),
-                row(100, "Chrome", "lo0", "Established", "127.0.0.1", 52344, "127.0.0.1", 7890, 9_000_000, 0),
-                row(9, "clash", "lo0", "Established", "127.0.0.1", 7890, "127.0.0.1", 52344, 0, 9_000_000),
-                row(9, "clash", "en7", "Established", "192.168.1.10", 40000, "1.1.1.1", 443, 9_000_000, 0),
+                row(
+                    100,
+                    "Chrome",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    52344,
+                    "127.0.0.1",
+                    7890,
+                    9_000_000,
+                    0,
+                ),
+                row(
+                    9,
+                    "clash",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    7890,
+                    "127.0.0.1",
+                    52344,
+                    0,
+                    9_000_000,
+                ),
+                row(
+                    9,
+                    "clash",
+                    "en7",
+                    "Established",
+                    "192.168.1.10",
+                    40000,
+                    "1.1.1.1",
+                    443,
+                    9_000_000,
+                    0,
+                ),
             ],
             resolve,
         );
-        assert!(out.is_empty(), "新连接首帧不应产生速率：{out:?}");
+        assert_eq!(of(&out, "Chrome#100").rx, 9_000_000);
+    }
+
+    #[test]
+    fn delayed_proxy_forwarding_conserves_external_total() {
+        let mut acc = FlowAccounting::new();
+        let frame = |ext, forwarded| {
+            vec![
+                listen(9, "proxy", 7890),
+                row(
+                    100,
+                    "browser",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    52344,
+                    "127.0.0.1",
+                    7890,
+                    forwarded,
+                    0,
+                ),
+                row(
+                    9,
+                    "proxy",
+                    "lo0",
+                    "Established",
+                    "127.0.0.1",
+                    7890,
+                    "127.0.0.1",
+                    52344,
+                    0,
+                    forwarded,
+                ),
+                row(
+                    9,
+                    "proxy",
+                    "en0",
+                    "Established",
+                    "192.168.1.1",
+                    40000,
+                    "1.1.1.1",
+                    443,
+                    ext,
+                    0,
+                ),
+            ]
+        };
+        acc.update(&frame(0, 0), resolve);
+        let a = acc.update(&frame(10_000, 0), resolve);
+        let b = acc.update(&frame(11_000, 10_000), resolve);
+        assert_eq!(a.iter().chain(&b).map(|(_, d)| d.rx).sum::<u64>(), 11_000);
+    }
+
+    #[test]
+    fn parser_delivers_empty_baseline_and_idle_frames() {
+        const HEADER: &str = "time,,interface,state,bytes_in,bytes_out";
+        let mut parser = FlowParser::new();
+        assert!(parser.feed(HEADER).is_none());
+        assert_eq!(parser.feed(HEADER), Some(vec![]));
+        assert_eq!(parser.feed(HEADER), Some(vec![]));
     }
 }
 
@@ -789,6 +1100,7 @@ mod accounting_tests {
 mod tun_tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)] // CSV fixture mirrors the input columns.
     fn row(
         pid: u32,
         name: &str,
@@ -833,8 +1145,28 @@ mod tun_tests {
         let mut acc = FlowAccounting::new();
         let frame = |n: u64| {
             vec![
-                row(100, "Safari", "utun3", "192.168.1.10", 52344, "93.184.216.34", 443, n, 0),
-                row(9, "mihomo", "en7", "192.168.1.10", 53000, "93.184.216.34", 443, n, 0),
+                row(
+                    100,
+                    "Safari",
+                    "utun3",
+                    "192.168.1.10",
+                    52344,
+                    "93.184.216.34",
+                    443,
+                    n,
+                    0,
+                ),
+                row(
+                    9,
+                    "mihomo",
+                    "en7",
+                    "192.168.1.10",
+                    53000,
+                    "93.184.216.34",
+                    443,
+                    n,
+                    0,
+                ),
             ]
         };
         acc.update(&frame(0), resolve);
@@ -849,8 +1181,28 @@ mod tun_tests {
         let mut acc = FlowAccounting::new();
         let frame = |n: u64| {
             vec![
-                row(100, "Safari", "utun3", "192.168.1.10", 52344, "93.184.216.34", 443, 0, n),
-                row(9, "mihomo", "en7", "192.168.1.10", 53000, "93.184.216.34", 443, 0, n),
+                row(
+                    100,
+                    "Safari",
+                    "utun3",
+                    "192.168.1.10",
+                    52344,
+                    "93.184.216.34",
+                    443,
+                    0,
+                    n,
+                ),
+                row(
+                    9,
+                    "mihomo",
+                    "en7",
+                    "192.168.1.10",
+                    53000,
+                    "93.184.216.34",
+                    443,
+                    0,
+                    n,
+                ),
             ]
         };
         acc.update(&frame(0), resolve);
@@ -865,8 +1217,28 @@ mod tun_tests {
         let mut acc = FlowAccounting::new();
         let frame = |n: u64, overhead: u64| {
             vec![
-                row(100, "Safari", "utun3", "192.168.1.10", 52344, "93.184.216.34", 443, n, 0),
-                row(9, "mihomo", "en7", "192.168.1.10", 53000, "93.184.216.34", 443, n + overhead, 0),
+                row(
+                    100,
+                    "Safari",
+                    "utun3",
+                    "192.168.1.10",
+                    52344,
+                    "93.184.216.34",
+                    443,
+                    n,
+                    0,
+                ),
+                row(
+                    9,
+                    "mihomo",
+                    "en7",
+                    "192.168.1.10",
+                    53000,
+                    "93.184.216.34",
+                    443,
+                    n + overhead,
+                    0,
+                ),
             ]
         };
         acc.update(&frame(0, 0), resolve);
@@ -881,8 +1253,28 @@ mod tun_tests {
         let mut acc = FlowAccounting::new();
         let frame = |tun: u64, other: u64| {
             vec![
-                row(100, "Safari", "utun3", "192.168.1.10", 52344, "93.184.216.34", 443, tun, 0),
-                row(7, "Other", "en7", "192.168.1.10", 50000, "1.1.1.1", 443, other, 0),
+                row(
+                    100,
+                    "Safari",
+                    "utun3",
+                    "192.168.1.10",
+                    52344,
+                    "93.184.216.34",
+                    443,
+                    tun,
+                    0,
+                ),
+                row(
+                    7,
+                    "Other",
+                    "en7",
+                    "192.168.1.10",
+                    50000,
+                    "1.1.1.1",
+                    443,
+                    other,
+                    0,
+                ),
             ]
         };
         acc.update(&frame(0, 0), resolve);
@@ -897,8 +1289,28 @@ mod tun_tests {
         let mut acc = FlowAccounting::new();
         let frame = |n: u64| {
             vec![
-                row(100, "Safari", "utun3", "0.0.0.0", 5353, "224.0.0.251", 5353, n, 0),
-                row(9, "mihomo", "en7", "192.168.1.10", 53000, "1.1.1.1", 443, n, 0),
+                row(
+                    100,
+                    "Safari",
+                    "utun3",
+                    "0.0.0.0",
+                    5353,
+                    "224.0.0.251",
+                    5353,
+                    n,
+                    0,
+                ),
+                row(
+                    9,
+                    "mihomo",
+                    "en7",
+                    "192.168.1.10",
+                    53000,
+                    "1.1.1.1",
+                    443,
+                    n,
+                    0,
+                ),
             ]
         };
         acc.update(&frame(0), resolve);

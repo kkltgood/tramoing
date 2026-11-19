@@ -53,6 +53,16 @@ pub trait Sampler: Send {
     fn interval(&self) -> Duration {
         Duration::from_secs(1)
     }
+
+    /// true 表示计数器由采集器从零累计，新应用的首批字节可以直接计入。
+    fn counters_start_at_zero(&self) -> bool {
+        false
+    }
+
+    /// 计数器来源重启后只建立一次新基线，避免把旧助手历史当成新流量。
+    fn take_reset(&mut self) -> bool {
+        false
+    }
 }
 
 /// 假采样源：按固定节奏生成几条渐变流量，用来在没有采样权限的机器上
@@ -61,6 +71,7 @@ pub trait Sampler: Send {
 pub struct MockSampler {
     tick: u32,
     interval: Duration,
+    totals: [(u64, u64); 5],
 }
 
 impl Default for MockSampler {
@@ -74,6 +85,7 @@ impl MockSampler {
         Self {
             tick: 0,
             interval: Duration::from_secs(1),
+            totals: [(0, 0); 5],
         }
     }
 
@@ -96,7 +108,11 @@ impl Sampler for MockSampler {
             ("/Applications/Docker.app", 260_000.0, 120_000.0),
             ("/Applications/Slack.app", 120_000.0, 90_000.0),
             ("/Applications/WeChat.app", 60_000.0, 40_000.0),
-            ("/System/Library/CoreServices/mDNSResponder", 20_000.0, 15_000.0),
+            (
+                "/System/Library/CoreServices/mDNSResponder",
+                20_000.0,
+                15_000.0,
+            ),
         ]
         .iter()
         .enumerate()
@@ -104,11 +120,13 @@ impl Sampler for MockSampler {
             let phase = t * 0.35 + i as f64 * 1.7;
             let rx = (base + amp * phase.sin()) * self.interval.as_secs_f64();
             let tx = rx * 0.11;
+            self.totals[i].0 += rx as u64;
+            self.totals[i].1 += tx as u64;
             out.push(ProcSample::new(
                 1000 + i as u32,
                 *key,
-                (t * rx) as u64,
-                (t * tx) as u64,
+                self.totals[i].0,
+                self.totals[i].1,
             ));
         }
 
@@ -119,6 +137,10 @@ impl Sampler for MockSampler {
     fn interval(&self) -> Duration {
         self.interval
     }
+
+    fn counters_start_at_zero(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -128,14 +150,18 @@ mod tests {
     #[test]
     fn mock_produces_monotonic_counters() {
         let mut s = MockSampler::new().with_interval(Duration::from_millis(1));
-        let a = s.sample().expect("第一帧");
-        let b = s.sample().expect("第二帧");
-        assert_eq!(a.len(), b.len());
+        let mut a = s.sample().expect("第一帧");
+        for _ in 0..100 {
+            let b = s.sample().expect("后续帧");
+            assert_eq!(a.len(), b.len());
 
-        // 累计值必须单调递增，否则下游会判定成计数器重置
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert_eq!(x.app, y.app);
-            assert!(y.rx_total >= x.rx_total);
+            // 累计值必须单调递增，否则下游会判定成计数器重置
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.app, y.app);
+                assert!(y.rx_total >= x.rx_total);
+                assert!(y.tx_total >= x.tx_total);
+            }
+            a = b;
         }
     }
 

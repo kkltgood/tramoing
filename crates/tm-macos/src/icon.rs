@@ -146,9 +146,7 @@ pub fn app_icon(bundle_path: &str) -> Option<IconBitmap> {
 
         if std::env::var_os("TM_DEBUG_ICON").is_some() {
             let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
-            eprintln!(
-                "[icon] {bundle_path}: {w}x{h} bpr={bpr} spp={spp} 非透明像素={opaque}"
-            );
+            eprintln!("[icon] {bundle_path}: {w}x{h} bpr={bpr} spp={spp} 非透明像素={opaque}");
         }
 
         let bmp = IconBitmap {
@@ -197,4 +195,3 @@ mod tests {
         assert!(app_icon("/Applications/不存在的应用.app").is_none());
     }
 }
-

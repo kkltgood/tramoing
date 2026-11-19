@@ -181,8 +181,16 @@ mod tests {
     fn identify_keys_on_path_when_there_is_no_bundle() {
         // 自己的路径一定读得到，且它不在任何 .app 里
         let id = identify(std::process::id(), "ignored");
-        assert!(!id.key.ends_with(".app"), "测试进程不该被认成 app：{}", id.key);
-        assert!(id.key.starts_with('/'), "无 bundle 时键应是完整路径：{}", id.key);
+        assert!(
+            !id.key.ends_with(".app"),
+            "测试进程不该被认成 app：{}",
+            id.key
+        );
+        assert!(
+            id.key.starts_with('/'),
+            "无 bundle 时键应是完整路径：{}",
+            id.key
+        );
         assert_eq!(id.name, pretty_name(&id.key), "展示名取路径里的文件名");
         // 路径是图标层的判断依据，必须能从中认出系统目录
         assert!(!tm_core::is_system_service(&id.key));

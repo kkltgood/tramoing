@@ -48,7 +48,7 @@ pub struct Frame {
 pub enum ProtoError {
     BadMagic(u32),
     BadVersion(u16),
-    TooManyProcs(u16),
+    TooManyProcs(usize),
     Truncated { need: usize, got: usize },
     NameTooLong(usize),
     NotUtf8,
@@ -75,8 +75,11 @@ impl Frame {
     }
 
     /// 编码到已有缓冲区（复用分配，避免每秒新建 Vec）。
-    pub fn encode_into(&self, out: &mut Vec<u8>) {
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ProtoError> {
         out.clear();
+        if self.procs.len() > MAX_PROCS as usize {
+            return Err(ProtoError::TooManyProcs(self.procs.len()));
+        }
         out.reserve(HEADER_LEN + self.procs.len() * ENTRY_FIXED);
         out.extend_from_slice(&MAGIC.to_le_bytes());
         out.extend_from_slice(&VERSION.to_le_bytes());
@@ -97,12 +100,13 @@ impl Frame {
             out.extend_from_slice(&(len as u16).to_le_bytes());
             out.extend_from_slice(&name[..len]);
         }
+        Ok(())
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut v = Vec::new();
-        self.encode_into(&mut v);
-        v
+        self.encode_into(&mut v)?;
+        Ok(v)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -118,7 +122,7 @@ impl Frame {
         }
         let count = cur.u16()?;
         if count > MAX_PROCS {
-            return Err(ProtoError::TooManyProcs(count));
+            return Err(ProtoError::TooManyProcs(count as usize));
         }
         let seq = cur.u64()?;
 
@@ -183,6 +187,26 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn encoder_rejects_oversize_without_a_wrapped_count() {
+        let frame = Frame::new(
+            1,
+            vec![
+                ProcEntry {
+                    pid: 1,
+                    rx: 1,
+                    tx: 1,
+                    name: "x".into()
+                };
+                MAX_PROCS as usize + 1
+            ],
+        );
+        assert_eq!(
+            frame.encode(),
+            Err(ProtoError::TooManyProcs(MAX_PROCS as usize + 1))
+        );
+    }
+
     fn sample() -> Frame {
         Frame::new(
             42,
@@ -206,7 +230,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let f = sample();
-        let bytes = f.encode();
+        let bytes = f.encode().unwrap();
         assert_eq!(Frame::decode(&bytes).unwrap(), f);
     }
 
@@ -221,21 +245,21 @@ mod tests {
                 name: r"C:\用户\微信\WeChat.exe".to_owned(),
             }],
         );
-        let bytes = f.encode();
+        let bytes = f.encode().unwrap();
         assert_eq!(Frame::decode(&bytes).unwrap(), f);
     }
 
     #[test]
     fn empty_frame_roundtrips() {
         let f = Frame::new(0, Vec::new());
-        let bytes = f.encode();
+        let bytes = f.encode().unwrap();
         assert_eq!(bytes.len(), HEADER_LEN);
         assert_eq!(Frame::decode(&bytes).unwrap(), f);
     }
 
     #[test]
     fn rejects_bad_magic() {
-        let mut bytes = sample().encode();
+        let mut bytes = sample().encode().unwrap();
         bytes[0] = 0xFF;
         assert!(matches!(
             Frame::decode(&bytes),
@@ -245,7 +269,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated_body() {
-        let bytes = sample().encode();
+        let bytes = sample().encode().unwrap();
         let cut = &bytes[..bytes.len() - 5];
         assert!(matches!(
             Frame::decode(cut),
@@ -263,9 +287,9 @@ mod tests {
     fn reports_remaining_length_after_decode() {
         // 一帧后面跟着下一帧的开头，解码必须只吃自己那一段
         let a = sample();
-        let mut stream = a.encode();
+        let mut stream = a.encode().unwrap();
         let first_len = stream.len();
-        stream.extend_from_slice(&sample().encode());
+        stream.extend_from_slice(&sample().encode().unwrap());
         let decoded = Frame::decode(&stream[..first_len]).unwrap();
         assert_eq!(decoded.procs.len(), 2);
     }
@@ -273,8 +297,16 @@ mod tests {
     #[test]
     fn strips_overlong_name_instead_of_panicking() {
         let long = "a".repeat(MAX_NAME + 100);
-        let f = Frame::new(1, vec![ProcEntry { pid: 1, rx: 0, tx: 0, name: long }]);
-        let bytes = f.encode();
+        let f = Frame::new(
+            1,
+            vec![ProcEntry {
+                pid: 1,
+                rx: 0,
+                tx: 0,
+                name: long,
+            }],
+        );
+        let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).unwrap();
         assert_eq!(back.procs[0].name.len(), MAX_NAME);
     }
@@ -293,7 +325,7 @@ mod tests {
                 name: long,
             }],
         );
-        let bytes = f.encode();
+        let bytes = f.encode().unwrap();
         let back = Frame::decode(&bytes).expect("截断后的名字必须是合法 UTF-8");
         assert!(back.procs[0].name.len() <= MAX_NAME);
         assert!(!back.procs[0].name.is_empty());

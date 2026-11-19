@@ -30,7 +30,7 @@ mod win {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use tm_windows::agg::Aggregator;
+    use tm_windows::agg::{Aggregator, AppAccumulator};
     use tm_windows::etw::{self, EtwSession};
     use tm_windows::pipe::PipeServer;
     use tm_windows::proc::PathCache;
@@ -79,13 +79,28 @@ mod win {
             Err(e) => {
                 log(&format!("ETW 启动失败：{e}"));
                 log("请确认本程序以管理员权限运行（--install 注册的任务会自动带最高权限）");
-                loop {
-                    std::thread::sleep(Duration::from_secs(3600));
-                }
+                std::process::exit(1);
             }
         };
 
-        let mut cache = PathCache::new();
+        // 采样不随 UI 是否连接而停止。原始 PID 表每秒取走，避免无人连接时无限积累。
+        let latest = Arc::new(Mutex::new(tm_windows::proto::Frame::new(0, Vec::new())));
+        let output = latest.clone();
+        std::thread::spawn(move || {
+            let mut cache = PathCache::new();
+            let mut apps = AppAccumulator::default();
+            loop {
+                let mut batch = agg.lock().unwrap().drain_with(|_| String::new());
+                let active: Vec<u32> = batch.procs.iter().map(|p| p.pid).collect();
+                // 进程查询在 ETW 锁外，回调不等待系统 API。
+                for entry in &mut batch.procs {
+                    entry.name = cache.resolve(entry.pid);
+                }
+                cache.retain_pids(&active);
+                *output.lock().unwrap() = apps.update(batch);
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
         let mut scratch = Vec::with_capacity(64 * 1024);
 
         loop {
@@ -105,16 +120,11 @@ mod win {
             log("界面已连接，开始推送");
 
             loop {
-                let frame = agg.lock().unwrap().snapshot_with(|pid| cache.resolve(pid));
+                let frame = latest.lock().unwrap().clone();
                 if let Err(e) = server.send_frame(&frame, &mut scratch) {
                     log(&format!("推送中断：{e}"));
                     break;
                 }
-
-                // 帧里没出现的进程视为已退出，清掉缓存防止长跑时膨胀
-                let alive: Vec<u32> = frame.procs.iter().map(|p| p.pid).collect();
-                agg.lock().unwrap().retain_pids(&alive);
-                cache.retain_pids(&alive);
 
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -143,15 +153,14 @@ mod win {
         let tr = format!("\"{}\"", exe.display());
         let out = std::process::Command::new("schtasks")
             .args([
-                "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST",
-                "/F",
+                "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
             ])
             .output();
 
         match out {
             Ok(o) if o.status.success() => {
                 log("已注册登录自启任务");
-        log(&format!("日志：{LOG_HINT}"));
+                log(&format!("日志：{LOG_HINT}"));
                 let _ = std::process::Command::new("schtasks")
                     .args(["/Run", "/TN", TASK_NAME])
                     .output();

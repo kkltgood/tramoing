@@ -168,7 +168,9 @@ impl Args {
                 "--mock" => a.mock = true,
                 "--quiet" => a.quiet = true,
                 "-h" | "--help" => {
-                    println!("用法: tm-spike-mac [--frames N] [--dump [--lines N]] [--mock] [--quiet]");
+                    println!(
+                        "用法: tm-spike-mac [--frames N] [--dump [--lines N]] [--mock] [--quiet]"
+                    );
                     std::process::exit(0);
                 }
                 _ => {}

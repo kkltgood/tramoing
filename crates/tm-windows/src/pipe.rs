@@ -14,8 +14,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW, PIPE_READMODE_BYTE,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, WaitNamedPipeW,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 use crate::proto::{Frame, ProtoError};
@@ -32,6 +32,7 @@ pub enum PipeError {
     Closed,
     Proto(ProtoError),
     FrameTooLarge(usize),
+    Timeout,
 }
 
 impl std::fmt::Display for PipeError {
@@ -43,6 +44,7 @@ impl std::fmt::Display for PipeError {
             Self::Closed => write!(f, "管道已被对端关闭"),
             Self::Proto(e) => write!(f, "帧格式错误：{e}"),
             Self::FrameTooLarge(n) => write!(f, "帧长度异常：{n} 字节"),
+            Self::Timeout => write!(f, "等待管道数据超时"),
         }
     }
 }
@@ -123,7 +125,7 @@ impl PipeServer {
                 name.as_ptr(),
                 PIPE_ACCESS_OUTBOUND,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,      // 只允许一个客户端
+                1, // 只允许一个客户端
                 64 * 1024,
                 64 * 1024,
                 0,
@@ -156,7 +158,7 @@ impl PipeServer {
         scratch.clear();
         scratch.extend_from_slice(&[0u8; 4]); // 占位，稍后回填长度
         let mut payload = Vec::new();
-        frame.encode_into(&mut payload);
+        frame.encode_into(&mut payload).map_err(PipeError::Proto)?;
         scratch[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         scratch.extend_from_slice(&payload);
         write_all(self.handle, scratch)
@@ -176,13 +178,18 @@ impl Drop for PipeServer {
 /// 客户端（跑在普通权限的界面进程里）。
 pub struct PipeClient {
     handle: HANDLE,
+    buffered: Vec<u8>,
 }
+
+// 句柄由客户端独占，只有同步操作；移动所有权时没有挂起的 IO。
+unsafe impl Send for PipeClient {}
 
 impl PipeClient {
     /// 带超时地连接。助手还没起来时返回错误，调用方负责重试。
     pub fn connect(timeout_ms: u32) -> Result<Self, PipeError> {
         let name = wide(crate::PIPE_NAME);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
         loop {
             // SAFETY: 名字有效；只读打开，不共享
@@ -198,7 +205,10 @@ impl PipeClient {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
-                return Ok(Self { handle });
+                return Ok(Self {
+                    handle,
+                    buffered: Vec::new(),
+                });
             }
             let err = last_error();
             if err != ERROR_PIPE_BUSY {
@@ -225,6 +235,50 @@ impl PipeClient {
         let mut payload = vec![0u8; len];
         read_exact(self.handle, &mut payload)?;
         Frame::decode(&payload).map_err(PipeError::Proto)
+    }
+
+    /// 保留部分帧，按可读长度消费，避免同步 ReadFile 无限阻塞退出/重连。
+    pub fn poll_frame(&mut self, timeout: std::time::Duration) -> Result<Frame, PipeError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.buffered.len() >= 4 {
+                let len = u32::from_le_bytes(self.buffered[..4].try_into().unwrap()) as usize;
+                if len > MAX_FRAME_BYTES {
+                    return Err(PipeError::FrameTooLarge(len));
+                }
+                if self.buffered.len() >= len + 4 {
+                    let frame =
+                        Frame::decode(&self.buffered[4..len + 4]).map_err(PipeError::Proto)?;
+                    self.buffered.drain(..len + 4);
+                    return Ok(frame);
+                }
+            }
+            let mut available = 0;
+            if unsafe {
+                PeekNamedPipe(
+                    self.handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(PipeError::Io(last_error()));
+            }
+            if available > 0 {
+                let count = (available as usize).min(64 * 1024);
+                let start = self.buffered.len();
+                self.buffered.resize(start + count, 0);
+                read_exact(self.handle, &mut self.buffered[start..])?;
+            } else {
+                if std::time::Instant::now() >= deadline {
+                    return Err(PipeError::Timeout);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 }
 

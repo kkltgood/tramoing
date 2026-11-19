@@ -16,15 +16,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{
-    NSAppearanceCustomization, NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSFont,
-    NSBaselineOffsetAttributeName, NSFontAttributeName, NSFontWeightMedium,
-    NSForegroundColorAttributeName, NSImage,
-    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSStatusBar, NSStatusItem,
-    NSTextAlignment, NSVariableStatusItemLength, NSSquareStatusItemLength,
+    NSAppearanceCustomization, NSBaselineOffsetAttributeName, NSBitmapImageFileType,
+    NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSFont, NSFontAttributeName,
+    NSFontWeightMedium, NSForegroundColorAttributeName, NSImage, NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName, NSScreen, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
+    NSTextAlignment, NSVariableStatusItemLength,
 };
 use objc2_foundation::{
-    NSDictionary, NSMutableAttributedString, NSNumber, NSRange, NSSize, NSString,
-    NSObjectProtocol,
+    NSDictionary, NSMutableAttributedString, NSNumber, NSObjectProtocol, NSRange, NSSize, NSString,
 };
 
 /// 点击回调。全进程只有一个状态栏项，用全局变量比往 ObjC 对象里塞闭包省事。
@@ -88,7 +87,11 @@ fn title_font() -> Retained<NSFont> {
 
 /// 状态栏当前是不是深色。`name` 里带 `Dark` 的就是。
 fn is_dark(button: &objc2_app_kit::NSStatusBarButton) -> bool {
-    button.effectiveAppearance().name().to_string().contains("Dark")
+    button
+        .effectiveAppearance()
+        .name()
+        .to_string()
+        .contains("Dark")
 }
 
 /// 语义色调 → 实际颜色。
@@ -104,7 +107,6 @@ fn tone_color(tone: Tone, dark: bool) -> Retained<NSColor> {
     let (r, g, b) = rgb.to_f64();
     NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
 }
-
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -187,7 +189,11 @@ impl StatusItem {
     /// 设置上下两行的速度文字。
     pub fn set_speed_lines(&self, spec: &SpeedLines) {
         let up_tone = if spec.colored { Tone::Up } else { Tone::Plain };
-        let down_tone = if spec.colored { Tone::Down } else { Tone::Plain };
+        let down_tone = if spec.colored {
+            Tone::Down
+        } else {
+            Tone::Plain
+        };
 
         // 箭头带色、数字跟系统标签色走：数字是主要信息，染色反而降对比度，
         // 箭头染一下 + 固定的上下位置就已经能把两个方向分开了。
@@ -284,7 +290,7 @@ impl StatusItem {
             return;
         };
         let s = text.map(NSString::from_str);
-        button.setToolTip(s.as_ref().map(|s| &**s));
+        button.setToolTip(s.as_deref());
     }
 
     /// 图标在屏幕上的位置，**左上角原点、单位是点**。
@@ -299,13 +305,28 @@ impl StatusItem {
         if f.size.height <= 0.0 {
             return None;
         }
-        // 用所在屏幕而不是主屏：多显示器时状态栏在哪个屏就得按哪个屏算
-        let screen_h = window
-            .screen()
-            .map(|s| s.frame().size.height)
-            .unwrap_or(f.origin.y + f.size.height);
-        let top = screen_h - (f.origin.y + f.size.height);
+        // AppKit 全局坐标始终以第一块屏（菜单栏主屏）的左下角为原点。
+        // 所在屏的高度不能用于翻转；上下排列时尤其会丢失整个屏幕的偏移。
+        let screens = NSScreen::screens(mtm);
+        let primary = screens.firstObject()?;
+        let primary_top = primary.frame().origin.y + primary.frame().size.height;
+        let top = primary_top - (f.origin.y + f.size.height);
         Some((f.origin.x, top, f.size.width, f.size.height))
+    }
+
+    /// 状态项所在屏幕的可用工作区，和 icon_rect 使用同一全局点坐标。
+    pub fn work_area(&self) -> Option<(f64, f64, f64, f64)> {
+        let mtm = MainThreadMarker::new()?;
+        let screen = self.item.button(mtm)?.window()?.screen()?;
+        let primary = NSScreen::screens(mtm).firstObject()?;
+        let primary_top = primary.frame().origin.y + primary.frame().size.height;
+        let f = screen.visibleFrame();
+        Some((
+            f.origin.x,
+            primary_top - f.origin.y - f.size.height,
+            f.size.width,
+            f.size.height,
+        ))
     }
 
     /// 是否真的挂上了状态栏。排查「图标不出现」时先看这个。
@@ -373,7 +394,6 @@ impl StatusItem {
             bf.size.width, bf.size.height,
         )
     }
-
 }
 
 impl Drop for StatusItem {

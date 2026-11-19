@@ -5,21 +5,28 @@
 //! 既算对总量、又把流量归到发起方。pid → 应用由 `libproc` 完成，Chrome 的一堆
 //! helper 会合并成一行「Google Chrome」。
 
-// 整个 crate 都是 macOS 专属：workspace 里成员是无条件列出的，
-// Windows 上 `cargo check --workspace` 也会来编它。crate 级门控之后，
-// 非 macOS 平台编出来是个空 crate，不会去碰 libc / objc2 这些 macOS-only 依赖。
-#![cfg(target_os = "macos")]
+// 连接解析和记账可在所有平台测试；系统 API 模块分别门控。
 
+#[cfg(target_os = "macos")]
 pub mod appid;
 pub mod flows;
+#[cfg(target_os = "macos")]
 pub mod icon;
+#[cfg(target_os = "macos")]
 pub mod procname;
+#[cfg(target_os = "macos")]
 pub mod pty;
+#[cfg(target_os = "macos")]
 pub mod sampler;
+#[cfg(target_os = "macos")]
 pub mod status_item;
 
+#[cfg(target_os = "macos")]
 pub use appid::{bundle_of, identify, AppIdentity, AppResolver};
 pub use flows::{Bytes, FlowAccounting, FlowParser, FlowRow};
+#[cfg(target_os = "macos")]
 pub use icon::{app_icon, IconBitmap, ICON_SIDE};
+#[cfg(target_os = "macos")]
 pub use sampler::NettopSampler;
+#[cfg(target_os = "macos")]
 pub use status_item::{SpeedLines, StatusItem, Tone};

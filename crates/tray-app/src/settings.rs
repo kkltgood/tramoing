@@ -56,10 +56,7 @@ pub struct Settings {
     pub alert_mb: u64,
     /// 菜单栏用彩色区分上下行。关掉后统一跟随系统色，适合喜欢素一点的菜单栏
     pub tray_color: bool,
-    /// 是否在托盘图标上方显示网速贴片（只在 Windows 生效）。
-    ///
-    /// Windows 的托盘图标是定死的方形，塞不进 `↓1.2M`，数字只能画在图标
-    /// 上方那个自绘小窗口里；不想看的人可以在这里关掉。
+    /// 是否显示 Windows 原生任务栏网速区域。
     pub tray_badge: bool,
     /// 启动后自动检查新版本。
     ///
@@ -320,7 +317,10 @@ mod tests {
     fn legacy_visible_rows_key_still_loads() {
         // 旧版本写的是 row_limit（可视行数）。升级后不能被当成未知键丢掉。
         let s = Settings::parse("row_limit=12");
-        assert_eq!(s.max_apps, 10, "旧键要按「最多展示」接住，并吸附到最近的档位");
+        assert_eq!(
+            s.max_apps, 10,
+            "旧键要按「最多展示」接住，并吸附到最近的档位"
+        );
     }
 
     #[test]
