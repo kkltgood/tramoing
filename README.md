@@ -88,7 +88,7 @@ tramoing/
 ├── crates/
 │   ├── tm-core/                   # 平台无关的速率/窗口聚合核心
 │   ├── tm-sampler/                # Sampler trait + MockSampler
-│   ├── tm-macos/                  # macOS：nettop 采集、应用归并、原生状态栏
+│   ├── tm-macos/                  # macOS：nettop 按连接采集、流量归属、应用归并
 │   ├── tm-windows/                # Windows：ETW 助手、命名管道、进程路径、屏幕工作区
 │   ├── tm-store/                  # SQLite 历史库（rusqlite bundled）
 │   ├── tm-spike-mac/              # macOS 探针小程序（开发用）
@@ -110,19 +110,19 @@ tramoing/
 |---|---|---|
 | `tm-core` | 累计值差分、EMA 平滑、按应用归并、1m/5m/1h 窗口聚合 | 否，纯逻辑 |
 | `tm-sampler` | `Sampler` trait 与演示数据实现 | 否 |
-| `tm-macos` | `nettop` 子进程 + pty、pid→应用归并、AppKit 图标/状态栏 | 仅 macOS |
+| `tm-macos` | `nettop` 子进程 + pty、按连接解析与流量归属、pid→应用归并、AppKit 图标/状态栏 | 仅 macOS |
 | `tm-windows` | ETW 会话、聚合、命名管道协议、进程路径解析、屏幕工作区与任务栏明暗 | 仅 Windows |
 | `tm-store` | SQLite 建表/写入/查询/清理/CSV 导出 | 否（SQLite 已 bundled） |
 | `tray-app` | 采样线程、界面、设置、自启、导出 | 平台相关部分用 cfg 隔离 |
 
-**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 96 个测试里有一半以上与平台无关的原因。
+**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 114 个测试里有一半以上与平台无关的原因。
 
 ### 3.2 数据流
 
 ```text
 macOS:
-  nettop -P -x -l 0 -s 1 -J bytes_in,bytes_out
-      └─(pty，行缓冲)→ tm-macos::NettopSampler → 每秒一帧累计值
+  nettop -x -n -L 0 -s 1          # CSV，按连接
+      └─(pty，行缓冲)→ tm-macos::FlowParser → FlowAccounting（归属）→ 每秒一帧累计值
 
 Windows:
   tramoing-helper.exe（管理员，登录自启）
@@ -150,6 +150,11 @@ Windows:
 | 界面线程只渲染 | 起子进程、读流、syscall、写库全在采样线程，弹窗不会因为 IO 掉帧 |
 | 管道协议手写小端编码 | 一帧只有几个数字加进程名，省掉 serde/bincode 依赖和编译时间 |
 | macOS 给 `nettop` 开 pty | `nettop` 的 stdout 接管道时走 4KB 全缓冲，`-s 1` 实际 3 秒才吐一帧；接 tty 才是精确 1 秒 |
+| macOS 按**连接**统计，不用 `-P` 进程汇总 | 系统代理下一份下载会出现在三个 socket 上（代理外网收、代理回环发、App 回环收）。汇总口径要么算两遍（实测 6 MB 变 12.5 MB，上下行接近），要么只能记到代理名下。按连接配对后可以把回环客户端侧回填给发起方，总量只取外网连接 |
+| 回环两端按「监听端口」判服务端 | 服务端那一侧和客户端侧是同一份数据，用 `state=Listen` 的端口集合就能区分，不需要猜端口号大小 |
+| 代理自己的流量 = 外网 − 已回填部分 | 代理的自更新、DNS 不该被减没，也不能重复计；链式代理的第一跳没有外网流量，按「同时在服务回环且连向下一跳」也识别为中继 |
+| 本机互访不计入 | 浏览器 ↔ 本地 dev server 两端都不是中继，这份流量从没上网卡，计进去只会让数字虚高 |
+| TUN 模式按「量守恒」认转发进程 | `utun` 和物理网卡之间没有端口可配对，唯一可靠的关系是：转发进程的物理流量 ≈ 隧道里所有 App 的流量（略多一点点是加密开销）。认不出就退回外网口径，保证总量不翻倍 |
 | Windows 拆成两个进程 | ETW 按进程统计必须提权；助手提权跑，托盘程序始终普通权限 |
 | Windows 网速数字不画进托盘图标，另开一个贴片窗口 | `Shell_NotifyIcon` 只接受方形小图标，`↓1.2M` 塞进去会被系统缩成一团糊；图标槽的 rect 是壳定死的，撑开 HICON 也没用 |
 | 贴片用**颜色键**抠背景，不用逐像素 alpha | eframe 的 GL 配置在这台机器上没有 alpha 通道（`Cannot create transparent window`），`UpdateLayeredWindow` 那套用不上；纯黑颜色键既能抠干净，又顺带让鼠标穿透。详见 [6.13](#613-windows-任务栏网速贴片) |
@@ -161,7 +166,7 @@ Windows:
 工具链：Rust 1.89.0（edition 2021），无需额外系统依赖即可跑单测。
 
 ```bash
-cargo test                       # 全部 87 个单测
+cargo test                       # 全部 114 个单测
 cargo build                      # debug 构建整个工作区
 cargo build --release -p tray-app
 
@@ -226,6 +231,10 @@ open dist/Tramoing.app                     # 验证真实形态（推荐）
 
 - 菜单栏被其他图标塞满时，系统会把本应用收进 `«` 折叠区，看起来像"图标没出现"。收掉一两个不常用图标即可，与程序无关。
 - 应用图标取自 `NSWorkspace`，取不到时退化为首字母色块；Chrome 等应用的 helper 进程会归并到最外层 `.app`，不会重复占位。
+- 走系统代理（Clash / Surge / 公司代理）的流量会**回填给发起请求的 App**；代理进程只保留它自己的那部分流量。链式代理只记最外层一次。
+- **TUN 模式**（Clash 增强模式 / WireGuard）靠「量守恒」识别转发进程：隧道侧（`utun*`）的字节回填给 App，转发进程的物理流量按隧道总量抵扣。判定条件是「没有隧道侧流量、物理流量与隧道总量最接近且比值在 0.7–3.0 之间」；认不出来时宁可不回填（总量仍然准，只是退化成只看到代理）。同一时刻只支持一个隧道转发进程。
+- 采样器读的是 nettop 的 socket 字节数，不含 TCP/IP 头与 ACK，所以总量会比网卡计数器略低（实测下行 90% 左右，上行差得多一些，属正常）。
+- 别的用户的进程（root 起的代理、`mDNSResponder` 这类系统守护进程）读不到可执行路径，列表里用 nettop 给的进程名（可能被截断到 20 字符）；本用户的进程会走 `proc_name` 取全名。
 
 ---
 
@@ -390,7 +399,7 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 | 滚动条把手压在行盒描边上 | 用的是 egui 自带的浮动把手，它画在内容矩形之内 | 关掉自带把手，改成自绘的 3pt 指示条，专门占行盒右侧的 9pt 过道；滚动仍然按整行吸附 |
 | 菜单栏速率宽度来回跳 | 菜单栏项按标题宽度自适应，而 `compact()` 是"最短写法"：`9.9M`/`10M`、`56B`/`1.2M` 长度不同，`820K` 和 `1.2M` 长度相同但 K/M 字母宽度不同；空闲时 `0` 只有一个字符 | 速率固定成 **4 个字符**（`menu_speed`：`"  0B"`、`" 820K"`、`"1.2M"`），标题字体从"等宽数字"换成**整段等宽**（SF Mono）；实测连续 7 次刷新按钮宽度恒为 56×22（带图标 76×22） |
 
-验证方式：`cargo test --workspace`（96 个用例，含定位几何、滚动吸附、速率定宽的单测）；
+验证方式：`cargo test --workspace`（114 个用例，含定位几何、滚动吸附、速率定宽的单测）；
 `cargo check --target x86_64-pc-windows-msvc`（`tray-app` + `tm-windows`，0 警告）。
 真机行为仍需按 6.4 的用例表复测。
 
@@ -580,9 +589,9 @@ comctl32 **v6** 里，没有应用清单的程序会被加载 5.82，静态导�
 
 ## 8. 测试与质量
 
-- **87 个单元测试全部通过，0 编译警告**
+- **114 个单元测试全部通过，0 编译警告**
   - `tm-core` 21：速率差分、pid 复用、计数器回退、窗口补零、格式化
-  - `tm-macos` 20：nettop 帧切分、应用归并、pty 换行、状态栏渲染辅助
+  - `tm-macos` 35：CSV 连接解析、回环配对与代理回填、TUN 隧道量守恒归属、应用归并、pty 换行、状态栏渲染辅助
   - `tm-windows` 14：管道协议编解码、按 PID 聚合、方向表一致性
   - `tray-app` 21：设置解析、自启 plist、CSV 导出、名称截断
   - `tm-store` 9：建表、upsert、范围查询、清理

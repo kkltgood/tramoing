@@ -1,14 +1,20 @@
-//! `nettop` 采样器：把子进程输出变成一帧帧 [`ProcSample`]。
+//! `nettop` 采样器：按连接解析，再把流量归属回发起方。
 //!
 //! 结构上分两个线程：
-//! - 读线程：`BufReader` 阻塞读 nettop 的输出，凑满一帧就丢进 channel；
-//! - 调用方：`sample()` 阻塞等 channel，拿到帧后把 pid 解析成应用。
+//! - 读线程：`BufReader` 阻塞读 nettop 的 CSV 输出，凑满一帧就丢进 channel；
+//! - 调用方：`sample()` 阻塞等 channel，拿到帧后做归属并输出累计值。
 //!
 //! 这样 `sample()` 天然是「阻塞到下一帧」，UI 主循环不会被 `read()` 卡住。
 //!
 //! stdout 走**伪终端**而不是管道：管道会让 stdio 变成全缓冲，
 //! 每帧要攒满 4 KB 才吐一次，实测 3 秒才来一批（详见 [`crate::pty`]）。
+//!
+//! # 为什么不用 `-P` 的进程汇总
+//!
+//! 见 [`crate::flows`]：汇总口径下走系统代理的流量会被重复计算，或者只能记到
+//! 代理名下。按连接解析才能既保证总量、又归到发起方。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -19,7 +25,7 @@ use tm_core::{AppKey, ProcSample};
 use tm_sampler::{Sampler, SamplerError};
 
 use crate::appid::AppResolver;
-use crate::nettop::{NettopParser, ProcRow};
+use crate::flows::{Bytes, FlowAccounting, FlowParser, FlowRow};
 use crate::pty;
 
 /// 默认的 nettop 路径。可用 `TM_NETTOP_BIN` 覆盖（测试或非标准安装）。
@@ -28,14 +34,26 @@ pub const DEFAULT_NETTOP: &str = "/usr/bin/nettop";
 /// 每多少帧清理一次应用缓存
 const CACHE_GC_FRAMES: u64 = 300;
 
+/// 多久没出现就把应用从累计表里摘掉（约 10 分钟）
+const APP_IDLE_FRAMES: u64 = 600;
+
 /// 伪终端的宽高（字符数）。给足宽度，免得 nettop 把名字和数字挤成一列。
 const PTY_COLS: u16 = 400;
 const PTY_ROWS: u16 = 60;
 
+/// 合成 pid 的起点。真实 pid 不会到这里，避免和进程表混淆。
+const SYNTH_PID_BASE: u32 = 1_000_000;
+
 pub struct NettopSampler {
-    rx: Receiver<Vec<ProcRow>>,
+    rx: Receiver<Vec<FlowRow>>,
     child: Child,
     resolver: AppResolver,
+    accounting: FlowAccounting,
+    /// 归属后的累计字节（按应用）
+    cum: HashMap<AppKey, (u64, u64)>,
+    synth: HashMap<AppKey, u32>,
+    next_pid: u32,
+    last_seen: HashMap<AppKey, u64>,
     interval: Duration,
     frames: u64,
 }
@@ -50,19 +68,14 @@ impl NettopSampler {
         // nettop 只认整数秒。小于 1 秒按 1 秒算 —— 传 0 会让它退化成忙轮询。
         let delay = interval.as_secs().max(1).to_string();
 
+        // -L 0：CSV + 一直采；-n：不做地址反解（稳定、快，名字里也不会冒逗号）
+        // 不加 -t：回环连接是回填代理流量的依据，总量在 flows 模块里只取外网。
+        let args: Vec<&str> = vec!["-x", "-n", "-L", "0", "-s", delay.as_str()];
+
         let mut cmd = Command::new(&bin);
-        cmd.args([
-            "-P",
-            "-x",
-            "-l",
-            "0",
-            "-s",
-            delay.as_str(),
-            "-J",
-            "bytes_in,bytes_out",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
 
         // 关键：stdout 必须是 pty，否则 nettop 走全缓冲，3 秒才吐一批
         let (child, source): (Child, Box<dyn Read + Send>) = match pty::open(PTY_COLS, PTY_ROWS)
@@ -90,7 +103,7 @@ impl NettopSampler {
             .name("nettop-reader".to_owned())
             .spawn(move || {
                 let reader = BufReader::new(source);
-                let mut parser = NettopParser::new();
+                let mut parser = FlowParser::new();
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
                     if let Some(rows) = parser.feed(&line) {
@@ -107,6 +120,11 @@ impl NettopSampler {
             rx,
             child,
             resolver: AppResolver::new(),
+            accounting: FlowAccounting::new(),
+            cum: HashMap::new(),
+            synth: HashMap::new(),
+            next_pid: SYNTH_PID_BASE,
+            last_seen: HashMap::new(),
             interval,
             frames: 0,
         })
@@ -130,20 +148,60 @@ impl Sampler for NettopSampler {
 
         self.frames += 1;
 
-        let samples: Vec<ProcSample> = rows
-            .iter()
-            .map(|r| {
-                let id = self.resolver.resolve(r.pid);
-                ProcSample::new(r.pid, AppKey::new(id.key), r.rx, r.tx)
-            })
-            .collect();
+        // 拆开借用：accounting 要 &mut，resolver 也要 &mut
+        let Self {
+            accounting,
+            resolver,
+            cum,
+            last_seen,
+            frames,
+            ..
+        } = self;
+        let frame = *frames;
+        let deltas = accounting.update(&rows, |pid, name| {
+            AppKey::new(resolver.resolve(pid, name).key)
+        });
 
-        if self.frames % CACHE_GC_FRAMES == 0 {
-            let alive: Vec<u32> = rows.iter().map(|r| r.pid).collect();
-            self.resolver.retain_only(&alive);
+        for (app, d) in deltas {
+            let e = cum.entry(app.clone()).or_insert((0, 0));
+            e.0 = e.0.saturating_add(d.rx);
+            e.1 = e.1.saturating_add(d.tx);
+            last_seen.insert(app, frame);
         }
 
-        Ok(samples)
+        if frame % CACHE_GC_FRAMES == 0 {
+            let alive: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+            self.resolver.retain_only(&alive);
+
+            // 长时间没流量的应用不再下发，避免累计表无限膨胀
+            let cut = frame.saturating_sub(APP_IDLE_FRAMES);
+            self.cum
+                .retain(|app, _| *self.last_seen.get(app).unwrap_or(&0) >= cut);
+            let keep = self.cum.keys().cloned().collect::<Vec<_>>();
+            self.last_seen.retain(|app, _| keep.contains(app));
+        }
+
+        // 每帧都下发全部应用：RateCalculator 的基线是按帧重建的，
+        // 某个应用缺席一帧会让它那一帧的增量白白丢掉。
+        let Self {
+            cum,
+            synth,
+            next_pid,
+            ..
+        } = self;
+        for app in cum.keys() {
+            if !synth.contains_key(app) {
+                *next_pid += 1;
+                synth.insert(app.clone(), *next_pid);
+            }
+        }
+        let mut out = Vec::with_capacity(cum.len());
+        for (app, (rx, tx)) in cum.iter() {
+            let pid = *synth.get(app).expect("刚补齐过");
+            out.push(ProcSample::new(pid, app.clone(), *rx, *tx));
+        }
+
+        Ok(out)
     }
 
     fn interval(&self) -> Duration {
@@ -156,6 +214,14 @@ impl Drop for NettopSampler {
         // 一定要杀子进程，否则 nettop 会一直留着
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl NettopSampler {
+    /// 某个应用累计归属到的字节（调试用）。
+    pub fn total_bytes(&self, app: &str) -> Bytes {
+        let (rx, tx) = self.cum.get(&AppKey::new(app)).copied().unwrap_or((0, 0));
+        Bytes { rx, tx }
     }
 }
 

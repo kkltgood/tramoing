@@ -60,15 +60,27 @@ pub fn bundle_of(path: &str) -> Option<&str> {
     None
 }
 
-/// 解析单个 pid 的应用身份。解析失败时退化成 `pid N`，不 panic。
-pub fn identify(pid: u32) -> AppIdentity {
+/// 解析单个 pid 的应用身份。
+///
+/// `fallback` 是 nettop 那一行给的进程名 —— 解析不到可执行路径时用它，
+/// 而不是退化成 `pid N`。典型场景是 **root 起的代理进程**（verge-mihomo / ClashX）：
+/// 别的用户的进程读不到 `proc_pidpath`，但 nettop 自己知道它叫什么，
+/// 列表里显示 `verge-mihomo` 比 `pid 2043` 有用得多。解析全失败时才写 `pid N`。
+pub fn identify(pid: u32, fallback: &str) -> AppIdentity {
     if let Some(bundle) = procname::executable_path(pid)
         .as_deref()
         .and_then(bundle_of)
     {
         return AppIdentity::new(bundle, pretty_name(bundle));
     }
-    let name = procname::process_name(pid).unwrap_or_else(|| format!("pid {pid}"));
+    // nettop 把名字截到约 20 字符，能取到全名就用全名
+    let name = procname::process_name(pid)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let f = fallback.trim().trim_end_matches('.').trim();
+            (!f.is_empty()).then(|| f.to_owned())
+        })
+        .unwrap_or_else(|| format!("pid {pid}"));
     AppIdentity::new(name.clone(), name)
 }
 
@@ -85,11 +97,12 @@ impl AppResolver {
         Self::default()
     }
 
-    pub fn resolve(&mut self, pid: u32) -> AppIdentity {
+    /// 解析 pid。`fallback` 取自 nettop 输出里的进程名，只在 syscall 拿不到身份时兜底。
+    pub fn resolve(&mut self, pid: u32, fallback: &str) -> AppIdentity {
         if let Some(id) = self.map.get(&pid) {
             return id.clone();
         }
-        let id = identify(pid);
+        let id = identify(pid, fallback);
         self.map.insert(pid, id.clone());
         id
     }
@@ -146,16 +159,25 @@ mod tests {
     }
 
     #[test]
-    fn identify_falls_back_for_bad_pid() {
-        let id = identify(999_999);
-        assert!(id.name.starts_with("pid ") || !id.name.is_empty());
+    fn identify_falls_back_to_nettop_name_for_foreign_process() {
+        // 别的用户的进程读不到路径和全名（root 起的代理就是这样），
+        // 此时必须用 nettop 给的名字，而不是显示成 `pid N`
+        let id = identify(999_999, "verge-mihomo");
+        assert_eq!(id.name, "verge-mihomo");
+        assert_eq!(id.key, "verge-mihomo");
+    }
+
+    #[test]
+    fn identify_uses_pid_only_when_everything_fails() {
+        let id = identify(999_999, "  ");
+        assert_eq!(id.name, "pid 999999");
     }
 
     #[test]
     fn resolver_caches_by_pid() {
         let mut r = AppResolver::new();
-        let a = r.resolve(999_999);
-        let b = r.resolve(999_999);
+        let a = r.resolve(999_999, "verge-mihomo");
+        let b = r.resolve(999_999, "ignored");
         assert_eq!(a, b);
         assert_eq!(r.len(), 1);
 

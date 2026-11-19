@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use tm_core::{format_speed, AppRate, RateCalculator};
 #[cfg(target_os = "macos")]
-use tm_macos::{NettopParser, NettopSampler};
+use tm_macos::{FlowParser, NettopSampler};
 use tm_sampler::{MockSampler, Sampler, SamplerError};
 
 const TOP_N: usize = 12;
@@ -67,7 +67,9 @@ fn run() -> i32 {
                 let dt = now.saturating_duration_since(last);
                 last = now;
                 let rates = calc.update(now, &samples);
-                render(n, dt, &rates, &calc);
+                if !args.quiet {
+                    render(n, dt, &rates, &calc);
+                }
             }
             Err(SamplerError::Timeout) => {
                 eprintln!("第 {n} 帧超时，跳过");
@@ -79,6 +81,9 @@ fn run() -> i32 {
         }
     }
 
+    let (rx, tx) = calc.session_total();
+    println!("累计 ↓{rx} B  ↑{tx} B");
+
     0
 }
 
@@ -86,7 +91,7 @@ fn run() -> i32 {
 fn dump(lines: usize) -> i32 {
     let bin = std::env::var("TM_NETTOP_BIN").unwrap_or_else(|_| "/usr/bin/nettop".to_owned());
     let mut child = match Command::new(&bin)
-        .args(["-P", "-x", "-l", "0", "-J", "bytes_in,bytes_out"])
+        .args(["-x", "-n", "-L", "0", "-s", "1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -99,16 +104,18 @@ fn dump(lines: usize) -> i32 {
     };
 
     let stdout = child.stdout.take().expect("stdout");
-    let mut parser = NettopParser::new();
+    let mut parser = FlowParser::new();
     let mut frames = 0usize;
+    let mut rows = 0usize;
     let mut count = 0usize;
 
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
         println!("{line}");
         count += 1;
-        if parser.feed(&line).is_some() {
+        if let Some(f) = parser.feed(&line) {
             frames += 1;
+            rows += f.len();
         }
         if count >= lines {
             break;
@@ -121,8 +128,8 @@ fn dump(lines: usize) -> i32 {
 
     eprintln!();
     eprintln!(
-        "诊断：{count} 行，识别 {frames} 帧，丢弃 {} 行。",
-        parser.unparsed
+        "诊断：{count} 行，识别 {frames} 帧（上一帧 {} 条连接），丢弃 {} 行。",
+        rows, parser.unparsed
     );
     0
 }
@@ -132,6 +139,7 @@ struct Args {
     dump: bool,
     lines: usize,
     mock: bool,
+    quiet: bool,
 }
 
 impl Args {
@@ -141,6 +149,7 @@ impl Args {
             dump: false,
             lines: 60,
             mock: false,
+            quiet: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(x) = it.next() {
@@ -157,8 +166,9 @@ impl Args {
                     }
                 }
                 "--mock" => a.mock = true,
+                "--quiet" => a.quiet = true,
                 "-h" | "--help" => {
-                    println!("用法: tm-spike-mac [--frames N] [--dump [--lines N]] [--mock]");
+                    println!("用法: tm-spike-mac [--frames N] [--dump [--lines N]] [--mock] [--quiet]");
                     std::process::exit(0);
                 }
                 _ => {}
