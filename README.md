@@ -85,7 +85,7 @@ tramoing/
 ├── Cargo.toml                     # workspace 定义，版本 0.1.0 / edition 2021
 ├── Cargo.lock
 ├── README.md                      # 本文档
-├── assets/                        # 图标源（gen-icon.rs 生成 PNG / icns）
+├── assets/                        # 图标源：gen-icon.rs 出 PNG/icns，gen-ico.py 出 Windows 的 .ico
 ├── crates/
 │   ├── tm-core/                   # 平台无关的速率/窗口聚合核心
 │   ├── tm-sampler/                # Sampler trait + MockSampler
@@ -637,6 +637,32 @@ comctl32 **v6** 里，没有应用清单的程序会被加载 5.82，静态导�
 验证方式（本机 Win11 24H2，真鼠标点击）：点到图标外 5px 仍能进设置页；
 按住后拖动 9px 再松开也能进（旧代码这条路径会丢）。Win10 若仍复现，
 请带 `TM_LOG=1` 的日志（能看到 `[ui]` 这一侧的帧循环是否还在跑）。
+
+---
+
+### 6.17 产品自身的图标（exe / 安装包）
+
+**现象**：装完之后找不到图标 —— 安装目录里的 `tramoing.exe`、开始菜单快捷方式、
+「程序和功能」里的条目全是 Windows 的空白方块，看起来像装坏了。
+
+**原因**：Rust 链接出来的 exe **默认没有 `.rsrc` 资源段**，`ExtractIconExW(path, -1, …)`
+返回 0。`assets/` 里原来只有 macOS 要用的 `AppIcon.icns` 和一张 1024×1024 的 PNG，
+而那张 PNG 是无 alpha 的、圆角外面还是**纯黑**，直接塞进去会在浅色任务栏上留下四个黑角。
+
+| 环节 | 做法 |
+|---|---|
+| 生成 `.ico` | `assets/gen-ico.py`：读 `icon-1024.png`，用圆角矩形（(44,44)-(980,980)、r≈196）的 SDF 覆盖率当 alpha，把圆角外的纯黑变成透明；预乘 alpha 后做**可分离盒式降采样**，出 16/20/24/32/40/48/64/128/256 九档 |
+| 帧格式 | 一律 **32bpp BMP**（不是 PNG 压缩帧）：NSIS 3 对 PNG 帧的支持不稳，而 256px 的 BMP 帧也就 256KB，LZMA 压完差别可忽略 |
+| 嵌进 exe | `crates/tray-app/build.rs` + `crates/tm-windows/build.rs` 用 `winresource` 在链接前生成 `.res`：`ICON` + `VERSIONINFO`（语言 0x0804，文件属性里是「Tramoing 托盘流量监控」）。macOS 目标直接跳过（图标在 `.app` 的 `AppIcon.icns` 里） |
+| 找 `rc.exe` | winresource 默认查注册表问 Visual Studio 装在哪，注册表被策略挡住的环境会直接报「找不到路径」；两个 build.rs 都先自己扫 `Windows Kits\10\bin\<版本>\x64\rc.exe`（取版本号最大的），把它塞进 `RC_PATH` 再编译 |
+| 失败策略 | **release 构建失败即中止**（发出去的包不能没有图标）；`cargo build` 这类开发构建只 `cargo:warning`，免得没装 SDK 的机器编不了 |
+| 安装包 | `.nsi` 里的 `Icon` / `UninstallIcon` 指向同一份 `.ico`，setup.exe 和 uninstall.exe 不再是 NSIS 默认图标；`DisplayIcon` 指向 exe，控制面板里也跟着变 |
+
+**验证**（改前 / 改后）：`ExtractIconExW` 从 **0 → 1** 组图标（组内 9 个尺寸），
+用 `PrivateExtractIconsW(path, 0, 48, 48)` 取出 48px 渲染，就是那条蓝色波形、圆角透明。
+
+改了图标源图之后：`python assets/gen-ico.py` 重新生成 `assets/tramoing.ico`（产物要一起提交），
+再走一遍 `packaging/windows/build.ps1`。
 
 ---
 

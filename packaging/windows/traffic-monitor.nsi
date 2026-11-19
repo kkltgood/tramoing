@@ -56,6 +56,9 @@ Unicode true
 Name "${APP_NAME}"
 BrandingText "${APP_NAME} ${APP_VERSION}"
 OutFile "..\..\dist\${APP_NAME}-${APP_VERSION}-setup.exe"
+; 安装包自己（以及卸载程序）也用产品图标，别留 NSIS 那个默认的
+Icon "..\..\assets\tramoing.ico"
+UninstallIcon "..\..\assets\tramoing.ico"
 InstallDir "$PROGRAMFILES64\${APP_NAME}"
 InstallDirRegKey HKLM "Software\${BUNDLE_ID}" "InstallDir"
 ; 装到 Program Files、注册计划任务都需要管理员权限，一次 UAC 换全程静默
@@ -131,6 +134,11 @@ Section "托盘程序（必需）" SEC_MAIN
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}" "NoRepair" 1
+
+  ; 覆盖安装时 exe 的图标变了，但 shell 的图标缓存不一定跟着刷 —— 旧版本装出来
+  ; 是个空白方块，不通知的话开始菜单可能还挂着那张缓存图。SHCNE_ASSOCCHANGED
+  ; 是安装程序里最常用的一招，代价只是让资源管理器重读一次图标。
+  System::Call 'shell32::SHChangeNotify(i 0x8000000, i 0, i 0, i 0)'
 SectionEnd
 
 Section "流量采集助手（按进程统计必需）" SEC_HELPER
@@ -179,6 +187,9 @@ Section "Uninstall"
   ; 旧版（Traffic Monitor）的条目也顺手清掉
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${LEGACY_BUNDLE_ID}"
   DeleteRegKey HKLM "Software\${LEGACY_BUNDLE_ID}"
+
+  ; 快捷方式和 exe 都删了，同样让 shell 立刻丢掉缓存
+  System::Call 'shell32::SHChangeNotify(i 0x8000000, i 0, i 0, i 0)'
 
   ; 历史数据默认保留：卸载工具不该顺手把用户一个月的流量记录删了
   MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除历史数据和设置？$\r$\n（%LOCALAPPDATA%\${DATA_DIR}）" /SD IDNO IDNO KeepData
