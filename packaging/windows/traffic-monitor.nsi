@@ -20,6 +20,9 @@ Unicode true
 
 ; 下面用到 ${If} / ${EndIf}，必须显式引 LogicLib（NSIS 不自带）
 !include "LogicLib.nsh"
+; Modern UI 2：经典页面集里没有「完成」页（Page 只有 directory / components /
+; instfiles），装完窗口直接消失 —— 既看不到「装好了」，也没机会顺手把程序拉起来。
+!include "MUI2.nsh"
 
 !define APP_NAME "Tramoing"
 !define APP_EXE "tramoing.exe"
@@ -56,9 +59,6 @@ Unicode true
 Name "${APP_NAME}"
 BrandingText "${APP_NAME} ${APP_VERSION}"
 OutFile "..\..\dist\${APP_NAME}-${APP_VERSION}-setup.exe"
-; 安装包自己（以及卸载程序）也用产品图标，别留 NSIS 那个默认的
-Icon "..\..\assets\tramoing.ico"
-UninstallIcon "..\..\assets\tramoing.ico"
 InstallDir "$PROGRAMFILES64\${APP_NAME}"
 InstallDirRegKey HKLM "Software\${BUNDLE_ID}" "InstallDir"
 ; 装到 Program Files、注册计划任务都需要管理员权限，一次 UAC 换全程静默
@@ -74,14 +74,39 @@ VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
 
-Page directory
-Page components
-Page instfiles
+; ---------- 安装界面 ----------
+; 图标同时管三处：安装包自身、卸载程序、以及对话框左上角那个小图标
+!define MUI_ICON "..\..\assets\tramoing.ico"
+!define MUI_UNICON "..\..\assets\tramoing.ico"
+!define MUI_ABORTWARNING
+; 完成页的「立即运行」：默认勾上，点「完成」时调用 LaunchApp
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "立即运行 ${APP_NAME}"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchApp
+!define MUI_FINISHPAGE_NOREBOOTSUPPORT
 
-UninstPage uninstConfirm
-UninstPage instfiles
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_COMPONENTS
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_UNPAGE_FINISH
+
+; 界面语言：产品只有中文文案，装英文包反而中英混排
+!insertmacro MUI_LANGUAGE "SimpChinese"
 
 ; ---------- 安装 ----------
+
+; 完成页勾了「立即运行」时走这里。
+;
+; 安装程序是提权跑的，直接 `Exec` 会把托盘程序也拉成管理员 —— 它自己不需要
+; 管理员（采集是计划任务里的助手干的，见 SEC_HELPER）。把路径交给已经在跑的
+; explorer，由它以登录用户的普通权限启动，效果和自己点开始菜单一样。
+Function LaunchApp
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\${APP_EXE}"'
+FunctionEnd
 
 ; 升级准备必须排在文件写入之前：NSIS 按脚本顺序执行选中的 section。
 ; 隐藏 section（名字以 - 开头）+ SectionIn RO，保证每次安装都会跑。

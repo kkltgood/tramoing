@@ -666,6 +666,35 @@ comctl32 **v6** 里，没有应用清单的程序会被加载 5.82，静态导�
 
 ---
 
+### 6.18 安装向导补上「完成页」和「立即运行」
+
+**现象**：装完之后窗口直接消失 —— 没有「安装完成」这一页，更不会问要不要马上运行。
+
+**原因**：脚本用的是**经典 NSIS 页面集**（`Page directory / components / instfiles`）。
+这套原生页面里**根本没有 finish 页**，`MUI_FINISHPAGE_RUN` 那个「立即运行」勾选属于
+Modern UI 2 —— 没引 MUI2 就永远不会有这一页，不是配置漏了某个开关。
+
+| 环节 | 做法 |
+|---|---|
+| 页面 | `!include "MUI2.nsh"`，换成 `MUI_PAGE_DIRECTORY / COMPONENTS / INSTFILES / FINISH`；卸载也补上 `MUI_UNPAGE_FINISH` |
+| 立即运行 | `MUI_FINISHPAGE_RUN`（空 define 只是让勾选框出现）+ `MUI_FINISHPAGE_RUN_TEXT "立即运行 Tramoing"` + `MUI_FINISHPAGE_RUN_FUNCTION LaunchApp`，默认勾选 |
+| 启动方式 | 安装程序是提权跑的，直接 `Exec` 会把托盘程序也拉成管理员。`LaunchApp` 走 `Exec '"$WINDIR\explorer.exe" "$INSTDIR\tramoing.exe"'`：explorer 转发给已在运行的 shell，由**登录用户的普通权限**启动，和自己点开始菜单一致 |
+| 图标 | `MUI_ICON` / `MUI_UNICON` 顶替原来的 `Icon` / `UninstallIcon`（MUI2 在页面初始化时自己发这两条指令） |
+| 语言 | `MUI_LANGUAGE "SimpChinese"`：按钮和「安装完成」这类文案都由 MUI 语言文件提供，产品只有中文，装英文包会中英混排 |
+
+**验证**（真安装包要 UAC，没法自动化，所以用同源副本）：把 `.nsi` 拷一份，只改
+`RequestExecutionLevel admin → user`、安装目录指到 `%TEMP%`、把 `taskkill` / 注册计划任务
+那几行注掉，跑完整个向导：
+
+- 页面序列 目录 → 组件 → 安装 → **完成**，完成页确有 `☑ 立即运行 Tramoing` 且默认勾选；
+- 点「完成」后 `tramoing.exe` 真的起来了（进程路径指向临时安装目录），安装器随后正常退出。
+
+**踩到的坑**：在受限沙箱里（WorkBuddy 的作业对象）安装器一退出，它拉起的子进程会被
+一起收走 —— 表现成「勾了也不启动」，`Sleep` 也救不回来。把安装器用 `explorer.exe` 启动
+（脱离作业对象）再跑一遍就看到真实行为了。以后验「安装器拉起程序」这类动作，先排除这条。
+
+---
+
 ## 7. 配置与数据文件
 
 ### 7.1 `settings.conf`
