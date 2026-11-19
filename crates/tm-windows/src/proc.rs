@@ -6,9 +6,11 @@
 //! 这里跑在**提权的助手进程**里，所以能给系统进程也查到路径；
 //! 普通权限的界面进程查 `svchost.exe` 这类会拿不到。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -16,37 +18,72 @@ use windows_sys::Win32::System::Threading::{
 
 /// 查一次路径。失败返回 `None`（进程已退出、或权限不够）。
 pub fn executable_path(pid: u32) -> Option<String> {
-    process_identity(pid).map(|(_, path)| path)
+    Process::open(pid)?.path()
 }
 
-fn process_identity(pid: u32) -> Option<(u64, String)> {
-    if pid == 0 {
-        return None;
+struct Process {
+    handle: HANDLE,
+    created: u64,
+}
+
+impl Process {
+    fn open(pid: u32) -> Option<Self> {
+        if pid == 0 {
+            return None;
+        }
+        // 创建时间与路径都通过同一个句柄查询，期间 PID 即使复用也不会串到另一个进程。
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut created: FILETIME = std::mem::zeroed();
+            let mut exited: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+                CloseHandle(handle);
+                return None;
+            }
+            Some(Self {
+                handle,
+                created: (created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64,
+            })
+        }
     }
-    // SAFETY: 只申请查询权限，拿到句柄后立即关闭；缓冲区放在栈上，长度如实传入。
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return None;
-        }
 
-        // MAX_PATH 是 260，长路径可能到 32767；先用 512 试，不够再放大到 1024
-        let mut created: FILETIME = std::mem::zeroed();
-        let mut exited: FILETIME = std::mem::zeroed();
-        let mut kernel: FILETIME = std::mem::zeroed();
-        let mut user: FILETIME = std::mem::zeroed();
-        let times = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
-        let mut buf = vec![0u16; 32768];
+    fn path(&self) -> Option<String> {
+        let mut short = [0u16; 512];
+        match self.query_path(&mut short) {
+            Ok(path) => Some(path),
+            Err(ERROR_INSUFFICIENT_BUFFER) => self.query_path(&mut vec![0u16; 32768]).ok(),
+            Err(_) => None,
+        }
+    }
+
+    fn query_path(&self, buf: &mut [u16]) -> Result<String, u32> {
         let mut size = buf.len() as u32;
-        let ok =
-            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
-
-        if ok == 0 || size == 0 || times == 0 {
-            return None;
+        // SAFETY: 句柄由 Self 持有，缓冲区长度按字符数传入。
+        unsafe {
+            if QueryFullProcessImageNameW(
+                self.handle,
+                PROCESS_NAME_WIN32,
+                buf.as_mut_ptr(),
+                &mut size,
+            ) == 0
+            {
+                return Err(GetLastError());
+            }
         }
-        let identity = (created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64;
-        Some((identity, String::from_utf16_lossy(&buf[..size as usize])))
+        Ok(String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
     }
 }
 
@@ -69,9 +106,8 @@ impl PathCache {
     pub fn resolve(&mut self, pid: u32) -> String {
         // 每批验证创建时间，PID 被复用时不能沿用旧路径；退出后的最后事件
         // 可暂时使用缓存归属，下一批无事件时由 retain_pids 清理。
-        if let Some((created, path)) = process_identity(pid) {
-            self.map.insert(pid, (created, path.clone()));
-            return path;
+        if let Some(process) = Process::open(pid) {
+            return self.resolve_identity(pid, process.created, || process.path());
         }
         if let Some((_, path)) = self.map.get(&pid) {
             return path.clone();
@@ -81,7 +117,28 @@ impl PathCache {
         path
     }
 
+    fn resolve_identity(
+        &mut self,
+        pid: u32,
+        created: u64,
+        load_path: impl FnOnce() -> Option<String>,
+    ) -> String {
+        if let Some((cached_created, path)) = self.map.get(&pid) {
+            if *cached_created == created {
+                return path.clone();
+            }
+        }
+        // 只有首次出现或 PID 换了身份才查路径。新身份查询失败时不能沿用旧身份。
+        let (identity, path) = match load_path() {
+            Some(path) => (created, path),
+            None => (0, format!("pid {pid}")), // 下次继续尝试，不永久缓存失败结果
+        };
+        self.map.insert(pid, (identity, path.clone()));
+        path
+    }
+
     pub fn retain_pids(&mut self, alive: &[u32]) {
+        let alive: HashSet<_> = alive.iter().copied().collect();
         self.map.retain(|pid, _| alive.contains(pid));
     }
 
@@ -97,6 +154,43 @@ impl PathCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_identity_skips_path_query_but_pid_reuse_refreshes_it() {
+        let mut cache = PathCache::new();
+        assert_eq!(
+            cache.resolve_identity(7, 100, || Some("a.exe".into())),
+            "a.exe"
+        );
+        assert_eq!(
+            cache.resolve_identity(7, 100, || panic!("cached path must not be queried again")),
+            "a.exe"
+        );
+        assert_eq!(
+            cache.resolve_identity(7, 200, || Some("b.exe".into())),
+            "b.exe"
+        );
+    }
+
+    #[test]
+    fn a_reused_pid_never_inherits_old_path_when_query_fails() {
+        let mut cache = PathCache::new();
+        cache.resolve_identity(7, 100, || Some("old.exe".into()));
+        assert_eq!(cache.resolve_identity(7, 200, || None), "pid 7");
+        assert_eq!(
+            cache.resolve_identity(7, 200, || Some("new.exe".into())),
+            "new.exe"
+        );
+    }
+
+    #[test]
+    fn resolves_a_live_process_and_reuses_its_path() {
+        let mut cache = PathCache::new();
+        let pid = std::process::id();
+        let expected = executable_path(pid).unwrap();
+        assert_eq!(cache.resolve(pid), expected);
+        assert_eq!(cache.resolve(pid), expected);
+    }
 
     #[test]
     fn unknown_pid_gets_placeholder() {

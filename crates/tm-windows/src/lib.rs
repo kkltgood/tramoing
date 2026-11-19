@@ -13,10 +13,11 @@
 //!
 //! 界面进程永远不需要提权，装一次就好。
 //!
-//! 能在这里跑单测的只有 [`proto`] 和 [`agg`]（纯逻辑），
+//! [`proto`]、[`agg`] 和 [`network`] 的纯逻辑测试可在两种平台执行，
 //! 系统调用部分只在 `cfg(windows)` 下编译。
 
 pub mod agg;
+pub mod network;
 pub mod proto;
 
 #[cfg(windows)]

@@ -27,8 +27,8 @@ fn main() {
 #[cfg(windows)]
 mod win {
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use tm_windows::agg::{Aggregator, AppAccumulator};
     use tm_windows::etw::{self, EtwSession};
@@ -84,21 +84,28 @@ mod win {
         };
 
         // 采样不随 UI 是否连接而停止。原始 PID 表每秒取走，避免无人连接时无限积累。
-        let latest = Arc::new(Mutex::new(tm_windows::proto::Frame::new(0, Vec::new())));
+        let latest = Arc::new((
+            Mutex::new(tm_windows::proto::Frame::new(0, Vec::new())),
+            Condvar::new(),
+        ));
         let output = latest.clone();
         std::thread::spawn(move || {
             let mut cache = PathCache::new();
             let mut apps = AppAccumulator::default();
+            let source_clock = Instant::now();
             loop {
+                let tick = Instant::now();
                 let mut batch = agg.lock().unwrap().drain_with(|_| String::new());
+                batch.sampled_at_us = Some(source_clock.elapsed().as_micros() as u64);
                 let active: Vec<u32> = batch.procs.iter().map(|p| p.pid).collect();
                 // 进程查询在 ETW 锁外，回调不等待系统 API。
                 for entry in &mut batch.procs {
                     entry.name = cache.resolve(entry.pid);
                 }
                 cache.retain_pids(&active);
-                *output.lock().unwrap() = apps.update(batch);
-                std::thread::sleep(Duration::from_secs(1));
+                *output.0.lock().unwrap() = apps.update(batch);
+                output.1.notify_one();
+                std::thread::sleep(Duration::from_secs(1).saturating_sub(tick.elapsed()));
             }
         });
         let mut scratch = Vec::with_capacity(64 * 1024);
@@ -119,14 +126,23 @@ mod win {
             }
             log("界面已连接，开始推送");
 
+            let mut last_sent = None;
             loop {
-                let frame = latest.lock().unwrap().clone();
+                // 新采样到达即发送，避免两个独立定时器重复发送旧帧。
+                let frame = {
+                    let guard = latest.0.lock().unwrap();
+                    latest
+                        .1
+                        .wait_while(guard, |frame| last_sent == Some(frame.seq))
+                        .unwrap()
+                        .clone()
+                };
                 if let Err(e) = server.send_frame(&frame, &mut scratch) {
                     log(&format!("推送中断：{e}"));
                     break;
                 }
 
-                std::thread::sleep(Duration::from_secs(1));
+                last_sent = Some(frame.seq);
             }
         }
     }

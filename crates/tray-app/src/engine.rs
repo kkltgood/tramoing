@@ -231,7 +231,7 @@ where
                             last_good = Instant::now();
                             error = None;
                             backoff = 1;
-                            calc.update(last_good, &samples);
+                            calc.update(s.sampled_at().unwrap_or(last_good), &samples);
                             let deltas = calc.take_deltas();
                             tracker.push_at(last_good, &deltas);
                             pending.add(SystemTime::now(), &deltas);

@@ -34,15 +34,38 @@ if (-not $Version) {
 Write-Host "==> 版本 $Version"
 
 Write-Host "==> 编译 release"
-cargo build --release -p tray-app
-if ($LASTEXITCODE -ne 0) { throw "编译 tray-app 失败" }
-cargo build --release -p tm-windows --bin tramoing-helper
-if ($LASTEXITCODE -ne 0) { throw "编译 tramoing-helper 失败" }
+# Cargo 报告本次构建的确切路径，兼容 CARGO_TARGET_DIR、.cargo 配置及目标平台子目录。
+# 不能从固定 target/release 收集：那里可能还留着另一次构建的旧程序。
+$buildOutput = & cargo build --release --locked -p tray-app -p tm-windows --bins --message-format=json-render-diagnostics
+if ($LASTEXITCODE -ne 0) { throw "编译失败，未收集安装包输入" }
+$artifacts = @{}
+foreach ($line in $buildOutput) {
+    $record = $line | ConvertFrom-Json
+    if ($record.reason -eq 'compiler-artifact' -and $record.executable -and
+        $record.target.name -in @('tramoing', 'tramoing-helper') -and
+        $record.target.kind -contains 'bin') {
+        $artifacts[$record.target.name] = $record.executable
+    }
+}
+foreach ($binary in @('tramoing', 'tramoing-helper')) {
+    if (-not $artifacts.ContainsKey($binary) -or
+        -not (Test-Path -LiteralPath $artifacts[$binary] -PathType Leaf) -or
+        [IO.Path]::GetFileName($artifacts[$binary]) -ne "$binary.exe") {
+        throw "Cargo 未提供有效的 Windows 产物：$binary.exe"
+    }
+}
 
 $stage = Join-Path $root "dist\windows"
 New-Item -ItemType Directory -Force $stage | Out-Null
-Copy-Item "target\release\tramoing.exe" $stage -Force
-Copy-Item "target\release\tramoing-helper.exe" $stage -Force
+foreach ($binary in @('tramoing', 'tramoing-helper')) {
+    $destination = Join-Path $stage "$binary.exe"
+    Copy-Item -LiteralPath $artifacts[$binary] -Destination $destination -Force
+    if ((Get-FileHash -LiteralPath $artifacts[$binary]).Hash -ne
+        (Get-FileHash -LiteralPath $destination).Hash) {
+        throw "打包输入校验失败：$binary.exe"
+    }
+    Write-Host "    $binary <- $($artifacts[$binary])"
+}
 Write-Host "    已收集到 $stage"
 
 # winget 装的 NSIS 不会把自己写进 PATH，所以先查命令、再退到默认安装目录

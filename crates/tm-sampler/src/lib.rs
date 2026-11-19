@@ -6,7 +6,7 @@
 //! - 没有采样权限的机器也能跑通整条管道；
 //! - 单测不需要真网络、真进程。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tm_core::ProcSample;
 
@@ -48,6 +48,11 @@ impl From<std::io::Error> for SamplerError {
 /// 这样采样器不需要知道时间窗口，算法也只有一份。
 pub trait Sampler: Send {
     fn sample(&mut self) -> Result<Vec<ProcSample>, SamplerError>;
+
+    /// 最近成功一帧的采集时间，映射到本进程的单调时钟。没有源时间戳时用接收时间。
+    fn sampled_at(&self) -> Option<Instant> {
+        None
+    }
 
     /// 建议的采样间隔，UI 用它决定刷新节奏。
     fn interval(&self) -> Duration {

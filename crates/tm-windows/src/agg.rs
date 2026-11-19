@@ -77,6 +77,7 @@ impl Aggregator {
         Frame {
             seq: self.seq,
             procs,
+            sampled_at_us: None,
         }
     }
 
@@ -144,6 +145,7 @@ impl AppAccumulator {
         }
         Frame {
             seq: self.seq,
+            sampled_at_us: deltas.sampled_at_us,
             procs: self
                 .apps
                 .iter()

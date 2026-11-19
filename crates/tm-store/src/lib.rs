@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use tm_core::AppKey;
 
 /// 保留多少天的历史
@@ -77,6 +77,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// 查询/导出已有历史；不建目录、不迁移，也不申请写锁。
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
+    }
+
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -380,6 +386,53 @@ pub fn default_path() -> PathBuf {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn read_only_export_works_while_another_writer_holds_a_transaction() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-read-only-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("history.db");
+        let csv = dir.join("history.csv");
+        {
+            let mut writer = Store::open(&db).unwrap();
+            writer
+                .add_deltas(at(60), &[(app("browser"), 123, 7)])
+                .unwrap();
+            writer
+                .conn
+                .execute_batch("BEGIN IMMEDIATE; UPDATE samples SET rx = 999;")
+                .unwrap();
+            let reader = Store::open_read_only(&db).unwrap();
+            assert_eq!(reader.totals_between(0, 120).unwrap()[0].rx, 123);
+            assert_eq!(reader.export_csv(0, 120, &csv).unwrap(), 1);
+            assert!(std::fs::read_to_string(&csv).unwrap().contains(",123,7"));
+            assert!(reader.conn.execute("DELETE FROM samples", []).is_err());
+            writer.conn.execute_batch("ROLLBACK").unwrap();
+        }
+        std::fs::remove_file(csv).unwrap();
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_open_never_creates_a_missing_database() {
+        let path = std::env::temp_dir().join(format!(
+            "tm-missing-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn recovery_replay_is_idempotent() {

@@ -8,8 +8,10 @@
 //! ```text
 //! 帧头   magic:u32(4)  version:u16(2)  count:u16(2)  seq:u64(8)      = 16 字节
 //! 每项   pid:u32(4)    rx:u64(8)       tx:u64(8)     name_len:u16(2)  = 22 + name_len
-//!        name:[u8; name_len]（UTF-8，最长 260）
+//!        name:[u8; name_len]（UTF-8，最长 512 字节）
+//! 可选帧尾 `TMT1:[u8;4] sampled_at_us:u64`：助手单调时钟上的采集时间。
 //! ```
+//! 旧版解码器忽略帧尾；新版也能读取没有时间戳的旧助手帧，保持 v1 兼容。
 //!
 //! 这个模块不碰任何 Windows API，所以能在 macOS 上跑单测 —— 协议错了
 //! 是最难排查的一类问题，必须在这里就锁死。
@@ -20,11 +22,12 @@ pub const VERSION: u16 = 1;
 /// 一帧最多多少个进程。Windows 上常年有 200~400 个进程，
 /// 4096 留足余量；超过说明数据错乱，直接拒收而不是无限分配内存。
 pub const MAX_PROCS: u16 = 4096;
-/// 进程路径最长 260（MAX_PATH），留点余量给长路径
+/// 编码后的路径最多 512 字节，超出时在 UTF-8 字符边界截断。
 pub const MAX_NAME: usize = 512;
 
 const HEADER_LEN: usize = 16;
 const ENTRY_FIXED: usize = 22;
+const TIME_TAG: &[u8; 4] = b"TMT1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcEntry {
@@ -42,6 +45,8 @@ pub struct Frame {
     /// 帧序号，界面端可用来发现丢帧
     pub seq: u64,
     pub procs: Vec<ProcEntry>,
+    /// 同一次助手运行中的单调采集时间（微秒），不受系统校时和传输延迟影响。
+    pub sampled_at_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +76,11 @@ impl std::error::Error for ProtoError {}
 
 impl Frame {
     pub fn new(seq: u64, procs: Vec<ProcEntry>) -> Self {
-        Self { seq, procs }
+        Self {
+            seq,
+            procs,
+            sampled_at_us: None,
+        }
     }
 
     /// 编码到已有缓冲区（复用分配，避免每秒新建 Vec）。
@@ -99,6 +108,10 @@ impl Frame {
             out.extend_from_slice(&p.tx.to_le_bytes());
             out.extend_from_slice(&(len as u16).to_le_bytes());
             out.extend_from_slice(&name[..len]);
+        }
+        if let Some(at) = self.sampled_at_us {
+            out.extend_from_slice(TIME_TAG);
+            out.extend_from_slice(&at.to_le_bytes());
         }
         Ok(())
     }
@@ -142,7 +155,17 @@ impl Frame {
             procs.push(ProcEntry { pid, rx, tx, name });
         }
 
-        Ok(Self { seq, procs })
+        let sampled_at_us = if buf[cur.pos..].starts_with(TIME_TAG) {
+            cur.bytes(TIME_TAG.len())?;
+            Some(cur.u64()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            seq,
+            procs,
+            sampled_at_us,
+        })
     }
 }
 
@@ -232,6 +255,22 @@ mod tests {
         let f = sample();
         let bytes = f.encode().unwrap();
         assert_eq!(Frame::decode(&bytes).unwrap(), f);
+    }
+
+    #[test]
+    fn timestamp_extension_preserves_the_legacy_frame_prefix() {
+        let legacy = sample();
+        let original = legacy.encode().unwrap();
+        let mut timed = legacy.clone();
+        timed.sampled_at_us = Some(12_345_678);
+        let encoded = timed.encode().unwrap();
+        assert_eq!(&encoded[..original.len()], &original);
+        assert_eq!(Frame::decode(&original).unwrap(), legacy);
+        assert_eq!(Frame::decode(&encoded).unwrap(), timed);
+        assert!(matches!(
+            Frame::decode(&encoded[..encoded.len() - 1]),
+            Err(ProtoError::Truncated { .. })
+        ));
     }
 
     #[test]

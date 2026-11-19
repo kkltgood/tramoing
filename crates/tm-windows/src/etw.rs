@@ -8,8 +8,8 @@
 //!
 //! # 事件布局
 //!
-//! 内核网络事件的前 8 字节是 `PID:u32, size:u32`，后面的字段随 v4/v6 不同，
-//! 我们不关心地址和端口，所以只读前 8 字节。
+//! 内核网络事件的前 8 字节是 `PID:u32, size:u32`，之后是 v4/v6 的地址与端口。
+//! 地址解析和回环过滤见 [`crate::network`]，避免把代理在本机的转发算成网络流量。
 //!
 //! 只订阅计费用的 Send/Receive 事件；连接、断开、重传等事件不计字节。
 //! 事件 ID 对照 Microsoft-Windows-Kernel-Network manifest。
@@ -30,7 +30,8 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
 
-use crate::agg::{Aggregator, Dir};
+use crate::agg::Aggregator;
+use crate::network::decode_event;
 
 /// `Microsoft-Windows-Kernel-Network`
 const PROVIDER: windows_sys::core::GUID =
@@ -311,15 +312,6 @@ fn consumer_loop(
     }
 }
 
-/// manifest: TCPv4 10/11、TCPv6 26/27、UDPv4 42/43、UDPv6 58/59。
-fn direction(event_id: u16) -> Option<Dir> {
-    match event_id {
-        10 | 26 | 42 | 58 => Some(Dir::Tx),
-        11 | 27 | 43 | 59 => Some(Dir::Rx),
-        _ => None,
-    }
-}
-
 /// ETW 回调。跑在系统的实时线程上，做的事越少越好。
 unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     if record.is_null() {
@@ -347,31 +339,12 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         dump_event(event_id, pid, size, len, &hex);
     }
 
-    let Some(dir) = direction(event_id) else {
+    let Some(event) = decode_event(event_id, rec.EventHeader.EventDescriptor.Version, data) else {
         return;
     };
     if let Some(sink) = (rec.UserContext as *const Mutex<Aggregator>).as_ref() {
         if let Ok(mut agg) = sink.lock() {
-            agg.add(pid, dir, size);
+            agg.add(event.pid, event.dir, event.bytes);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counts_tcp_and_udp_for_both_address_families() {
-        for id in [10u16, 26, 42, 58] {
-            assert_eq!(direction(id), Some(Dir::Tx));
-            assert_eq!(direction(id + 1), Some(Dir::Rx));
-        }
-        // Connect/Disconnect/Retransmit/Accept/Reconnect/Fail 不是新增流量。
-        for id in [12, 13, 14, 15, 16, 17, 28, 29, 30, 31, 32, 33] {
-            assert_eq!(direction(id), None);
-        }
-        assert_eq!(direction(1), None, "非流量事件应被忽略");
-        assert_eq!(direction(999), None);
     }
 }

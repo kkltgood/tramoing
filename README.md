@@ -17,6 +17,7 @@
 - **当前状态**：已修复统计、采集生命周期和原生任务栏挂接；Windows 本机测试与 macOS 两种架构的源码检查见 [本轮验证记录](docs/verification-2026-11-19.md)。macOS 原生构建与交互需要 Mac 验收。
 - **任务栏显示修复**：透明背景和固定箭头列的实现、实机截图与测试见 [2026-11-20 验证记录](docs/taskbar-transparency-2026-11-20.md)。
 - **当前界面**：主面板、设置页与紧凑任务栏的最新运行截图及验收见 [界面优化记录](docs/ui-polish-2026-11-20.md)。
+- **网速统计修复**：Windows 过滤代理回环转发，按源采样时间计算速率，历史导出改为后台只读任务；本轮测试与安装包见 [统计修复记录](docs/traffic-accounting-fixes-2026-11-20.md)。
 
 ![主面板](docs/screenshot-panel.png)
 
@@ -64,7 +65,7 @@
 ### 1.3 数据与设置
 
 - SQLite 历史库，按**分钟**存增量，默认保留 30 天
-- CSV 导出（界面按钮或命令行 `--export`）
+- CSV 导出（界面按钮在后台执行，命令行 `--export` 等待完成）；只读打开已有历史库，导出期间不阻塞界面
 - 开机自启开关（界面或命令行）
 - 设置分为「显示」「统计」两组，各组选项同宽对齐，选中状态使用强调色；开机自启和状态提示固定在底部
 - 设置写成纯文本 `settings.conf`，坏文件不会导致程序起不来
@@ -122,7 +123,7 @@ tramoing/
 | `tm-store` | SQLite 建表/写入/查询/清理/CSV 导出 | 否（SQLite 已 bundled） |
 | `tray-app` | 采样线程、界面、设置、自启、导出 | 平台相关部分用 cfg 隔离 |
 
-**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。这也是 125 个测试里有一半以上与平台无关的原因。
+**关键约束**：`tm-core`、`tm-sampler`、`tm-store` 以及 `tm-windows` 的 `proto` / `agg` / `network` 模块完全不碰系统 API，所以能在 macOS 上直接跑单测。
 
 ### 3.2 数据流
 
@@ -134,9 +135,10 @@ macOS:
 Windows:
   tramoing-helper.exe（管理员，登录自启）
       └─ ETW: Microsoft-Windows-Kernel-Network
-      └─ Aggregator（按 PID 累加累计字节）
-      └─ \\.\pipe\traffic-monitor-v1（每秒一帧，手写小端协议）
-      └─ WindowsSampler（普通权限的界面进程只读管道）
+      └─ network::decode_event（解析收发方向与地址，过滤回环）
+      └─ Aggregator（按 PID 收集每批增量）→ AppAccumulator（按应用累计）
+      └─ \\.\pipe\traffic-monitor-v1（新采样通知推送，附带单调采集时间）
+      └─ WindowsSampler（普通权限读取，跳过重复帧，按源时间差分）
 
 两条支路汇合：
   Sampler → tm_core::RateCalculator（差分 + 平滑 + 按应用归并）
@@ -156,6 +158,9 @@ Windows:
 | 历史库开 WAL | 后台写盘与界面查询不互相阻塞 |
 | 界面线程只渲染 | 起子进程、读流、syscall、写库全在采样线程，弹窗不会因为 IO 掉帧 |
 | 管道协议手写小端编码 | 一帧只有几个数字加进程名，省掉 serde/bincode 依赖和编译时间 |
+| Windows 帧尾携带可选采集时间戳 | 重复帧不更新基线，传输延迟不改变速率的分母；保留 v1 帧前缀，新旧版本可互读，旧助手回退到接收时间 |
+| Windows 不计 IPv4/IPv6 回环转发 | 避免浏览器与本地代理之间的同一份数据同时抬高上下行；普通局域网流量保留，代理外网流量目前归代理进程 |
+| 历史导出使用后台任务和只读数据库连接 | 大库导出不冻结面板，不执行建表/迁移或申请写锁；同一界面一次只导出一份，正常退出等待文件完成 |
 | macOS 给 `nettop` 开 pty | `nettop` 的 stdout 接管道时走 4KB 全缓冲，`-s 1` 实际 3 秒才吐一帧；接 tty 才是精确 1 秒 |
 | macOS 按**连接**统计，不用 `-P` 进程汇总 | 系统代理下一份下载会出现在三个 socket 上（代理外网收、代理回环发、App 回环收）。汇总口径要么算两遍（实测 6 MB 变 12.5 MB，上下行接近），要么只能记到代理名下。按连接配对后可以把回环客户端侧回填给发起方，总量只取外网连接 |
 | 回环两端按「监听端口」判服务端 | 服务端那一侧和客户端侧是同一份数据，用 `state=Listen` 的端口集合就能区分，不需要猜端口号大小 |
@@ -339,19 +344,24 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 | T13 | `tramoing-helper.exe --uninstall` 后再启动界面 | 面板停在骨架屏、没有应用列表；控制台打印"连不上采集助手"，每 2 秒重连一次 | 助手是进程级数据的前提；助手恢复后界面会自动重连 |
 | T14 | 运行 NSIS 安装包，再运行卸载程序 | 安装到 `Program Files\Tramoing`；开始菜单出现 `Tramoing`；卸载时先停任务再删文件；历史数据默认保留 | 只验证过「生成安装包」，安装/卸载流程待测 |
 
-### 6.5 【重点】ETW 事件方向校准
+### 6.5 ETW 统计口径与验证
 
-这是 Windows 侧**唯一依赖记忆而非规范**的部分，请在真机上确认一次。
-
-`Microsoft-Windows-Kernel-Network` 的事件数据前 8 字节是 `PID:u32, Size:u32`，代码靠事件 ID 判断方向：
+已核对本机 `Microsoft-Windows-Kernel-Network` manifest。Version 0 的事件数据以
+`PID:u32, Size:u32, daddr, saddr, dport, sport` 开头；地址按网络字节序解析。计费事件为：
 
 ```rust
-// crates/tm-windows/src/etw.rs
-10 | 12 | 14 | 16 => Tx   // 发送
-11 | 13 | 15 | 17 => Rx   // 接收
+// crates/tm-windows/src/network.rs
+10 | 26 | 42 | 58 => Tx   // TCPv4、TCPv6、UDPv4、UDPv6 发送
+11 | 27 | 43 | 59 => Rx   // 对应接收
 ```
 
-**校准步骤**：
+连接、断开、重传等事件不计费。任意端点为 `127.0.0.0/8`、`::1` 或映射的 IPv4
+回环地址时跳过；普通局域网连接仍计费。未知事件版本和截断数据直接忽略。
+
+本地代理的外网流量目前记在代理进程名下，尚未实现 Windows 端回填给浏览器的连接配对。
+纯回环传输不应增加全局上传、下载；代理下载不应再因本机转发生成近似等量的上传。
+
+**需要管理员权限的真实采集验收步骤**：
 
 1. 先停掉正在运行的助手，避免同名 ETW 会话冲突：
    ```powershell
@@ -362,15 +372,15 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
    ```powershell
    .\target\release\tramoing-helper.exe --dump-events
    ```
-3. 制造**只有单一方向**的流量。推荐：在内网起一个 HTTP 服务，用 `curl -O` 只下载一个大文件；再用 `curl -T` 只上传一个大文件。
+3. 在另一台局域网设备上起 HTTP 服务，分别下载、上传大文件；再经本机代理执行一次下载。检查主要速率方向与实际传输一致。
 4. 每次动作后查看 `%LOCALAPPDATA%\TrafficMonitor\etw-dump.log`，形如：
    ```text
-   id=14 pid=12345 size=1460 len=88 bytes=39 30 00 00 b4 05 00 00 ...
+   id=10 pid=12345 size=1460 len=48 bytes=39 30 00 00 b4 05 00 00 ...
    ```
    记下「纯下载」时占多数的 `id`，以及「纯上传」时占多数的 `id`。
-5. 把 `etw.rs` 里 `direction()` 的两组 ID 改成实测值，`cargo test -p tm-windows` 确认内部一致性，重新构建助手。
+5. 单独进行纯 `127.0.0.1` / `::1` 文件传输，确认应用全局统计不增加。诊断日志在过滤前记录事件，所以日志中仍能看到这些事件。
 
-判定标准：改完之后，单独下载时下行数字涨、上行基本不动；单独上传时相反。若方向仍反了，说明 ID 分组需要整体对调。
+自动回归覆盖四类收发事件、回环过滤、代理转发和普通局域网保留；本轮未替换正在运行的提权助手进行新版本端到端实测，具体边界见 [统计修复记录](docs/traffic-accounting-fixes-2026-11-20.md)。
 
 > 日志里的 `size` 是**单次事件**的字节数，不是累计值；聚合由 `Aggregator` 完成。
 
@@ -384,7 +394,7 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 | 点托盘图标后看不到面板 | ① 面板被摆到屏幕外（6.8）；② 收起时把窗口真隐藏，eframe 的 `update()` 停摆，点击没人处理（6.12） | 已在 6.8 / 6.12 修复；若仍复现，`TM_TRACE_FRAMES=1` 启动看收起后 `[ui] frame=` 还在不在涨 |
 | 面板一直"等待数据"、没有应用列表 | 助手没装、没提权、或崩了 | 看 `helper.log`；确认计划任务状态；`tramoing-helper.exe --help` 会把用法写进 `helper.log` |
 | 有总流量但没有进程级数据 | helper 未运行或管道连不上 | 管理员运行 `--install`；检查 `\\.\pipe\traffic-monitor-v1` 是否存在 |
-| 上下行数字对调 | ETW 事件 ID 表不对 | 执行 6.5 |
+| 代理下载时上传、下载经常接近 | 旧助手重复计算本机回环转发 | 同时更新主程序与采集助手，再按 6.5 验证；旧历史不自动重算 |
 | 进程名显示为 `pid 1234` | 进程刚退出，或即使提权也查不到路径 | 正常降级，不影响流量统计 |
 | 数据不更新 | ETW 会话被同名会话占用 | `tramoing-helper.exe --uninstall` 后重装；检查是否有旧助手进程 |
 | `makensis` 找不到 | 没装 NSIS | `winget install NSIS.NSIS` |
@@ -393,11 +403,9 @@ schtasks /Query /TN TrafficMonitorHelper /FO LIST
 
 请测试时特别留意，这些**不是 bug 或已有明确说明**：
 
-1. **ETW 事件 ID 表待校准**（6.5）——目前唯一未经真机确认的核心逻辑。
+1. **Windows 代理流量归属**：已过滤回环重复计费，但代理的真实网络流量仍显示在代理名下；TUN/VPN 虚拟接口的跨层归属和去重尚未覆盖本轮验收。
 2. **安装包脚本只在真机跑通了「生成」这一步**（见 6.10）：`dist\Tramoing-0.1.0-setup.exe` 已产出，但安装 → 卸载全流程、UAC 提示和 SmartScreen 拦截尚未验证。
-3. **任务栏没有速率文字**：Windows 托盘项不支持文字标题（`tray-icon` 的 `set_title` 只对 macOS 生效），
-   所以面板之外的实时速率只有一个出口——**鼠标悬停**（tooltip 每秒更新，显示 `↓ 1.2 MB/s  ↑ 180 KB/s`）。
-   设置页里「菜单栏」「菜单栏配色」两行因此只在 macOS 显示。
+3. **原生任务栏网速**：通过任务栏子窗口显示，具体系统支持范围与实现见 1.1 / 6.13；托盘图标仍提供速率 tooltip。
 4. **少数应用仍显示首字母色块**：图标走 `SHGetFileInfoW` 从 exe 资源里取（见 6.11），
    取不到就退回首字母方块。已知取不到的一类：装在**受 ACL 保护的服务目录**里的核心程序
    （例如 `C:\ProgramData\clash-verge-service\cores\verge-mihomo.exe`），普通权限读不到文件，
@@ -460,8 +468,10 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Version 0.1.1
 ```
 
-脚本做的事：读 `Cargo.toml` 的版本 → `cargo build --release` 两个 exe →
-收集到 `dist\windows\` → 调 `makensis` 出 `dist\Tramoing-<version>-setup.exe`（约 2.5 MB）。
+脚本做的事：读 `Cargo.toml` 的版本 → `cargo build --release --locked` 两个 exe →
+从 Cargo JSON 的 `compiler-artifact.executable` 读取本次实际输出路径 →
+复制到 `dist\windows\` 并逐个校验 SHA256 → 调 `makensis` 出 `dist\Tramoing-<version>-setup.exe`。
+支持 `CARGO_TARGET_DIR`、Cargo 配置及目标平台子目录，不再假设产物一定在 `target\release`。
 
 实操踩到的两个坑，已在脚本里修掉：
 
@@ -785,7 +795,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release -p tray-app -p tm-windows --locked
 ```
 
-macOS 连接解析/记账模块在所有平台都参与测试，系统 API 模块仍只在对应平台编译。本机执行结果和未验证项目见 [验证记录](docs/verification-2026-11-19.md)。
+macOS 连接解析/记账与 Windows 网络事件解析模块在所有平台都参与测试，系统 API 模块仍只在对应平台编译。本轮执行结果见 [统计修复记录](docs/traffic-accounting-fixes-2026-11-20.md)，此前跨平台验证见 [验证记录](docs/verification-2026-11-19.md)。
 
 ## 10. 提交前检查
 

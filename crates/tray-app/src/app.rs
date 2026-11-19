@@ -237,6 +237,8 @@ pub struct App {
     transition: Option<(View, Instant)>,
     /// 底部临时提示（导出结果、自启切换结果），`(文案, 起始时间)`
     toast: Option<(String, Instant)>,
+    /// 同一时刻只运行一个后台导出，避免重复点击覆盖同一文件。
+    export_job: Option<crate::export::ExportJob>,
     /// 更新检测。网络动作全在后台线程，这里只是把事件攒成可画的状态。
     update: crate::update::Updater,
     /// 进程启动时刻。
@@ -399,6 +401,7 @@ impl App {
             toast: std::env::var("TM_TOAST")
                 .ok()
                 .map(|msg| (msg, Instant::now())),
+            export_job: None,
             update: crate::update::Updater::new(),
             started_at: Instant::now(),
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
@@ -816,6 +819,21 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.sync_badge(ctx);
         self.icons.poll();
+        if let Some(job) = &self.export_job {
+            let message = match job.try_result() {
+                Ok(message) => Some(message),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(
+                    self.lang
+                        .t("导出任务意外结束", "Export interrupted")
+                        .to_owned(),
+                ),
+            };
+            if let Some(message) = message {
+                self.export_job = None;
+                self.toast = Some((message, Instant::now()));
+            }
+        }
 
         if let Some(settings) = crate::instance::take_activation() {
             if settings {
@@ -1945,18 +1963,27 @@ impl App {
         let row = egui::Rect::from_min_max(egui::pos2(band.left(), line_y + 1.0 + 4.0), band.max);
         let cy = row.center().y;
 
-        let export_rect = egui::Rect::from_min_size(row.min, Vec2::new(76.0, row.height()));
+        let export_width = if self.export_job.is_some() {
+            88.0
+        } else {
+            76.0
+        };
+        let export_rect = egui::Rect::from_min_size(row.min, Vec2::new(export_width, row.height()));
         let export = action_button(
             ui,
             export_rect,
             "footer-export",
-            lang.t("导出历史", "Export"),
+            if self.export_job.is_some() {
+                lang.t("导出中…", "Exporting…")
+            } else {
+                lang.t("导出历史", "Export")
+            },
             p,
             paint_export_icon,
         )
         .on_hover_text(lang.t("导出历史", "Export history"));
-        if export.clicked() {
-            self.export_history(zh);
+        if export.clicked() && self.export_job.is_none() {
+            self.export_history(zh, ui.ctx());
         }
 
         // 页脚中间这一条：有更新相关的事就显示更新，否则退回临时提示。
@@ -2163,19 +2190,41 @@ impl App {
     }
 
     /// 把库里全部历史写成 CSV。
-    fn export_history(&mut self, zh: bool) {
-        let msg = export_history_csv(zh);
-        self.toast = Some((msg, Instant::now()));
+    fn export_history(&mut self, zh: bool, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        match crate::export::ExportJob::start(
+            move || export_history_csv(zh),
+            move || ctx.request_repaint(),
+        ) {
+            Ok(job) => {
+                self.export_job = Some(job);
+                self.toast = Some((
+                    self.lang
+                        .t("正在导出历史…", "Exporting history…")
+                        .to_owned(),
+                    Instant::now(),
+                ));
+            }
+            Err(error) => {
+                self.toast = Some((
+                    format!("{}: {error}", self.lang.t("导出失败", "Export failed")),
+                    Instant::now(),
+                ));
+            }
+        }
     }
 }
 
 /// 导出全部历史，返回可以直接展示的提示文案。
 ///
-/// 几十万行以内都是几十毫秒，不值得为它再起一个线程和一套状态机，
-/// 所以界面和 `--export` 命令行入口共用这一份同步实现。
+/// 界面在后台任务中调用；`--export` 命令行入口直接等待结果。
 pub fn export_history_csv(zh: bool) -> String {
     let result = (|| -> Result<(u64, String), String> {
-        let store = tm_store::Store::open(&engine::db_path()).map_err(|e| e.to_string())?;
+        let path = engine::db_path();
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            return Ok((0, String::new()));
+        }
+        let store = tm_store::Store::open_read_only(&path).map_err(|e| e.to_string())?;
         let stamp = store.local_now_stamp().map_err(|e| e.to_string())?;
         let name = format!("Tramoing-{stamp}.csv");
 

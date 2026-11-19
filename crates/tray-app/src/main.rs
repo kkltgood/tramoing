@@ -15,6 +15,7 @@ mod autostart;
 #[cfg(windows)]
 mod badge_window;
 mod engine;
+mod export;
 mod icon;
 mod icons;
 mod instance;
