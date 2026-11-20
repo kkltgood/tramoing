@@ -55,6 +55,11 @@ pub struct Settings {
     pub tray_color: bool,
     /// 是否显示 Windows 原生任务栏网速区域。
     pub tray_badge: bool,
+    /// macOS：CPU / GPU 共用一个双行状态项，由总开关同时控制。
+    pub performance_enabled: bool,
+    pub performance_color: bool,
+    /// 性能采样间隔，只提供 1 / 2 / 5 秒。
+    pub performance_interval: u64,
     /// 启动后自动检查新版本。
     ///
     /// **默认关闭**（2026-11-19 决定先不上线）：清单地址还没定，
@@ -80,6 +85,9 @@ impl Default for Settings {
             alert_mb: 0,
             tray_color: true,
             tray_badge: true,
+            performance_enabled: false,
+            performance_color: true,
+            performance_interval: 2,
             update_check: false,
             last_check: 0,
         }
@@ -171,6 +179,21 @@ impl Settings {
                     "off" | "false" | "0" => s.update_check = false,
                     _ => {}
                 },
+                "performance_enabled" => {
+                    if let Some(value) = parse_bool(v) {
+                        s.performance_enabled = value;
+                    }
+                }
+                "performance_color" => {
+                    if let Some(value) = parse_bool(v) {
+                        s.performance_color = value;
+                    }
+                }
+                "performance_interval" => {
+                    if let Ok(value @ (1 | 2 | 5)) = v.parse::<u64>() {
+                        s.performance_interval = value;
+                    }
+                }
                 "last_check" => {
                     if let Ok(n) = v.parse::<i64>() {
                         s.last_check = n.max(0);
@@ -208,6 +231,9 @@ impl Settings {
              alert_mb={}\n\
              tray_color={}\n\
              tray_badge={}\n\
+             performance_enabled={}\n\
+             performance_color={}\n\
+             performance_interval={}\n\
              update_check={}\n\
              last_check={}\n",
             self.max_apps,
@@ -215,6 +241,13 @@ impl Settings {
             self.alert_mb,
             if self.tray_color { "on" } else { "off" },
             if self.tray_badge { "on" } else { "off" },
+            if self.performance_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if self.performance_color { "on" } else { "off" },
+            self.performance_interval,
             if self.update_check { "on" } else { "off" },
             self.last_check
         )
@@ -230,6 +263,14 @@ fn snap_options(n: usize) -> usize {
         .into_iter()
         .min_by_key(|o| o.abs_diff(n))
         .unwrap_or(10)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_tray(v: &str) -> Option<TrayMode> {
@@ -284,6 +325,9 @@ mod tests {
             alert_mb: 500,
             tray_color: false,
             tray_badge: false,
+            performance_enabled: true,
+            performance_color: false,
+            performance_interval: 5,
             update_check: false,
             last_check: 1_700_000_000,
         };
@@ -344,5 +388,23 @@ mod tests {
         // 2026-11-19 决定先不上线：新装用户不该有任何出网请求，
         // 而不能指望「反正地址是占位的」——占位地址也是请求。
         assert!(!Settings::default().update_check);
+    }
+
+    #[test]
+    fn performance_settings_are_opt_in_and_validate_interval() {
+        assert!(!Settings::parse("theme=dark").performance_enabled);
+        let settings = Settings::parse(
+            "performance_enabled=on\nperformance_color=off\nperformance_interval=1",
+        );
+        assert!(settings.performance_enabled);
+        assert!(!settings.performance_color);
+        assert_eq!(settings.performance_interval, 1);
+        for value in ["0", "-1", "3", "999", "abc"] {
+            assert_eq!(
+                Settings::parse(&format!("performance_interval={value}")).performance_interval,
+                2
+            );
+        }
+        assert!(!Settings::parse("performance_enabled=maybe").performance_enabled);
     }
 }

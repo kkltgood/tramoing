@@ -20,6 +20,8 @@ pub mod pty;
 pub mod sampler;
 #[cfg(target_os = "macos")]
 pub mod status_item;
+#[cfg(target_os = "macos")]
+pub mod utilization;
 
 #[cfg(target_os = "macos")]
 pub use appid::{bundle_of, identify, AppIdentity, AppResolver};

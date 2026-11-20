@@ -14,6 +14,7 @@ tm-sampler = { path = "../tm-sampler" }
 objc2 = "0.6"
 # openpty / termios：让 nettop 的 stdout 变成行缓冲（见 pty.rs）
 libc = "0.2"
+core-foundation-sys = "0.8"
 objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSGeometry",

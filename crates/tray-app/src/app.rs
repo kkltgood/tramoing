@@ -183,6 +183,8 @@ enum TrayEvent {
     /// `«` 溢出区时，`Shell_NotifyIconGetRect` 会失败，那时就用点击事件
     /// 里带的位置兜底，否则点了完全没反应。
     Click { fallback: Option<IconRect> },
+    #[cfg(target_os = "macos")]
+    PerformanceClick,
     /// 用户点了任务栏上的网速贴片（Windows 专属）。
     ///
     /// 和托盘点击分开记，是因为**锚点不一样**：贴片在任务栏条里，和托盘
@@ -205,6 +207,18 @@ pub struct App {
     shown_at: Instant,
     auto_hidden_at: Option<Instant>,
     tray: Option<TrayHandle>,
+    #[cfg(target_os = "macos")]
+    performance: crate::performance::Monitor,
+    #[cfg(target_os = "macos")]
+    performance_tray: Option<tm_macos::StatusItem>,
+    #[cfg(target_os = "macos")]
+    performance_title: String,
+    #[cfg(target_os = "macos")]
+    performance_tip: String,
+    #[cfg(target_os = "macos")]
+    performance_tray_retry: Instant,
+    #[cfg(target_os = "macos")]
+    performance_anchor: bool,
     /// 上一次写进状态栏的「模式 + 文字」。只比文字不够：切到「仅图标」时
     /// 文字本来就是空串，会被当成没变化而跳过一次必要的重排。
     tray_title: String,
@@ -252,6 +266,7 @@ pub struct App {
     force_update_check: bool,
     /// 调试用初始滚动位置，只设置一次；后续由 ScrollArea 保留连续滚动状态。
     initial_list_scroll: Option<f32>,
+    initial_settings_scroll: Option<f32>,
     /// 调试用：启动后立刻把面板摆出来（`--show` / `TM_SHOW_ON_START`）
     show_on_start: bool,
     /// 显式 --show 用于预览，启动标记被消费后仍保持展开。
@@ -361,6 +376,13 @@ impl App {
         install_tray_handler();
 
         let icons = IconSet::new(ctx.clone());
+        #[cfg(target_os = "macos")]
+        let performance = {
+            let wake = ctx.clone();
+            let mut monitor = crate::performance::Monitor::new(move || wake.request_repaint());
+            monitor.configure(settings.performance_enabled, settings.performance_interval);
+            monitor
+        };
 
         let app = Self {
             rx,
@@ -370,6 +392,18 @@ impl App {
             shown_at: Instant::now(),
             auto_hidden_at: None,
             tray: None,
+            #[cfg(target_os = "macos")]
+            performance,
+            #[cfg(target_os = "macos")]
+            performance_tray: None,
+            #[cfg(target_os = "macos")]
+            performance_title: String::new(),
+            #[cfg(target_os = "macos")]
+            performance_tip: String::new(),
+            #[cfg(target_os = "macos")]
+            performance_tray_retry: Instant::now(),
+            #[cfg(target_os = "macos")]
+            performance_anchor: false,
             tray_title: String::new(),
             tray_tip: String::new(),
             lang,
@@ -410,6 +444,10 @@ impl App {
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
             initial_list_scroll: std::env::var("TM_SCROLL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &f32| v.is_finite()),
+            initial_settings_scroll: std::env::var("TM_SETTINGS_SCROLL")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f32| v.is_finite()),
@@ -582,17 +620,20 @@ impl App {
                 .unwrap_or(screen)
         };
         #[cfg(target_os = "macos")]
-        let work = self
-            .tray
-            .as_ref()
-            .and_then(|tray| tray.work_area())
-            .map(|(x, y, w, h)| ScreenBox {
-                x: x as f32 * ppp,
-                y: y as f32 * ppp,
-                w: w as f32 * ppp,
-                h: h as f32 * ppp,
-            })
-            .unwrap_or(screen);
+        let work = (if self.performance_anchor {
+            &self.performance_tray
+        } else {
+            &self.tray
+        })
+        .as_ref()
+        .and_then(|tray| tray.work_area())
+        .map(|(x, y, w, h)| ScreenBox {
+            x: x as f32 * ppp,
+            y: y as f32 * ppp,
+            w: w as f32 * ppp,
+            h: h as f32 * ppp,
+        })
+        .unwrap_or(screen);
         #[cfg(not(any(windows, target_os = "macos")))]
         let work = screen;
 
@@ -722,7 +763,7 @@ impl App {
                 TrayMode::IconOnly => String::new(),
                 _ => format!("↑{up}\n↓{down}"),
             };
-            let key = format!("{mode:?}|{text}");
+            let key = format!("{mode:?}|{text}|{}", tray.appearance_is_dark());
             if key != self.tray_title {
                 if text.is_empty() {
                     tray.clear_title();
@@ -752,6 +793,83 @@ impl App {
                 }
 
                 // 悬停提示在上面统一处理了，这里只管文字
+            }
+        }
+    }
+
+    /// 单个双行性能状态项，与网速相邻；关闭时移除整个项并停止采样。
+    #[cfg(target_os = "macos")]
+    fn sync_performance_tray(&mut self) {
+        if !self.settings.performance_enabled {
+            self.performance_tray = None;
+            self.performance_title.clear();
+            self.performance_tip.clear();
+            return;
+        }
+        if self.tray.is_none() {
+            return;
+        }
+        if self.performance_tray.is_none() && Instant::now() >= self.performance_tray_retry {
+            self.performance_tray = tm_macos::StatusItem::new(|| {
+                if let Some(tx) = TRAY_TX.get() {
+                    let _ = tx.send(TrayEvent::PerformanceClick);
+                }
+                if let Some(ctx) = CTX.get() {
+                    ctx.request_repaint();
+                }
+            });
+            self.performance_tray_retry = Instant::now() + Duration::from_secs(5);
+        }
+        let Some(tray) = &self.performance_tray else {
+            return;
+        };
+        let reading = self.performance.reading();
+        let cpu = reading.as_ref().and_then(|r| r.cpu);
+        let gpu = reading.as_ref().and_then(|r| r.gpu);
+        let cpu_text = crate::performance::menu_percent(cpu);
+        let gpu_text = crate::performance::menu_percent(gpu);
+        let key = format!(
+            "{cpu_text}|{gpu_text}|{}|{}",
+            self.settings.performance_color,
+            tray.appearance_is_dark()
+        );
+        if key != self.performance_title {
+            tray.set_utilization_lines(&cpu_text, &gpu_text, self.settings.performance_color);
+            self.performance_title = key;
+        }
+        let unavailable = self.lang.t("暂不可用", "Unavailable");
+        let exact = |v: Option<f64>| {
+            v.map(|v| format!("{v:.1}%"))
+                .unwrap_or_else(|| unavailable.into())
+        };
+        let mut tooltip = format!(
+            "CPU {}\nGPU {}\n{} {}s",
+            exact(cpu),
+            exact(gpu),
+            self.lang.t("刷新间隔", "Refresh"),
+            self.settings.performance_interval
+        );
+        if gpu.is_none() && reading.is_some() {
+            tooltip.push_str(self.lang.t(
+                "\nGPU 驱动未提供利用率",
+                "\nGPU driver does not report utilization",
+            ));
+        }
+        tooltip.push_str(self.lang.t("\n点击打开设置", "\nClick to open settings"));
+        if std::env::var_os("TM_FORCE_MOCK").is_some() {
+            tooltip.push_str(self.lang.t("\n演示数据", "\nDemo data"));
+        }
+        if tooltip != self.performance_tip {
+            tray.set_tooltip(Some(&tooltip));
+            self.performance_tip = tooltip;
+        }
+        if std::env::var_os("TM_TRACE").is_some() {
+            if let Ok(path) = std::env::var("TM_PERFORMANCE_PNG") {
+                eprintln!(
+                    "[performance] CPU={cpu_text} GPU={gpu_text} {} dump={}",
+                    tray.debug_state(),
+                    tray.dump_png(&path)
+                );
             }
         }
     }
@@ -837,6 +955,8 @@ impl eframe::App for App {
         self.sync_tray_theme();
         self.drain_engine();
         self.sync_tray_title();
+        #[cfg(target_os = "macos")]
+        self.sync_performance_tray();
         #[cfg(windows)]
         self.sync_badge(ctx);
         self.icons.poll();
@@ -938,11 +1058,42 @@ impl eframe::App for App {
 
         while let Ok(ev) = self.tray_rx.try_recv() {
             match ev {
-                TrayEvent::Click { fallback } => match self.tray_icon_rect(ctx).or(fallback) {
-                    Some(rect) => self.toggle(ctx, rect),
-                    // 状态项还没被布局（刚创建的头几帧）就拿不到位置，这次点击直接忽略
-                    None => eprintln!("[ui] 状态栏项还没有位置，忽略这次点击"),
-                },
+                TrayEvent::Click { fallback } => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.performance_anchor = false;
+                    }
+                    match self.tray_icon_rect(ctx).or(fallback) {
+                        Some(rect) => self.toggle(ctx, rect),
+                        // 状态项还没被布局（刚创建的头几帧）就拿不到位置，这次点击直接忽略
+                        None => eprintln!("[ui] 状态栏项还没有位置，忽略这次点击"),
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                TrayEvent::PerformanceClick => {
+                    self.initial_settings_scroll = Some(0.0);
+                    if let Some((x, y, w, h)) = self
+                        .performance_tray
+                        .as_ref()
+                        .and_then(|tray| tray.icon_rect())
+                    {
+                        let ppp = ctx.pixels_per_point().max(1.0);
+                        self.performance_anchor = true;
+                        let at = IconRect {
+                            x: x as f32 * ppp,
+                            y: y as f32 * ppp,
+                            w: w as f32 * ppp,
+                            h: h as f32 * ppp,
+                        };
+                        if self.visible && self.view != View::Settings {
+                            self.goto(View::Settings);
+                            self.open(ctx, at);
+                        } else {
+                            self.goto(View::Settings);
+                            self.toggle(ctx, at);
+                        }
+                    }
+                }
                 #[cfg(windows)]
                 TrayEvent::BadgeClick { at } => self.toggle(ctx, at),
             }
@@ -1218,150 +1369,161 @@ impl App {
         }
         ui.add_space(12.0);
 
-        settings_group(ui, p, lang.t("显示", "Display"), |ui| {
-            // ---- 菜单栏（只有 macOS 有这回事）----
-            //
-            // Windows 的任务栏托盘没有文字标题，这两项在那边是纯装饰：
-            // 调了不会有任何变化。宁可少两行，也不能给用户一个假的开关。
+        // 中间选项独立滚动，标题、返回和开机自启始终留在原位。
+        let options_height = (bounds.bottom() - 42.0 - TOAST_H - 15.0 - ui.cursor().top()).max(1.0);
+        ui.spacing_mut().scroll.floating_width = 3.0;
+        settings_scroll_area(options_height, self.initial_settings_scroll.take()).show(ui, |ui| {
+            ui.set_width(ui.available_width() - 8.0);
             #[cfg(target_os = "macos")]
             {
+                self.performance_options(ui, p, lang, &mut changed);
+                ui.add_space(12.0);
+            }
+            settings_group(ui, p, lang.t("显示", "Display"), |ui| {
+                // ---- 菜单栏（只有 macOS 有这回事）----
+                //
+                // Windows 的任务栏托盘没有文字标题，这两项在那边是纯装饰：
+                // 调了不会有任何变化。宁可少两行，也不能给用户一个假的开关。
+                #[cfg(target_os = "macos")]
+                {
+                    if option_row(
+                        ui,
+                        p,
+                        lang.t("网速显示", "Network speed"),
+                        &mut self.settings.tray_mode,
+                        &[
+                            (TrayMode::Both, lang.t("全部", "Icon+Speed")),
+                            (TrayMode::SpeedOnly, lang.t("仅网速", "Speed")),
+                            (TrayMode::IconOnly, lang.t("仅图标", "Icon")),
+                        ],
+                    ) {
+                        changed = true;
+                    }
+
+                    // ---- 菜单栏配色 ----
+                    // 彩色时下行绿、上行蓝；单色时全部跟随系统标签色。
+                    if option_row(
+                        ui,
+                        p,
+                        lang.t("网速配色", "Speed color"),
+                        &mut self.settings.tray_color,
+                        &[
+                            (true, lang.t("彩色", "Color")),
+                            (false, lang.t("单色", "Mono")),
+                        ],
+                    ) {
+                        changed = true;
+                    }
+                }
+
+                // ---- 任务栏（只有 Windows 有这回事）----
+                //
+                // Windows 数字由原生任务栏子窗口绘制，这里控制显示和配色。
+                #[cfg(windows)]
+                {
+                    if option_row(
+                        ui,
+                        p,
+                        lang.t("任务栏网速", "Tray speed"),
+                        &mut self.settings.tray_badge,
+                        &[
+                            (true, lang.t("显示", "Show")),
+                            (false, lang.t("隐藏", "Hide")),
+                        ],
+                    ) {
+                        changed = true;
+                    }
+
+                    if option_row(
+                        ui,
+                        p,
+                        lang.t("网速配色", "Speed color"),
+                        &mut self.settings.tray_color,
+                        &[
+                            (true, lang.t("彩色", "Color")),
+                            (false, lang.t("单色", "Mono")),
+                        ],
+                    ) {
+                        changed = true;
+                    }
+                }
+
+                // ---- 外观 ----
                 if option_row(
                     ui,
                     p,
-                    lang.t("菜单栏", "Menu bar"),
-                    &mut self.settings.tray_mode,
+                    lang.t("外观", "Appearance"),
+                    &mut self.settings.theme,
                     &[
-                        (TrayMode::Both, lang.t("全部", "Icon+Speed")),
-                        (TrayMode::SpeedOnly, lang.t("仅网速", "Speed")),
-                        (TrayMode::IconOnly, lang.t("仅图标", "Icon")),
+                        (ThemeMode::System, lang.t("跟随系统", "System")),
+                        (ThemeMode::Light, lang.t("浅色", "Light")),
+                        (ThemeMode::Dark, lang.t("深色", "Dark")),
                     ],
                 ) {
                     changed = true;
                 }
 
-                // ---- 菜单栏配色 ----
-                // 彩色时下行绿、上行蓝；单色时全部跟随系统标签色。
+                // ---- 语言 ----
                 if option_row(
                     ui,
                     p,
-                    lang.t("菜单栏配色", "Menu bar color"),
-                    &mut self.settings.tray_color,
+                    lang.t("语言", "Language"),
+                    &mut self.settings.lang,
                     &[
-                        (true, lang.t("彩色", "Color")),
-                        (false, lang.t("单色", "Mono")),
+                        (LangMode::Auto, lang.t("自动", "Auto")),
+                        (LangMode::Zh, "中文"),
+                        (LangMode::En, "English"),
                     ],
                 ) {
                     changed = true;
                 }
-            }
-
-            // ---- 任务栏（只有 Windows 有这回事）----
-            //
-            // Windows 数字由原生任务栏子窗口绘制，这里控制显示和配色。
-            #[cfg(windows)]
-            {
+            });
+            ui.add_space(12.0);
+            settings_group(ui, p, lang.t("统计", "Statistics"), |ui| {
+                // ---- 列表条数 ----
+                // 面板高度固定，所以这一项不再管「窗口多高」，而是「最多列几个应用」：
+                // 超出的部分不展示，多到装不下可视行数时靠滚动查看。
                 if option_row(
                     ui,
                     p,
-                    lang.t("任务栏网速", "Tray speed"),
-                    &mut self.settings.tray_badge,
+                    lang.t("最多展示", "Max apps"),
+                    &mut self.settings.max_apps,
+                    &[(5, "5"), (10, "10"), (20, "20")],
+                ) {
+                    changed = true;
+                }
+
+                // ---- 历史保留 ----
+                if option_row(
+                    ui,
+                    p,
+                    lang.t("历史保留", "History"),
+                    &mut self.settings.retention_days,
                     &[
-                        (true, lang.t("显示", "Show")),
-                        (false, lang.t("隐藏", "Hide")),
+                        (7, if zh { "7 天" } else { "7d" }),
+                        (30, if zh { "30 天" } else { "30d" }),
+                        (90, if zh { "90 天" } else { "90d" }),
                     ],
                 ) {
                     changed = true;
                 }
 
+                // ---- 流量提醒 ----
                 if option_row(
                     ui,
                     p,
-                    lang.t("网速配色", "Speed color"),
-                    &mut self.settings.tray_color,
+                    lang.t("流量提醒", "Traffic alert"),
+                    &mut self.settings.alert_mb,
                     &[
-                        (true, lang.t("彩色", "Color")),
-                        (false, lang.t("单色", "Mono")),
+                        (0, lang.t("关闭", "Off")),
+                        (100, "100M"),
+                        (500, "500M"),
+                        (1024, "1G"),
                     ],
                 ) {
                     changed = true;
                 }
-            }
-
-            // ---- 外观 ----
-            if option_row(
-                ui,
-                p,
-                lang.t("外观", "Appearance"),
-                &mut self.settings.theme,
-                &[
-                    (ThemeMode::System, lang.t("跟随系统", "System")),
-                    (ThemeMode::Light, lang.t("浅色", "Light")),
-                    (ThemeMode::Dark, lang.t("深色", "Dark")),
-                ],
-            ) {
-                changed = true;
-            }
-
-            // ---- 语言 ----
-            if option_row(
-                ui,
-                p,
-                lang.t("语言", "Language"),
-                &mut self.settings.lang,
-                &[
-                    (LangMode::Auto, lang.t("自动", "Auto")),
-                    (LangMode::Zh, "中文"),
-                    (LangMode::En, "English"),
-                ],
-            ) {
-                changed = true;
-            }
-        });
-        ui.add_space(12.0);
-        settings_group(ui, p, lang.t("统计", "Statistics"), |ui| {
-            // ---- 列表条数 ----
-            // 面板高度固定，所以这一项不再管「窗口多高」，而是「最多列几个应用」：
-            // 超出的部分不展示，多到装不下可视行数时靠滚动查看。
-            if option_row(
-                ui,
-                p,
-                lang.t("最多展示", "Max apps"),
-                &mut self.settings.max_apps,
-                &[(5, "5"), (10, "10"), (20, "20")],
-            ) {
-                changed = true;
-            }
-
-            // ---- 历史保留 ----
-            if option_row(
-                ui,
-                p,
-                lang.t("历史保留", "History"),
-                &mut self.settings.retention_days,
-                &[
-                    (7, if zh { "7 天" } else { "7d" }),
-                    (30, if zh { "30 天" } else { "30d" }),
-                    (90, if zh { "90 天" } else { "90d" }),
-                ],
-            ) {
-                changed = true;
-            }
-
-            // ---- 流量提醒 ----
-            if option_row(
-                ui,
-                p,
-                lang.t("流量提醒", "Traffic alert"),
-                &mut self.settings.alert_mb,
-                &[
-                    (0, lang.t("关闭", "Off")),
-                    (100, "100M"),
-                    (500, "500M"),
-                    (1024, "1G"),
-                ],
-            ) {
-                changed = true;
-            }
+            });
         });
 
         // 提示与开关区分别固定在底部，设置行不会因状态文案出现而移动。
@@ -1414,6 +1576,92 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn performance_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        lang: Lang,
+        changed: &mut bool,
+    ) {
+        let top = ui.cursor().top();
+        settings_group(
+            ui,
+            p,
+            lang.t("菜单栏性能", "Menu bar performance"),
+            |ui| {
+                *changed |= option_row(
+                    ui,
+                    p,
+                    "CPU / GPU",
+                    &mut self.settings.performance_enabled,
+                    &[(false, lang.t("关闭", "Off")), (true, lang.t("开启", "On"))],
+                );
+                *changed |= option_row(
+                    ui,
+                    p,
+                    lang.t("刷新间隔", "Refresh"),
+                    &mut self.settings.performance_interval,
+                    &[
+                        (1, lang.t("1 秒", "1s")),
+                        (2, lang.t("2 秒", "2s")),
+                        (5, lang.t("5 秒", "5s")),
+                    ],
+                );
+                *changed |= option_row(
+                    ui,
+                    p,
+                    lang.t("性能配色", "Colors"),
+                    &mut self.settings.performance_color,
+                    &[
+                        (true, lang.t("彩色", "Color")),
+                        (false, lang.t("单色", "Mono")),
+                    ],
+                );
+            },
+        );
+        let line = egui::Rect::from_min_size(
+            egui::pos2(ui.max_rect().right() - 158.0, top),
+            Vec2::new(158.0, 18.0),
+        );
+        let reading = self.performance.reading();
+        let text = if self.performance.error.is_some() {
+            lang.t("采样未启动", "Sampler unavailable").to_owned()
+        } else if self.settings.performance_enabled {
+            format!(
+                "CPU {}    GPU {}",
+                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.cpu)),
+                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.gpu))
+            )
+        } else {
+            lang.t("上排 CPU · 下排 GPU", "CPU above GPU").to_owned()
+        };
+        ellipsis_text(ui.painter(), line, &text, 10.5, p.subtext, Align::Max);
+        let hint = if self.performance.error.is_some() {
+            lang.t(
+                "性能采样启动失败，请关闭后重新开启",
+                "Could not start; toggle off and on",
+            )
+        } else if !self.settings.performance_enabled {
+            lang.t(
+                "开启后在网速旁以同一组两行显示 CPU 和 GPU 使用率",
+                "Show CPU above GPU in one item beside network speed",
+            )
+        } else if reading.as_ref().is_some_and(|r| r.gpu.is_none()) {
+            lang.t(
+                "GPU 驱动未提供利用率，使用 --% 表示不可用",
+                "GPU driver does not report utilization; --% means unavailable",
+            )
+        } else {
+            lang.t(
+                "CPU 为整机平均占用；多 GPU 显示最忙设备",
+                "CPU is the system average; GPU is the busiest device",
+            )
+        };
+        ui.interact(line, ui.id().with("performance-hint"), egui::Sense::hover())
+            .on_hover_text(hint);
+    }
+
     /// 设置改动后立刻生效并落盘。
     fn apply_settings(&mut self, ctx: &egui::Context) {
         self.settings.save();
@@ -1424,6 +1672,16 @@ impl App {
         // 清掉缓存，逼 `sync_tray_title` 下一帧重画：只改了配色时文字没变，
         // 不清缓存就不会重新上色。
         self.tray_title.clear();
+        #[cfg(target_os = "macos")]
+        {
+            self.performance.configure(
+                self.settings.performance_enabled,
+                self.settings.performance_interval,
+            );
+            self.performance_title.clear();
+            self.performance_tray_retry = Instant::now();
+            self.sync_performance_tray();
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
@@ -2503,6 +2761,14 @@ fn option_row<T: Copy + PartialEq>(
         );
         let resp = ui.interact(r, ui.id().with(("opt", label, i)), egui::Sense::click());
         let selected = *current == *value;
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::RadioButton,
+                ui.is_enabled(),
+                selected,
+                format!("{label}: {text}"),
+            )
+        });
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             if !selected {
@@ -2808,6 +3074,17 @@ fn app_list_scroll_area(height: f32, initial_offset: Option<f32>) -> egui::Scrol
         .auto_shrink([false, false])
         // 右侧过道中的自绘指示条不覆盖行盒描边。
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    match initial_offset {
+        Some(offset) => area.vertical_scroll_offset(offset),
+        None => area,
+    }
+}
+
+fn settings_scroll_area(height: f32, initial_offset: Option<f32>) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical()
+        .id_salt("settings-options")
+        .max_height(height)
+        .auto_shrink([false, false]);
     match initial_offset {
         Some(offset) => area.vertical_scroll_offset(offset),
         None => area,

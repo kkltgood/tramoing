@@ -17,6 +17,7 @@
 - **当前状态**：已完成 macOS 原生测试、双架构构建与 DMG 打包，并修复触控板列表滚动；真实采样、代理归属限制及交互验收边界见 [macOS 验证记录](docs/macos-verification-2026-11-20.md)。此前 Windows 验证见 [修复记录](docs/verification-2026-11-19.md)。
 - **任务栏显示修复**：透明背景和固定箭头列的实现、实机截图与测试见 [2026-11-20 验证记录](docs/taskbar-transparency-2026-11-20.md)。
 - **当前界面**：按深浅双主题设计重做主面板和设置页，新增真实流量趋势；截图、验证和运行方式见 [双主题设计记录](docs/design-refresh-2026-11-20.md)。
+- **菜单栏性能**：macOS 新增同一组双行 CPU / GPU 使用率，上排 CPU、下排 GPU；支持统一开关、刷新频率和彩色／单色，见 [性能显示记录](docs/performance-menu-2026-11-20.md)。
 - **网速统计修复**：Windows 过滤代理回环转发，按源采样时间计算速率，历史导出改为后台只读任务；本轮测试与安装包见 [统计修复记录](docs/traffic-accounting-fixes-2026-11-20.md)。
 - **代码审查修复**：修复 macOS 归属与资源管理、配置及导出文件写入、损坏历史恢复和更新下载问题；问题清单与验证边界见 [代码审查记录](docs/code-audit-2026-11-20.md)。
 
@@ -35,6 +36,8 @@
 - 三档显示模式：`图标+网速` / `仅网速` / `仅图标`，运行时切换即时生效
 - 可选「单色」模式，全部文字跟随系统色
 - 鼠标悬停显示完整数值（菜单栏里只放得下缩写）
+- 可选的 CPU / GPU 使用率共用一个双行状态项，CPU 在上、GPU 在下，采用网速的等宽字体与行高；点击打开设置
+- 「设置 → 菜单栏性能」提供一个总开关（默认关闭）、1 / 2 / 5 秒刷新和彩色／单色；关闭时停止性能采样。CPU 是整机平均使用率，多 GPU 显示最忙设备；驱动不提供 GPU 使用率时显示 `--%`
 
 **Windows（原生任务栏网速）**
 
@@ -68,7 +71,7 @@
 - SQLite 历史库，按**分钟**存增量，默认保留 30 天
 - CSV 导出（界面按钮在后台执行，命令行 `--export` 等待完成）；只读打开已有历史库，导出期间不阻塞界面
 - 开机自启开关（界面或命令行）
-- 设置分为「显示」「统计」两组，各组选项同宽对齐，选中状态使用强调色；开机自启和状态提示固定在底部
+- 设置按「显示」「统计」分组，macOS 顶部增加「菜单栏性能」；中间选项可滚动，各组选项同宽对齐，标题与开机自启固定在原位
 - 设置写成纯文本 `settings.conf`，坏文件不会导致程序起不来
 
 ### 1.4 界面截图
@@ -76,7 +79,7 @@
 | 页面 | 深色 | 浅色 |
 |---|---|---|
 | 主面板 | ![深色主面板](docs/design-refresh-panel-dark.png) | ![浅色主面板](docs/design-refresh-panel-light.png) |
-| 设置页 | ![深色设置](docs/design-refresh-settings-dark.png) | ![浅色设置](docs/design-refresh-settings-light.png) |
+| 设置页 | ![深色设置](docs/performance-settings-dark.png) | ![浅色设置](docs/performance-settings-light.png) |
 
 以上是 2026-11-20 新设计的 macOS 原生渲染截图（2×，隔离演示数据），两页均为 408×482 逻辑像素。
 英文及滚动状态见 [双主题设计记录](docs/design-refresh-2026-11-20.md)；Windows 任务栏的此前验收保留在 [界面优化记录](docs/ui-polish-2026-11-20.md)。
@@ -210,10 +213,12 @@ macOS 上必须放进 `.app` 包运行，直接跑 `target/debug/tramoing` 会�
 | `TM_WINDOW=1m\|5m\|1h` | 固定初始时间窗口 |
 | `TM_TRACE=1` | 打印采样帧间隔（macOS 还打印状态栏窗口诊断信息） |
 | `TM_TRAY_PNG=/tmp/x.png` | macOS：把状态栏按钮离屏渲染成 PNG（状态项被折叠进 `«` 时唯一可靠的检查手段） |
+| `TM_PERFORMANCE_PNG=/tmp/performance.png` | macOS：配合 `TM_TRACE=1`，保存 CPU / GPU 双行状态项的离屏渲染；需要启用性能显示 |
 | `TM_NETTOP_BIN` | 覆盖 `nettop` 路径 |
 | `TM_DB_PATH` | 覆盖历史库路径 |
 | `TM_DATA_DIR` | 覆盖应用数据目录，隔离历史、设置、日志和实例锁；`TM_DB_PATH` 仍可单独覆盖历史库 |
 | `TM_PANEL_Y` / `TM_SCROLL` | 截图时调整面板位置 / 给列表一个初始滚动位置（仅设置一次，之后连续滚动） |
+| `TM_SETTINGS_SCROLL` | 设置页初始滚动位置；点击性能状态项时回到顶部 |
 | `TM_TRACE_LIST` | 打印列表可用高度、能放几行、整行高度，以及设置页余量（调固定高度时用） |
 | `TM_TOAST="已导出 12 行"` | 启动时先塞一条页脚提示，用来核对提示文案的排版 |
 | `TM_CAPTURE_PPM` / `TM_CAPTURE_AFTER` | debug 演示模式下保存应用渲染截图并退出；必须同时设置 `TM_DATA_DIR`，默认等待 3 秒 |
@@ -779,6 +784,9 @@ macOS 只做到「提示 + 下载」，不自动替换 `.app`：`/Applications` 
 | `retention_days` | 1~365 | `30` | 历史保留天数 |
 | `alert_mb` | 0~1048576 | `0` | 近 10 分钟单应用超阈值提醒，0 关闭 |
 | `tray_color` | `on` / `off` | `on` | 仅 macOS 有效 |
+| `performance_enabled` | `on` / `off` | `off` | macOS：同时启停 CPU / GPU 双行显示及采样 |
+| `performance_color` | `on` / `off` | `on` | macOS：CPU 蓝、GPU 紫；关闭后跟随系统标签色 |
+| `performance_interval` | 1 / 2 / 5 | `2` | macOS：性能采样间隔，单位为秒，非法值使用默认值 |
 | `update_check` | `on` / `off` | `off` | 启动后自动检查新版本；**默认关闭**，手动检查不受影响 |
 | `last_check` | Unix 秒 | `0` | 上次检查时刻，用来保证「一天最多一次」，重启不重置 |
 

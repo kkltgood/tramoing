@@ -46,6 +46,23 @@ pub fn upload(on_dark: bool) -> Rgb {
     }
 }
 
+/// 性能指标和网络方向各有文字标识，配色只辅助扫读。
+pub fn cpu(on_dark: bool) -> Rgb {
+    if on_dark {
+        Rgb(96, 180, 255)
+    } else {
+        Rgb(29, 108, 205)
+    }
+}
+
+pub fn gpu(on_dark: bool) -> Rgb {
+    if on_dark {
+        Rgb(185, 157, 255)
+    } else {
+        Rgb(119, 76, 199)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

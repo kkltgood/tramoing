@@ -10,11 +10,9 @@
 //! 也就是说问题出在那层抽象上，不是系统限制。我们需要的能力其实只有三件事：
 //! 一个图标、一段文字、一个点击回调 —— 直接调 AppKit 更省心。
 
-use std::sync::OnceLock;
-
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{define_class, msg_send, sel, AnyThread, ClassType, MainThreadMarker};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{
     NSAppearanceCustomization, NSBaselineOffsetAttributeName, NSBitmapImageFileType,
     NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSFont, NSFontAttributeName,
@@ -26,18 +24,21 @@ use objc2_foundation::{
     NSDictionary, NSMutableAttributedString, NSNumber, NSObjectProtocol, NSRange, NSSize, NSString,
 };
 
-/// 点击回调。全进程只有一个状态栏项，用全局变量比往 ObjC 对象里塞闭包省事。
-static ON_CLICK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+struct ClickTargetIvars {
+    on_click: Box<dyn Fn() + Send + Sync>,
+}
 
 /// 菜单栏标题里一段文字的语义。
 ///
-/// 这里只表达「这段是下载 / 上传 / 无所谓」，具体颜色由状态栏当时的明暗外观
-/// 决定 —— 浅色菜单栏配深一档的蓝绿，深色菜单栏配亮一档，
+/// 这里只表达下载、上传、CPU、GPU 或普通文字，具体颜色由状态栏当时的明暗外观
+/// 决定 —— 浅色菜单栏配深一档的语义色，深色菜单栏配亮一档，
 /// 否则同一个颜色总有一边看不清。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     Down,
     Up,
+    Cpu,
+    Gpu,
     /// 不区分方向：分隔空格、纯文字模式
     Plain,
 }
@@ -102,6 +103,8 @@ fn tone_color(tone: Tone, dark: bool) -> Retained<NSColor> {
     let rgb = match tone {
         Tone::Down => tm_core::color::download(dark),
         Tone::Up => tm_core::color::upload(dark),
+        Tone::Cpu => tm_core::color::cpu(dark),
+        Tone::Gpu => tm_core::color::gpu(dark),
         Tone::Plain => return NSColor::labelColor(),
     };
     let (r, g, b) = rgb.to_f64();
@@ -111,6 +114,7 @@ fn tone_color(tone: Tone, dark: bool) -> Retained<NSColor> {
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "TMStatusItemTarget"]
+    #[ivars = ClickTargetIvars]
     struct ClickTarget;
 
     unsafe impl NSObjectProtocol for ClickTarget {}
@@ -120,12 +124,20 @@ define_class!(
         /// 少写一个冒号会静默地永远不触发。
         #[unsafe(method(toggle:))]
         fn toggle(&self, _sender: &AnyObject) {
-            if let Some(cb) = ON_CLICK.get() {
-                cb();
-            }
+            (self.ivars().on_click)();
         }
     }
 );
+
+impl ClickTarget {
+    fn new(on_click: impl Fn() + Send + Sync + 'static) -> Retained<Self> {
+        let allocated = Self::alloc().set_ivars(ClickTargetIvars {
+            on_click: Box::new(on_click),
+        });
+        // SAFETY: NSObject 的 init 签名和返回类型匹配，Rust ivars 已初始化。
+        unsafe { msg_send![super(allocated), init] }
+    }
+}
 
 pub struct StatusItem {
     item: Retained<NSStatusItem>,
@@ -137,13 +149,15 @@ pub struct StatusItem {
 impl StatusItem {
     /// 创建状态栏项。`on_click` 在用户点击图标时被调用（主线程）。
     pub fn new(on_click: impl Fn() + Send + Sync + 'static) -> Option<Self> {
-        let _ = ON_CLICK.set(Box::new(on_click));
         let mtm = MainThreadMarker::new()?;
 
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
 
-        let target: Retained<ClickTarget> = unsafe { msg_send![ClickTarget::class(), new] };
-        let button = item.button(mtm)?;
+        let target = ClickTarget::new(on_click);
+        let Some(button) = item.button(mtm) else {
+            NSStatusBar::systemStatusBar().removeStatusItem(&item);
+            return None;
+        };
         // 标题是两行的，必须允许换行、关掉单行模式，
         // 否则 AppKit 会把 "\n" 当成普通字符，两行挤成一行再被裁掉。
         if let Some(cell) = button.cell() {
@@ -209,6 +223,23 @@ impl StatusItem {
     /// 清空文字，只留图标。
     pub fn clear_title(&self) {
         self.apply_parts(&[]);
+    }
+
+    /// CPU 在上、GPU 在下，共用一个状态项及与网速相同的两行字形和固定宽度数值。
+    pub fn set_utilization_lines(&self, cpu: &str, gpu: &str, colored: bool) {
+        self.apply_parts(&[
+            ("CPU ", if colored { Tone::Cpu } else { Tone::Plain }),
+            (cpu, Tone::Plain),
+            ("\n", Tone::Plain),
+            ("GPU ", if colored { Tone::Gpu } else { Tone::Plain }),
+            (gpu, Tone::Plain),
+        ]);
+    }
+
+    pub fn appearance_is_dark(&self) -> bool {
+        MainThreadMarker::new()
+            .and_then(|mtm| self.item.button(mtm))
+            .is_some_and(|button| is_dark(&button))
     }
 
     /// 设置分段着色的标题。传空切片表示只留图标。
@@ -456,6 +487,42 @@ fn make_template_image(rgba: &[u8], width: u32, height: u32) -> Option<Retained<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_status_target_keeps_its_own_callback_and_releases_it() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first = ClickTarget::new({
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let second = ClickTarget::new({
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(10, Ordering::SeqCst);
+            }
+        });
+        let sender = NSObject::new();
+        unsafe {
+            let _: () = msg_send![&first, toggle: &*sender];
+        }
+        unsafe {
+            let _: () = msg_send![&second, toggle: &*sender];
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 11);
+        drop(first);
+        unsafe {
+            let _: () = msg_send![&second, toggle: &*sender];
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 21);
+        drop(second);
+        assert_eq!(Arc::strong_count(&calls), 1);
+    }
 
     /// 只有真跑起来才能拿到 mtm；这里只验证不 panic 的路径。
     #[test]

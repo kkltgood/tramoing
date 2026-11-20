@@ -19,6 +19,8 @@ mod export;
 mod icon;
 mod icons;
 mod instance;
+#[cfg(target_os = "macos")]
+mod performance;
 mod settings;
 mod surface;
 mod theme;
