@@ -1,0 +1,150 @@
+//! Opt-in checks against the real macOS network collector.
+//! Run outside a sandbox with `cargo test -p tm-macos --test native_runtime
+//! -- --ignored --nocapture --test-threads=1`. The proxy check additionally needs
+//! TM_TEST_PROXY and downloads 4 MiB of public test data.
+#![cfg(target_os = "macos")]
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use tm_macos::NettopSampler;
+use tm_sampler::Sampler;
+
+#[test]
+#[ignore = "requires live nettop and local socket access"]
+fn live_loopback_is_excluded_and_nettop_is_reaped() {
+    let mut sampler = NettopSampler::spawn().expect("start nettop");
+    let children = Command::new("/usr/bin/pgrep")
+        .args(["-P", &std::process::id().to_string(), "-x", "nettop"])
+        .output()
+        .expect("find our nettop child");
+    assert!(children.status.success());
+    let child: i32 = String::from_utf8(children.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("exactly one nettop child");
+    sampler.sample().expect("baseline");
+    let app = tm_macos::procname::executable_path(std::process::id()).unwrap();
+
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = TcpListener::bind(address).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let timeout = Some(Duration::from_secs(8));
+        server.set_write_timeout(timeout).unwrap();
+        client.set_read_timeout(timeout).unwrap();
+        let writer = thread::spawn(move || {
+            for _ in 0..128 {
+                server.write_all(&[0x5a; 65536]).unwrap();
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let reader = thread::spawn(move || {
+            let mut data = Vec::new();
+            client.read_to_end(&mut data).unwrap();
+            assert_eq!(data.len(), 8 * 1024 * 1024);
+            assert!(data.iter().all(|&b| b == 0x5a));
+        });
+        let mut intervals = Vec::new();
+        for _ in 0..6 {
+            let started = Instant::now();
+            sampler.sample().expect("live sample");
+            intervals.push(started.elapsed().as_secs_f64());
+        }
+        writer.join().unwrap();
+        reader.join().unwrap();
+        let bytes = sampler.total_bytes(&app);
+        eprintln!("{address}: transferred 8 MiB, accounted {bytes:?}, intervals {intervals:?}");
+        assert_eq!((bytes.rx, bytes.tx), (0, 0));
+        // Allow scheduling jitter while catching pipe-buffered three-second bursts.
+        assert!(intervals.iter().all(|&dt| (0.5..1.8).contains(&dt)));
+    }
+
+    let started = Instant::now();
+    drop(sampler);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // SAFETY: signal 0 only checks whether this known child still exists.
+    assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    eprintln!("nettop {child} reaped in {:?}", started.elapsed());
+}
+
+struct Download(Child);
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+#[ignore = "requires TM_TEST_PROXY and downloads 4 MiB from speed.cloudflare.com"]
+fn live_proxy_download_is_attributed_to_client() {
+    let proxy = std::env::var("TM_TEST_PROXY").expect("set TM_TEST_PROXY to the test HTTP proxy");
+    let mut sampler = NettopSampler::spawn().expect("start nettop");
+    sampler.sample().expect("baseline");
+    let before = sampler.total_bytes("/usr/bin/curl");
+    let mut download = Download(
+        Command::new("/usr/bin/curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--proxy",
+                &proxy,
+                "--noproxy",
+                "",
+                "--max-time",
+                "40",
+                "--limit-rate",
+                "256k",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{size_download}",
+                "https://speed.cloudflare.com/__down?bytes=4194304",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start curl"),
+    );
+    let started = Instant::now();
+    loop {
+        sampler.sample().expect("live sample during download");
+        if let Some(status) = download.0.try_wait().unwrap() {
+            assert!(status.success(), "curl failed: {status}");
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(45));
+    }
+    for _ in 0..2 {
+        sampler.sample().expect("drain final samples");
+    }
+    let mut output = String::new();
+    download
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(output.trim(), "4194304");
+    let after = sampler.total_bytes("/usr/bin/curl");
+    let (rx, tx) = (after.rx - before.rx, after.tx - before.tx);
+    eprintln!("proxy download: payload=4194304, curl rx={rx}, tx={tx}");
+    // nettop samples sockets: a connection closing between frames can lose its tail.
+    assert!(
+        (3_145_728..=4_823_450).contains(&rx),
+        "download attribution: {rx}"
+    );
+    assert!(tx < 104_858, "download incorrectly counted as upload: {tx}");
+}

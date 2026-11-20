@@ -248,9 +248,8 @@ pub struct App {
     started_at: Instant,
     /// `--check-update`：跳过「启动延迟 + 24 小时」两个门槛，立刻查一次。
     force_update_check: bool,
-    /// 列表滚动位置（点）。自己存一份是为了在滚动停下后吸附到整行：
-    /// 触控板松手时偏移量常常停在半行上，视口上下就会各露半截行。
-    list_scroll: f32,
+    /// 调试用初始滚动位置，只设置一次；后续由 ScrollArea 保留连续滚动状态。
+    initial_list_scroll: Option<f32>,
     /// 调试用：启动后立刻把面板摆出来（`--show` / `TM_SHOW_ON_START`）
     show_on_start: bool,
     /// 展开时刻，用于开头那段淡入 + 逐行浮现。
@@ -406,10 +405,10 @@ impl App {
             started_at: Instant::now(),
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
-            list_scroll: std::env::var("TM_SCROLL")
+            initial_list_scroll: std::env::var("TM_SCROLL")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0),
+                .filter(|v: &f32| v.is_finite()),
             show_on_start: std::env::var_os("TM_SHOW_ON_START").is_some(),
             // macOS 靠「前几帧再隐藏」抵消 eframe 的强制显示；Windows 改成摆到屏幕外
             #[cfg(not(windows))]
@@ -1547,7 +1546,7 @@ impl App {
     }
 
     fn list(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, reveal: f32, has_alert: bool) {
-        // 行高、间距及页脚预留统一计算，滚动区只展示整行。
+        // 行高、间距及页脚预留统一计算，视口高度按整行分配，滚动偏移保持连续。
         let reserve = FOOTER_BAND + if has_alert { ALERT_H } else { 0.0 };
         let avail = (ui.available_height() - reserve).max(ROW_H);
         let cap = (((avail + ROW_GAP) / ROW_H).floor() as usize).max(1);
@@ -1611,19 +1610,8 @@ impl App {
                 |ui| empty_note(ui, text, list_h, p),
             );
         } else {
-            // 每帧把「上一帧定下来的位置」写回去。不写回去的话，停止滚动之后
-            // 就没法把半行偏移吸回整行（ScrollArea 只在构造时接受偏移）。
-            let prev = self.list_scroll;
-            let out = egui::ScrollArea::vertical()
-                .id_salt("app-list")
-                .vertical_scroll_offset(prev)
-                .max_height(list_h)
-                // 关掉自动收缩，否则内容少时窗口会再缩一圈
-                .auto_shrink([false, false])
-                // 自带的浮动把手会压在行盒的右描边上（它画在内容矩形之内），
-                // 所以关掉，改用下面自绘的细指示条
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
+            let out =
+                app_list_scroll_area(list_h, self.initial_list_scroll.take()).show(ui, |ui| {
                     // 让出右侧过道：行盒的描边不能和指示条叠在一起
                     ui.set_width(ui.available_width() - SCROLL_GUTTER);
                     // 行距自己控制，不叠加默认 item_spacing。
@@ -1644,11 +1632,8 @@ impl App {
                     }
                 });
 
-            // 滚动停下后吸附到整行。触控板松手时偏移量经常停在 12.3
-            // 这种半行值，视口上下就各露半截行。
             let now = out.state.offset.y;
             let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
-            self.list_scroll = snap_scroll(prev, now, max_off);
 
             // 自绘滚动指示条：3pt 宽，贴在行盒右侧的过道里。
             // 用 egui 自带的浮动把手会压住行盒的描边，在「每行一张小卡」
@@ -1657,8 +1642,7 @@ impl App {
                 let track = out.inner_rect;
                 let frac = (track.height() / out.content_size.y).clamp(0.06, 1.0);
                 let h = (track.height() * frac).max(24.0);
-                let y = track.top()
-                    + (track.height() - h) * (self.list_scroll / max_off).clamp(0.0, 1.0);
+                let y = track.top() + (track.height() - h) * (now / max_off).clamp(0.0, 1.0);
                 let x = ui.max_rect().right() - SCROLL_BAR_W;
                 let color = if p.panel.r() < 128 {
                     Color32::from_rgba_unmultiplied(255, 255, 255, 70)
@@ -2668,18 +2652,19 @@ fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     ));
 }
 
-/// 列表滚动的吸附：停下时把偏移量对齐到整行。
-///
-/// `prev` 是这一帧开始时的偏移，`now` 是结束时的偏移。两者不同说明用户还在
-/// 滚（滚轮或拖把手），原样保留；相同说明已经停下，把半行偏移吸到最近的整行。
-/// 不吸的话触控板松手停在 12.3 这种位置，视口上下会各露半截行。
-fn snap_scroll(prev: f32, now: f32, max: f32) -> f32 {
-    let target = if (now - prev).abs() > 0.01 {
-        now
-    } else {
-        (now / ROW_H).round() * ROW_H
-    };
-    target.clamp(0.0, max.max(0.0))
+/// 不按帧吸附或覆盖偏移：macOS 触控板的小幅事件之间也会有空闲重绘帧。
+/// 把这种空帧当成手势结束，会不断抹掉不足半行的位移，让列表看起来滚不动。
+fn app_list_scroll_area(height: f32, initial_offset: Option<f32>) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical()
+        .id_salt("app-list")
+        .max_height(height)
+        .auto_shrink([false, false])
+        // 右侧过道中的自绘指示条不覆盖行盒描边。
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    match initial_offset {
+        Some(offset) => area.vertical_scroll_offset(offset),
+        None => area,
+    }
 }
 
 /// 列表为空时的一句话，垂直居中放在列表格里。
@@ -3270,25 +3255,95 @@ mod tests {
         }
     }
 
+    fn scroll_frame(
+        ctx: &egui::Context,
+        frame: usize,
+        rows: usize,
+        wheel: Option<(egui::MouseWheelUnit, f32)>,
+    ) -> (f32, f32) {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(320.0, 300.0),
+            )),
+            time: Some(frame as f64 / 60.0),
+            ..Default::default()
+        };
+        input
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(50.0, 50.0)));
+        if let Some((unit, delta)) = wheel {
+            input.events.push(egui::Event::MouseWheel {
+                unit,
+                delta: egui::vec2(0.0, delta),
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let mut result = (0.0, 0.0);
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let out = app_list_scroll_area(156.0, None).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for i in 0..rows {
+                        ui.allocate_exact_size(Vec2::new(260.0, ROW_BOX_H), egui::Sense::hover());
+                        if i + 1 < rows {
+                            ui.add_space(ROW_GAP);
+                        }
+                    }
+                });
+                result = (
+                    out.state.offset.y,
+                    (out.content_size.y - out.inner_rect.height()).max(0.0),
+                );
+            });
+        });
+        result
+    }
+
     #[test]
-    fn scroll_snaps_to_whole_rows_when_idle() {
-        // 用 ROW_H 而不是写死 24：行高一改，这些断言不该跟着失效
-        let step = ROW_H;
-        let max = step * 4.0;
-        // 停在整行：不动
-        assert_eq!(snap_scroll(0.0, 0.0, max), 0.0);
-        assert_eq!(snap_scroll(step, step, max), step);
-        // 停在半行（触控板松手的典型值）：吸到最近的整行
-        assert_eq!(snap_scroll(step * 0.4, step * 0.4, max), 0.0);
-        assert_eq!(snap_scroll(step * 0.6, step * 0.6, max), step);
-        assert_eq!(snap_scroll(step * 1.4, step * 1.4, max), step);
-        // 还在滚：这一帧别抢方向盘
-        assert_eq!(snap_scroll(step * 0.2, step * 0.9, max), step * 0.9);
-        // 吸附值不能越过最大偏移，否则会被 ScrollArea 夹回去，来回抖
-        assert_eq!(snap_scroll(max, max, max), max);
-        assert_eq!(snap_scroll(max * 1.2, max * 1.2, max), max);
-        // 内容比视口短时没有可滚的
-        assert_eq!(snap_scroll(0.0, 0.0, 0.0), 0.0);
+    fn trackpad_scroll_survives_frames_between_small_events() {
+        let ctx = egui::Context::default();
+        for frame in 0..180 {
+            let delta = match frame {
+                2..62 if frame % 3 == 2 => Some(-3.0),
+                92..152 if frame % 3 == 2 => Some(3.0),
+                _ => None,
+            };
+            let (offset, _) = scroll_frame(
+                &ctx,
+                frame,
+                10,
+                delta.map(|d| (egui::MouseWheelUnit::Point, d)),
+            );
+            if (62..92).contains(&frame) {
+                assert!(
+                    (offset - 60.0).abs() < 0.1,
+                    "small trackpad deltas were lost: {offset}"
+                );
+            }
+            if frame >= 152 {
+                assert!(
+                    offset < 0.1,
+                    "reverse scroll did not return to the top: {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_reaches_bottom_and_shorter_list_clamps_offset() {
+        let ctx = egui::Context::default();
+        for frame in 0..90 {
+            let wheel = matches!(frame, 2 | 6 | 10).then_some((egui::MouseWheelUnit::Line, -10.0));
+            let rows = if frame < 61 { 20 } else { 3 };
+            let (offset, max) = scroll_frame(&ctx, frame, rows, wheel);
+            if frame == 60 {
+                assert!(max > 400.0 && (offset - max).abs() < 0.1);
+            }
+            if frame >= 62 {
+                assert_eq!((offset, max), (0.0, 0.0));
+            }
+        }
     }
 
     #[test]

@@ -446,4 +446,94 @@ mod tests {
         let b = open_store(true).unwrap();
         assert!(b.totals_between(0, i64::MAX).unwrap().is_empty());
     }
+
+    /// Run this alone: it temporarily overrides this test process's data directory.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires live nettop; run with --test-threads=1"]
+    fn live_macos_engine_recovers_and_flushes_on_shutdown() {
+        use std::process::Command;
+
+        fn wait_for(engine: &Engine, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(snapshot) = engine.try_recv() {
+                    if predicate(&snapshot) {
+                        return snapshot;
+                    }
+                }
+                assert!(Instant::now() < deadline, "engine snapshot timed out");
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+        fn child_pid() -> String {
+            let output = Command::new("/usr/bin/pgrep")
+                .args(["-P", &std::process::id().to_string(), "-x", "nettop"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let pid = String::from_utf8(output.stdout).unwrap();
+            let pid = pid.trim();
+            assert!(pid.parse::<u32>().is_ok(), "expected one collector");
+            pid.to_owned()
+        }
+        struct RestoreDataDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreDataDir {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(path) => std::env::set_var("TM_DATA_DIR", path),
+                    None => std::env::remove_var("TM_DATA_DIR"),
+                }
+            }
+        }
+
+        assert!(std::env::var_os("TM_FORCE_MOCK").is_none());
+        assert!(std::env::var_os("TM_DB_PATH").is_none());
+        let _restore = RestoreDataDir(std::env::var_os("TM_DATA_DIR"));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tramoing-engine-{stamp}"));
+        std::env::set_var("TM_DATA_DIR", &dir);
+        let engine = spawn(|| {}, Arc::new(AtomicI64::new(30)));
+        let before = wait_for(&engine, |s| s.error.is_none());
+        assert!(!before.mock);
+        let first = child_pid();
+        assert!(Command::new("/bin/kill")
+            .args(["-TERM", &first])
+            .status()
+            .unwrap()
+            .success());
+        let failed = wait_for(&engine, |s| s.error.is_some());
+        assert_eq!((failed.total_rx, failed.total_tx), (0.0, 0.0));
+        let recovered = wait_for(&engine, |s| s.error.is_none());
+        assert!(!recovered.mock);
+        let second = child_pid();
+        assert_ne!(first, second);
+        let settled = Instant::now();
+        let last = wait_for(&engine, |_| settled.elapsed() >= Duration::from_secs(5));
+        let started = Instant::now();
+        drop(engine);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let status = Command::new("/bin/ps")
+            .args(["-p", &second, "-o", "pid="])
+            .output()
+            .unwrap();
+        assert!(
+            !status.status.success(),
+            "collector survived engine shutdown"
+        );
+        let store = Store::open_read_only(&dir.join("history.db")).unwrap();
+        let rows = store.totals_between(0, i64::MAX).unwrap();
+        let totals = rows
+            .iter()
+            .fold((0, 0), |(rx, tx), row| (rx + row.rx, tx + row.tx));
+        assert!(totals.0 >= last.session_rx && totals.1 >= last.session_tx);
+        eprintln!(
+            "collector {first} -> {second}; shutdown {:?}; stored {totals:?}; data {}",
+            started.elapsed(),
+            dir.display()
+        );
+    }
 }

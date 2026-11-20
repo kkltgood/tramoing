@@ -365,6 +365,10 @@ fn clamp(v: u64) -> i64 {
 
 /// 默认数据库位置。
 pub fn default_path() -> PathBuf {
+    // 原生运行验收使用独立目录，同时隔离历史、设置、日志和实例锁。
+    if let Some(dir) = std::env::var_os("TM_DATA_DIR").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir).join("history.db");
+    }
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
