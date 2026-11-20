@@ -16,11 +16,11 @@
 - **技术栈**：纯 Rust + egui / eframe，无 Electron、无 Python、无外部运行时
 - **当前状态**：已完成 macOS 原生测试、双架构构建与 DMG 打包，并修复触控板列表滚动；真实采样、代理归属限制及交互验收边界见 [macOS 验证记录](docs/macos-verification-2026-11-20.md)。此前 Windows 验证见 [修复记录](docs/verification-2026-11-19.md)。
 - **任务栏显示修复**：透明背景和固定箭头列的实现、实机截图与测试见 [2026-11-20 验证记录](docs/taskbar-transparency-2026-11-20.md)。
-- **当前界面**：主面板、设置页与紧凑任务栏的最新运行截图及验收见 [界面优化记录](docs/ui-polish-2026-11-20.md)。
+- **当前界面**：按深浅双主题设计重做主面板和设置页，新增真实流量趋势；截图、验证和运行方式见 [双主题设计记录](docs/design-refresh-2026-11-20.md)。
 - **网速统计修复**：Windows 过滤代理回环转发，按源采样时间计算速率，历史导出改为后台只读任务；本轮测试与安装包见 [统计修复记录](docs/traffic-accounting-fixes-2026-11-20.md)。
 - **代码审查修复**：修复 macOS 归属与资源管理、配置及导出文件写入、损坏历史恢复和更新下载问题；问题清单与验证边界见 [代码审查记录](docs/code-audit-2026-11-20.md)。
 
-![主面板](docs/screenshot-panel.png)
+![主面板](docs/design-refresh-panel-dark.png)
 
 ---
 
@@ -51,8 +51,8 @@
 
 ### 1.2 弹出面板
 
-- 顶部两张速率卡片：下载绿、上传蓝，数值和单位分层显示，等宽卡片内自动约束长数值
-- 应用列表：图标 + 名称 + 下行速率 + 上行速率，方向列标题、定宽数字列；长名称按实际剩余宽度省略，悬停可看全名和路径
+- 顶部两张渐变速率卡片：下载绿、上传蓝，数值和单位分层显示；最近 60 个成功采样点绘制趋势曲线，两个方向各自缩放，面板收起时继续采样
+- 应用列表：图标 + 名称 + 下行速率 + 上行速率，方向列标题、定宽数字列；长名称按实际剩余宽度省略，悬停或点击行尾箭头可看完整名称、路径及所选时间窗口的速率
 - 列表最多列出 10 个应用（设置里可改 5 / 10 / 20），超过可视整行数时滚动查看
 - 时间窗口四档：`实时` / `1分钟` / `5分钟` / `1小时`，决定列表按哪段时间聚合排序
 - 标题栏显示最近 24 小时（或本次运行）累计流量
@@ -73,15 +73,13 @@
 
 ### 1.4 界面截图
 
-| 状态 | 截图 |
-|---|---|
-| 数据面板 | ![面板](docs/screenshot-panel.png) |
-| 设置页 | ![设置](docs/screenshot-settings.png) |
-| 浅色英文面板 | ![浅色面板](docs/screenshot-panel-light.png) |
-| 浅色英文设置 | ![浅色设置](docs/screenshot-settings-light.png) |
-| Windows 原生任务栏网速（150% DPI，演示流量） | ![任务栏](docs/screenshot-transparent-taskbar.png) |
+| 页面 | 深色 | 浅色 |
+|---|---|---|
+| 主面板 | ![深色主面板](docs/design-refresh-panel-dark.png) | ![浅色主面板](docs/design-refresh-panel-light.png) |
+| 设置页 | ![深色设置](docs/design-refresh-settings-dark.png) | ![浅色设置](docs/design-refresh-settings-light.png) |
 
-以上截图来自 2026-11-20 当前 Windows release 程序（150% DPI，隔离演示模式），不是历史版本图片。第 6 节的旧修复条目保留为实现历史，当前界面以本节和[界面优化记录](docs/ui-polish-2026-11-20.md)为准。
+以上是 2026-11-20 新设计的 macOS 原生渲染截图（2×，隔离演示数据），两页均为 408×482 逻辑像素。
+英文及滚动状态见 [双主题设计记录](docs/design-refresh-2026-11-20.md)；Windows 任务栏的此前验收保留在 [界面优化记录](docs/ui-polish-2026-11-20.md)。
 
 ---
 
@@ -218,6 +216,7 @@ macOS 上必须放进 `.app` 包运行，直接跑 `target/debug/tramoing` 会�
 | `TM_PANEL_Y` / `TM_SCROLL` | 截图时调整面板位置 / 给列表一个初始滚动位置（仅设置一次，之后连续滚动） |
 | `TM_TRACE_LIST` | 打印列表可用高度、能放几行、整行高度，以及设置页余量（调固定高度时用） |
 | `TM_TOAST="已导出 12 行"` | 启动时先塞一条页脚提示，用来核对提示文案的排版 |
+| `TM_CAPTURE_PPM` / `TM_CAPTURE_AFTER` | debug 演示模式下保存应用渲染截图并退出；必须同时设置 `TM_DATA_DIR`，默认等待 3 秒 |
 
 ---
 

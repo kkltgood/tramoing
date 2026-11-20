@@ -25,9 +25,10 @@ use crate::icons::{self, IconSet};
 #[cfg(target_os = "macos")]
 use crate::settings::TrayMode;
 use crate::settings::{LangMode, Settings, ThemeMode};
+use crate::surface;
 use crate::theme::{self, Lang, Palette};
 
-pub const WINDOW_W: f32 = 352.0;
+pub const WINDOW_W: f32 = 408.0;
 /// 面板高度，**固定值**。
 ///
 /// 以前高度是逐帧量内容算出来的，结果：切到设置页会缩一截、应用数一变窗口就抽动。
@@ -35,7 +36,8 @@ pub const WINDOW_W: f32 = 352.0;
 /// 设置页底部留白，切页/换数据时窗口一动不动。
 ///
 /// 两页使用相同尺寸，列表按剩余高度显示整行，设置页固定底部开关区。
-pub const PANEL_H: f32 = 411.0;
+pub const PANEL_H: f32 = 482.0;
+const PANEL_PADDING: i8 = 16;
 
 /// 「收起」时窗口停靠的位置（逻辑点）。
 ///
@@ -52,11 +54,11 @@ const PARKED_Y: f32 = -32000.0;
 /// 这里**只含页脚**：提醒行是可选的（真的超阈值才有），提示则画在页脚里。
 /// 以前把 22+18 两段也预留在下面，于是没有提醒时列表底下永远空着 40pt，
 /// 看着像滚动区没铺满——现在列表一路铺到页脚线。
-const FOOTER_H: f32 = 26.0;
+const FOOTER_H: f32 = 28.0;
 /// 页脚带 = 空隙 + 分隔线 + 空隙 + 页脚
-const FOOTER_BAND: f32 = 8.0 + 1.0 + 4.0 + FOOTER_H;
+const FOOTER_BAND: f32 = 8.0 + 1.0 + 7.0 + FOOTER_H;
 /// 近 10 分钟超量提醒行的高度（只在真的有提醒时占位）
-const ALERT_H: f32 = 24.0;
+const ALERT_H: f32 = 20.0;
 /// 设置页里的临时提示行高度
 const TOAST_H: f32 = 18.0;
 /// 启动后多久才去查更新。
@@ -70,26 +72,26 @@ const UPDATE_INTERVAL_SECS: i64 = 86_400;
 
 /// 每一行的「盒子」高度（含 1px 描边）。
 ///
-/// 18pt 图标上下各留 5pt，文字和图标在同一条中线上。
-const ROW_BOX_H: f32 = 28.0;
+/// 23pt 图标与文字共用中线，上下留出稳定的呼吸空间。
+const ROW_BOX_H: f32 = 36.0;
 /// 行与行之间的外边距。盒子本身有描边，间距不能太小，否则像一条表格。
-const ROW_GAP: f32 = 4.0;
+const ROW_GAP: f32 = 5.0;
 /// 列表里每一行占的高度 = 盒子 + 外边距
 const ROW_H: f32 = ROW_BOX_H + ROW_GAP;
-/// 行盒的圆角。比面板的 14 小一档，形成「面板 ⊃ 行」的层级
-const ROW_RADIUS: u8 = 7;
+/// 行盒的圆角比面板小一档。
+const ROW_RADIUS: u8 = 10;
 /// 行盒左右内边距：让内容离描边有一个稳定的距离
 const ROW_PAD_X: f32 = 8.0;
 /// 行内「下行速率」列的固定宽度。数字列必须是定宽的：不定宽时一行显示
 /// `0`、另一行显示 `1.2 MB/s`，整列数字会左右跳，扫一眼对不齐。
-const NUM_W_RX: f32 = 74.0;
-/// 行内「上行速率」列的固定宽度（字小一档，所以窄一些）
-const NUM_W_TX: f32 = 62.0;
+const NUM_W_RX: f32 = 76.0;
+/// 上行与下行采用相同的数值、单位宽度。
+const NUM_W_TX: f32 = 76.0;
 /// 单位（`KB/s`、`MB/s`）占的固定宽度。
 ///
 /// 必须定宽：单位宽度随 K/M 变化，若让数值贴着自己的单位右对齐，各行的
 /// 数字就会差一两像素，竖着扫时小数点对不齐。
-const NUM_UNIT_W: f32 = 23.0;
+const NUM_UNIT_W: f32 = 25.0;
 /// 两个数字列之间的空隙
 const NUM_GAP: f32 = 6.0;
 /// 右侧给滚动指示条留的过道。行盒不占这一条，指示条才不会压在描边上。
@@ -100,11 +102,11 @@ const SCROLL_BAR_W: f32 = 3.0;
 #[cfg(test)]
 const NAME_UNITS: usize = 22;
 /// 顶部两张速率卡片的间隔。
-const METRIC_GAP: f32 = 8.0;
+const METRIC_GAP: f32 = 10.0;
 /// 时间窗口分段控件的宽度。四档等宽，"1分钟" 也放得下。
-const SEG_W: f32 = 196.0;
+const SEG_W: f32 = 218.0;
 /// 分段控件高度
-const SEG_H: f32 = 24.0;
+const SEG_H: f32 = 28.0;
 /// 失焦后多久才真正收起。托盘点击会先让窗口失焦再派发点击事件，
 /// 没有这个去抖就会「刚打开又立刻关上」。
 const HIDE_DEBOUNCE: Duration = Duration::from_millis(320);
@@ -116,7 +118,7 @@ const TOAST_TTL: Duration = Duration::from_secs(6);
 /// 底板由 [`App::draw`] 自己画，**不用 `egui::Frame`**：`Frame` 的背景矩形是
 /// 跟着内容的 `min_rect` 走的，内容只要比可视区高出一点点，整块底板就被顶到
 /// 窗口外面，底部圆角被裁掉 —— 表现就是「设置页的底部圆角比主面板小/像直角」。
-const PANEL_RADIUS: u8 = 14;
+const PANEL_RADIUS: u8 = 16;
 
 /// 主面板 ↔ 设置页的切换时长。
 ///
@@ -126,7 +128,7 @@ const VIEW_ANIM: Duration = Duration::from_millis(190);
 
 /// 切页时两页横向错开的距离（点）。
 ///
-/// 不按整页宽推：352pt 的面板整页平移显得很笨重，一小段位移配淡入淡出
+/// 不按整页宽推：一小段位移配淡入淡出
 /// 就够读出「换了一页」，也和这个弹窗的体量相称。
 const VIEW_SLIDE: f32 = 64.0;
 
@@ -252,6 +254,8 @@ pub struct App {
     initial_list_scroll: Option<f32>,
     /// 调试用：启动后立刻把面板摆出来（`--show` / `TM_SHOW_ON_START`）
     show_on_start: bool,
+    /// 显式 --show 用于预览，启动标记被消费后仍保持展开。
+    keep_open_on_blur: bool,
     /// 展开时刻，用于开头那段淡入 + 逐行浮现。
     ///
     /// 为什么不用 `Context::animate_bool_with_time`：那个按归一化进度推进，
@@ -410,6 +414,7 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f32| v.is_finite()),
             show_on_start: std::env::var_os("TM_SHOW_ON_START").is_some(),
+            keep_open_on_blur: std::env::var_os("TM_SHOW_ON_START").is_some(),
             // macOS 靠「前几帧再隐藏」抵消 eframe 的强制显示；Windows 改成摆到屏幕外
             #[cfg(not(windows))]
             startup_hide: 3,
@@ -647,6 +652,7 @@ impl App {
                 let snapshot = self.latest.get_or_insert_with(Snapshot::default);
                 snapshot.total_rx = 0.0;
                 snapshot.total_tx = 0.0;
+                snapshot.trend.clear();
                 snapshot.rates.clear();
                 snapshot.windowed = Default::default();
                 snapshot.error = Some(
@@ -953,7 +959,7 @@ impl eframe::App for App {
             } else if self.had_focus
                 // `--show` 是给调试/截图用的：那种情况下窗口本来就不是用户点开的，
                 // 一失焦就收起会导致「刚起来就没了」，根本没法核对界面。
-                && !self.show_on_start
+                && !self.keep_open_on_blur
                 && self.shown_at.elapsed() > HIDE_DEBOUNCE
             {
                 self.close(ctx);
@@ -962,6 +968,8 @@ impl eframe::App for App {
         }
 
         self.draw(ctx);
+        #[cfg(debug_assertions)]
+        crate::ui_capture::capture(ctx, self.started_at);
 
         // 展开动画（约 0.3s）和切页动画期间要连续重绘，之后回到 1s 心跳
         if self.reveal_secs() < 0.4 || self.transitioning() {
@@ -998,18 +1006,13 @@ impl App {
         // 窗口外被裁掉，看起来就是「设置页底部圆角比主面板小一档」。
         // 钉在窗口矩形上画，圆角就永远是圆的。
         let panel = ctx.content_rect();
-        ctx.layer_painter(egui::LayerId::background()).rect(
-            panel,
-            CornerRadius::same(PANEL_RADIUS),
-            // 面板本身也要参与淡入，否则会出现「背景先出现、内容后浮现」
-            palette.panel.gamma_multiply(alpha),
-            Stroke::new(0.5, palette.border.gamma_multiply(alpha)),
-            egui::StrokeKind::Inside,
-        );
+        let mut background = ctx.layer_painter(egui::LayerId::background());
+        background.set_opacity(alpha);
+        surface::panel(&background, panel, PANEL_RADIUS, &palette);
 
         // 只留内边距，不再让 Frame 画任何东西
-        let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(14));
-        let inner = panel.shrink(14.0);
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PANEL_PADDING));
+        let inner = panel.shrink(PANEL_PADDING as f32);
 
         egui::CentralPanel::default()
             .frame(frame)
@@ -1090,7 +1093,7 @@ impl App {
         let mut page = ui.new_child(egui::UiBuilder::new().id_salt(salt).max_rect(rect));
         page.set_clip_rect(inner);
         page.set_opacity(opacity);
-        page.set_width(WINDOW_W - 28.0);
+        page.set_width(WINDOW_W - 2.0 * PANEL_PADDING as f32);
         // 两页的纵向间距显式分配，避免字体高度与默认 item_spacing 叠加溢出。
         page.spacing_mut().item_spacing.y = 0.0;
         match view {
@@ -1143,15 +1146,15 @@ impl App {
         let reveal = self.reveal_secs();
 
         self.header(ui, p, lang);
-        ui.add_space(8.0);
-        self.totals(ui, p, lang);
         ui.add_space(12.0);
+        self.totals(ui, p, lang);
+        ui.add_space(18.0);
 
         // 时间窗口紧贴列表：它只决定列表按哪段时间排序，控件离内容越近越好。
         self.list_header(ui, p, lang);
-        ui.add_space(4.0);
+        ui.add_space(10.0);
         self.list_columns(ui, p, lang);
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         // 提醒行有没有内容要在排版前就知道：它占一行高度，列表得先让出来。
         // 以前是无条件预留 22pt，结果没提醒时列表底下永远空一截。
         let alert = self.alert_text(lang);
@@ -1173,8 +1176,8 @@ impl App {
 
         let bounds = ui.max_rect();
         let (header, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::hover());
-        let back_rect = egui::Rect::from_min_size(header.min, Vec2::splat(28.0));
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::hover());
+        let back_rect = egui::Rect::from_min_size(header.min, Vec2::splat(30.0));
         if icon_button(ui, back_rect, "settings-back", p, paint_back_icon)
             .on_hover_text(lang.t("返回", "Back"))
             .clicked()
@@ -1182,10 +1185,10 @@ impl App {
             self.goto(View::Main);
         }
         ui.painter().text(
-            egui::pos2(header.left() + 36.0, header.center().y),
+            egui::pos2(header.left() + 40.0, header.center().y),
             egui::Align2::LEFT_CENTER,
             lang.t("设置", "Settings"),
-            egui::FontId::proportional(15.0),
+            theme::display_font(17.0),
             p.text,
         );
         let version_rect =
@@ -1197,9 +1200,15 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text(lang.t("检查更新", "Check for updates"));
+        ui.painter()
+            .rect_filled(version_rect.shrink2(egui::vec2(0.0, 3.0)), 12.0, p.chip);
+        surface::focus(ui.painter(), version_rect, &version, p);
+        if version.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         ui.painter().text(
-            version_rect.right_center(),
-            egui::Align2::RIGHT_CENTER,
+            version_rect.center(),
+            egui::Align2::CENTER_CENTER,
             format!("v{}", crate::update::CURRENT),
             egui::FontId::proportional(10.5),
             if version.hovered() { p.accent } else { p.unit },
@@ -1207,7 +1216,7 @@ impl App {
         if version.clicked() {
             self.update.check();
         }
-        ui.add_space(8.0);
+        ui.add_space(12.0);
 
         settings_group(ui, p, lang.t("显示", "Display"), |ui| {
             // ---- 菜单栏（只有 macOS 有这回事）----
@@ -1308,7 +1317,7 @@ impl App {
                 changed = true;
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(12.0);
         settings_group(ui, p, lang.t("统计", "Statistics"), |ui| {
             // ---- 列表条数 ----
             // 面板高度固定，所以这一项不再管「窗口多高」，而是「最多列几个应用」：
@@ -1356,7 +1365,7 @@ impl App {
         });
 
         // 提示与开关区分别固定在底部，设置行不会因状态文案出现而移动。
-        let line_y = bounds.bottom() - 38.0;
+        let line_y = bounds.bottom() - 42.0;
         let toast_rect = egui::Rect::from_min_size(
             egui::pos2(bounds.left() + 2.0, line_y - TOAST_H - 7.0),
             Vec2::new(bounds.width() - 4.0, TOAST_H),
@@ -1433,10 +1442,13 @@ impl App {
         };
         let mut open_settings = false;
         ui.horizontal(|ui| {
-            ui.set_height(28.0);
+            ui.set_height(30.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (mark, _) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::hover());
+            surface::network_mark(ui.painter(), mark, p);
             ui.label(
                 RichText::new(lang.t("网络流量", "Network"))
-                    .size(15.0)
+                    .font(theme::display_font(17.0))
                     .color(p.text),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1457,7 +1469,7 @@ impl App {
                             },
                             format_bytes(rx.saturating_add(tx))
                         ))
-                        .size(11.0)
+                        .size(12.0)
                         .color(p.subtext),
                     );
                 }
@@ -1480,7 +1492,14 @@ impl App {
             ),
         };
 
-        const H: f32 = 64.0;
+        const H: f32 = 102.0;
+        let trend = self
+            .latest
+            .as_ref()
+            .map(|s| s.trend.as_slice())
+            .unwrap_or(&[]);
+        let rx_trend: Vec<_> = trend.iter().map(|v| v[0]).collect();
+        let tx_trend: Vec<_> = trend.iter().map(|v| v[1]).collect();
         let col = ((ui.available_width() - METRIC_GAP) / 2.0).max(60.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1489,15 +1508,34 @@ impl App {
                 col,
                 H,
                 "↓",
-                lang.t("下载", "Down"),
+                lang.t("下载", "Download"),
                 rx_text,
+                &rx_trend,
                 p.download,
                 p,
-            );
+            )
+            .on_hover_text(lang.t(
+                "最近的下载趋势 · 独立刻度",
+                "Recent download activity · independent scale",
+            ));
 
             ui.add_space(METRIC_GAP);
 
-            metric(ui, col, H, "↑", lang.t("上传", "Up"), tx_text, p.upload, p);
+            metric(
+                ui,
+                col,
+                H,
+                "↑",
+                lang.t("上传", "Upload"),
+                tx_text,
+                &tx_trend,
+                p.upload,
+                p,
+            )
+            .on_hover_text(lang.t(
+                "最近的上传趋势 · 独立刻度",
+                "Recent upload activity · independent scale",
+            ));
         });
     }
 
@@ -1515,13 +1553,10 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(lang.t("应用", "Apps"))
-                    .size(11.0)
-                    .color(p.subtext),
+                RichText::new(format!("{} · {count}", lang.t("应用", "Apps")))
+                    .font(theme::display_font(14.0))
+                    .color(p.text),
             );
-            if count > 0 {
-                ui.label(RichText::new(format!("· {count}")).size(11.0).color(p.unit));
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(Vec2::new(SEG_W, SEG_H), egui::Sense::hover());
@@ -1532,8 +1567,8 @@ impl App {
 
     fn list_columns(&self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
         let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), egui::Sense::hover());
-        let tx_right = rect.right() - SCROLL_GUTTER - ROW_PAD_X - 1.0;
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
+        let tx_right = rect.right() - SCROLL_GUTTER - ROW_PAD_X - 18.0;
         let rx_right = tx_right - NUM_W_TX - NUM_GAP;
         for (x, label, align) in [
             (
@@ -1556,7 +1591,7 @@ impl App {
                 egui::pos2(x, rect.center().y),
                 align,
                 label,
-                egui::FontId::proportional(9.5),
+                egui::FontId::proportional(11.5),
                 p.unit,
             );
         }
@@ -1717,18 +1752,21 @@ impl App {
             // 图标位：和真实行的 18pt 方块对齐
             painter.rect_filled(
                 egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - 9.0),
-                    Vec2::splat(18.0),
+                    egui::pos2(
+                        rect.left() + ROW_PAD_X,
+                        rect.center().y - icons::ICON_PT / 2.0,
+                    ),
+                    Vec2::splat(icons::ICON_PT),
                 ),
                 CornerRadius::same(6),
                 color,
             );
             let right = rect.right() - ROW_PAD_X;
-            let tx_x = right - 1.0 - NUM_W_TX;
+            let tx_x = right - 18.0 - NUM_W_TX;
             let rx_x = tx_x - NUM_GAP - NUM_W_RX;
             // 名字长度按行号错开（走一个固定序列，不是随机），
             // 否则每帧变一次，骨架会自己抖
-            let name_left = rect.left() + ROW_PAD_X + 25.0;
+            let name_left = rect.left() + ROW_PAD_X + icons::ICON_PT + 9.0;
             let name_max = (rx_x - 8.0 - name_left).max(24.0);
             let name_w = (name_max * (0.45 + ((i * 37) % 13) as f32 / 40.0)).min(name_max);
             painter.rect_filled(bar(name_left, name_w), CornerRadius::same(3), color);
@@ -1767,11 +1805,16 @@ impl App {
         } else {
             self.icons.get(r.app.as_str())
         };
-        let dark = p.panel.r() < 128;
+        let dark = p.dark;
 
         let width = ui.available_width();
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(width, ROW_BOX_H), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_BOX_H), egui::Sense::hover());
+        // 排名会变化，点击状态与应用键绑定，不能用行号作 ID。
+        let resp = ui.interact(
+            rect,
+            ui.id().with(("app-details", r.app.as_str())),
+            egui::Sense::click(),
+        );
 
         // 悬停：底色抬一档 + 描边转向强调色，120ms 过渡。
         //
@@ -1786,8 +1829,8 @@ impl App {
         painter.rect(
             rect,
             CornerRadius::same(ROW_RADIUS),
-            mix(p.surface, p.selection, t * 0.5),
-            Stroke::new(0.5, mix(p.border, p.accent, t * 0.35)),
+            mix(p.surface, p.accent, t * 0.08),
+            Stroke::new(0.7, mix(p.border, p.accent, t * 0.5)),
             egui::StrokeKind::Inside,
         );
 
@@ -1820,23 +1863,35 @@ impl App {
         }
 
         // 两列速率的右边界：先定数字，名字再去吃剩下的宽度
-        let tx_right = right - 1.0;
+        let tx_right = right - 18.0;
         let rx_right = tx_right - NUM_W_TX - NUM_GAP;
-        let name_left = icon.right() + 7.0;
+        let name_left = icon.right() + 9.0;
 
         let name_rect = egui::Rect::from_min_max(
             egui::pos2(name_left, rect.top()),
             egui::pos2(rx_right - NUM_W_RX - 5.0, rect.bottom()),
         );
-        ellipsis_text(painter, name_rect, &name, 11.5, p.text, Align::Min);
-        resp.on_hover_text(format!("{}\n{}", name, tildify(r.app.as_str())));
+        ellipsis_text(painter, name_rect, &name, 13.0, p.text, Align::Min);
+        let arrow_center = egui::pos2(right - 3.0, rect.center().y);
+        painter.add(egui::Shape::line(
+            vec![
+                arrow_center + egui::vec2(-2.0, -4.0),
+                arrow_center + egui::vec2(2.0, 0.0),
+                arrow_center + egui::vec2(-2.0, 4.0),
+            ],
+            Stroke::new(1.2, p.unit),
+        ));
+        surface::focus(painter, rect, &resp, p);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
 
         rate_cell(
             painter,
             rx_right,
             rect.center().y,
             r.rx_bps,
-            11.5,
+            14.0,
             p.download,
             p.unit,
         );
@@ -1845,10 +1900,46 @@ impl App {
             tx_right,
             rect.center().y,
             r.tx_bps,
-            11.0,
+            14.0,
             p.upload,
             p.unit,
         );
+        let resp = resp.on_hover_text(format!("{}\n{}", name, tildify(r.app.as_str())));
+        egui::Popup::from_toggle_button_response(&resp)
+            .width(280.0)
+            .frame(
+                egui::Frame::popup(ui.style())
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(12)
+                    .inner_margin(12),
+            )
+            .show(|ui| {
+                ui.label(
+                    RichText::new(&name)
+                        .font(theme::display_font(14.0))
+                        .color(p.text),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(tildify(r.app.as_str()))
+                            .size(11.0)
+                            .color(p.subtext),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("↓ {}", format_speed(r.rx_bps))).color(p.download),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(format!("↑ {}", format_speed(r.tx_bps))).color(p.upload),
+                    );
+                });
+            });
     }
 
     /// 近 10 分钟单应用超过阈值时给一行提醒。阈值没配就什么都不画。
@@ -1961,13 +2052,13 @@ impl App {
         );
 
         // 图标那一行：分隔线下面空 4pt 起，到面板底边为止
-        let row = egui::Rect::from_min_max(egui::pos2(band.left(), line_y + 1.0 + 4.0), band.max);
+        let row = egui::Rect::from_min_max(egui::pos2(band.left(), line_y + 1.0 + 7.0), band.max);
         let cy = row.center().y;
 
         let export_width = if self.export_job.is_some() {
-            88.0
+            106.0
         } else {
-            76.0
+            96.0
         };
         let export_rect = egui::Rect::from_min_size(row.min, Vec2::new(export_width, row.height()));
         let export = action_button(
@@ -1992,7 +2083,7 @@ impl App {
         // 更新优先——用户点「检查更新」就是为了看结果，被一条三秒前的
         // 「已导出 12 行」盖住，会像是点了没反应。
         let left = export_rect.right() + 8.0;
-        let right = row.right() - 56.0 - 8.0;
+        let right = row.right() - 64.0 - 8.0;
         if !self.update_strip(ui, p, lang, left, right, cy) {
             if let Some(msg) = &toast {
                 if right - left > 40.0 {
@@ -2012,8 +2103,8 @@ impl App {
         }
 
         let quit_rect = egui::Rect::from_min_size(
-            egui::pos2(row.right() - 56.0, row.top()),
-            Vec2::new(56.0, row.height()),
+            egui::pos2(row.right() - 64.0, row.top()),
+            Vec2::new(64.0, row.height()),
         );
         let quit = action_button(
             ui,
@@ -2326,23 +2417,31 @@ fn ellipsis_text(
 
 fn settings_group(ui: &mut egui::Ui, p: &Palette, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     let (label, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), egui::Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(
+            label.left_center() + egui::vec2(3.0, 0.0),
+            Vec2::new(3.0, 10.0),
+        ),
+        1.5,
+        p.accent,
+    );
     ui.painter().text(
-        label.left_center() + egui::vec2(2.0, 0.0),
+        label.left_center() + egui::vec2(12.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::proportional(10.0),
+        theme::display_font(12.0),
         p.subtext,
     );
     ui.add_space(4.0);
     let width = ui.available_width();
     egui::Frame::NONE
         .fill(p.surface)
-        .stroke(Stroke::new(0.5, p.border))
-        .corner_radius(CornerRadius::same(9))
-        .inner_margin(egui::Margin::symmetric(8, 6))
+        .stroke(Stroke::new(0.7, p.border))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.set_width(width - 17.0);
+            ui.set_width(width - 21.4);
             ui.spacing_mut().item_spacing.y = 0.0;
             body(ui);
         });
@@ -2356,13 +2455,13 @@ fn option_row<T: Copy + PartialEq>(
     current: &mut T,
     options: &[(T, &str)],
 ) -> bool {
-    const ROW_H: f32 = 30.0;
+    const ROW_H: f32 = 34.0;
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_H), egui::Sense::hover());
     let painter = ui.painter();
 
     // 各组选项共用起点；两档、三档、四档都在同一列内均分。
-    let ctl_w = 190.0_f32.min(rect.width() * 0.65);
+    let ctl_w = 218.0_f32.min(rect.width() * 0.65);
     let ctl = egui::Rect::from_min_max(
         egui::pos2(rect.right() - ctl_w, rect.top() + 3.0),
         egui::pos2(rect.right(), rect.bottom() - 3.0),
@@ -2371,14 +2470,14 @@ fn option_row<T: Copy + PartialEq>(
         rect.min + egui::vec2(2.0, 0.0),
         egui::pos2(ctl.left() - 6.0, rect.bottom()),
     );
-    ellipsis_text(painter, label_rect, label, 11.5, p.text, Align::Min);
+    ellipsis_text(painter, label_rect, label, 12.0, p.text, Align::Min);
     ui.interact(
         label_rect,
         ui.id().with(("setting-label", label)),
         egui::Sense::hover(),
     )
     .on_hover_text(label);
-    painter.rect_filled(ctl, CornerRadius::same(6), p.chip);
+    painter.rect_filled(ctl, CornerRadius::same(14), p.chip);
 
     let item_w = ctl.width() / options.len() as f32;
 
@@ -2393,8 +2492,7 @@ fn option_row<T: Copy + PartialEq>(
             egui::pos2(ctl.left() + pos * item_w, ctl.top()),
             Vec2::new(item_w, ctl.height()),
         );
-        ui.painter()
-            .rect_filled(pill.shrink(2.0), CornerRadius::same(5), p.selection);
+        surface::pill(ui.painter(), pill.shrink(2.0), p);
     }
 
     let mut changed = false;
@@ -2410,8 +2508,8 @@ fn option_row<T: Copy + PartialEq>(
             if !selected {
                 ui.painter().rect_filled(
                     r.shrink(2.0),
-                    CornerRadius::same(5),
-                    p.selection.gamma_multiply(0.4),
+                    CornerRadius::same(12),
+                    p.accent.gamma_multiply(0.10),
                 );
             }
         }
@@ -2421,10 +2519,11 @@ fn option_row<T: Copy + PartialEq>(
             r.shrink2(egui::vec2(3.0, 0.0)),
             text,
             10.5,
-            if selected { p.accent } else { p.subtext },
+            if selected { p.on_selection } else { p.subtext },
             Align::Center,
         );
 
+        surface::focus(ui.painter(), r, &resp, p);
         if resp.clicked() && !selected {
             *current = *value;
             changed = true;
@@ -2452,21 +2551,29 @@ fn toggle_row_at(
         egui::pos2(rect.left() + 2.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(11.5),
+        egui::FontId::proportional(13.0),
         p.text,
     );
 
     let track = egui::Rect::from_center_size(
-        egui::pos2(rect.right() - 16.0, rect.center().y),
-        Vec2::new(30.0, 18.0),
+        egui::pos2(rect.right() - 19.0, rect.center().y),
+        Vec2::new(36.0, 21.0),
     );
     // 0..1 的缓动值：轨道颜色和旋钮位置一起插值，开关才有「按下去」的手感
     let t = ui
         .ctx()
         .animate_bool_with_time(ui.id().with(("toggle-anim", label)), *on, 0.15);
-    painter.rect_filled(track, CornerRadius::same(9), mix(p.switch_off, p.accent, t));
-    let knob_x = track.left() + 9.0 + (track.width() - 18.0) * t.clamp(0.0, 1.0);
-    painter.circle_filled(egui::pos2(knob_x, track.center().y), 7.0, Color32::WHITE);
+    painter.rect_filled(
+        track,
+        CornerRadius::same(11),
+        mix(p.switch_off, p.selection, t),
+    );
+    let knob_x = track.left() + 10.5 + (track.width() - 21.0) * t.clamp(0.0, 1.0);
+    painter.circle_filled(egui::pos2(knob_x, track.center().y), 8.0, Color32::WHITE);
+    surface::focus(painter, rect, &resp, p);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
 
     if resp.clicked() {
         *on = !*on;
@@ -2481,28 +2588,31 @@ fn toggle_row_at(
 /// 点击区比图形大一圈（16pt 的画，28×28pt 的判定）：100% 缩放下图标只有
 /// 16 个像素，面板里又只有这一个入口，点空一个像素就等于「设置点不动」。
 fn sliders_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
-    let (hit, _) = ui.allocate_exact_size(Vec2::splat(28.0), egui::Sense::hover());
+    let (hit, _) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
     let rect = hit.shrink(6.0);
     let resp = ui.interact(hit, ui.id().with("settings-entry"), egui::Sense::click());
     let hovered = resp.hovered();
-    let color = if hovered { p.text } else { p.subtext };
+    let color = if p.dark { p.subtext } else { p.accent };
 
     let painter = ui.painter();
+    painter.rect_filled(hit, 11.0, p.chip);
     if hovered {
         // 悬停给一块底，先让人看出「这是能点的」，再谈点不点得中
-        painter.rect_filled(hit, CornerRadius::same(6), p.selection);
+        painter.rect_filled(hit, CornerRadius::same(11), p.accent.gamma_multiply(0.12));
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     for i in 0..3 {
         let y = rect.top() + 3.0 + i as f32 * 5.0;
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            Stroke::new(1.0, color),
+            Stroke::new(1.4, color),
         );
         // 滑块位置左右错开，看着像个均衡器而不是"汉堡菜单"
         let kx = rect.left() + 4.0 + ((i + 1) % 3) as f32 * 3.5;
-        painter.circle_filled(egui::pos2(kx, y), 1.8, color);
+        painter.circle_filled(egui::pos2(kx, y), 2.1, p.chip);
+        painter.circle_stroke(egui::pos2(kx, y), 2.1, Stroke::new(1.2, color));
     }
+    surface::focus(painter, hit, &resp, p);
     resp
 }
 
@@ -2574,12 +2684,14 @@ fn icon_button(
     paint: fn(&egui::Painter, egui::Rect, Color32),
 ) -> egui::Response {
     let resp = ui.interact(rect, ui.id().with(id), egui::Sense::click());
-    let color = if resp.hovered() { p.text } else { p.subtext };
+    let color = if p.dark { p.subtext } else { p.accent };
+    ui.painter().rect_filled(rect, 10.0, p.chip);
     if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), p.selection);
+            .rect_filled(rect, CornerRadius::same(10), p.accent.gamma_multiply(0.12));
     }
     paint(ui.painter(), rect, color);
+    surface::focus(ui.painter(), rect, &resp, p);
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -2595,24 +2707,25 @@ fn action_button(
     paint: fn(&egui::Painter, egui::Rect, Color32),
 ) -> egui::Response {
     let resp = ui.interact(rect, ui.id().with(id), egui::Sense::click());
-    let color = if resp.hovered() { p.text } else { p.subtext };
+    let color = if p.dark { p.subtext } else { p.accent };
     if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), p.selection);
+            .rect_filled(rect, CornerRadius::same(8), p.accent.gamma_multiply(0.10));
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let icon = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 11.0, rect.center().y),
-        Vec2::splat(20.0),
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        Vec2::splat(24.0),
     );
     paint(ui.painter(), icon, color);
     ui.painter().text(
-        egui::pos2(rect.left() + 25.0, rect.center().y),
+        egui::pos2(rect.left() + 29.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(10.5),
+        egui::FontId::proportional(12.5),
         color,
     );
+    surface::focus(ui.painter(), rect, &resp, p);
     resp
 }
 
@@ -2712,26 +2825,16 @@ fn empty_note(ui: &mut egui::Ui, text: &str, area_h: f32, p: &Palette) {
     });
 }
 
-/// 一行里的速率格子：定宽、右对齐、等宽字体。
-///
-/// 用 painter 直接落字而不是 `Label`：`Label` 的宽度随内容变，一列数字就
-/// 对不齐了。这里宽度写死，右边缘固定，小数点自然成列。
-///
 /// 拿不到真实图标时的字母块。
-///
-/// 早先是纯色块 + 白字，颜色一多整列像调色盘；现在压成「同色系的淡底 +
-/// 亮一档的字」，远看是彩色标记，近看又不抢应用名。
 fn badge(painter: &egui::Painter, rect: egui::Rect, name: &str, dark: bool) {
     let c = icons::tile_color(name);
-    // 浅色底上原来的 12% 淡底 + 本色字母，10pt 的字几乎糊在面板里；
-    // 底色加深一档、字再压暗一点，远看仍是彩色标记，近看才认得出字母
-    let bg = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if dark { 46 } else { 56 });
-    painter.rect_filled(rect, CornerRadius::same(6), bg);
-    let fg = if dark {
-        mix(c, Color32::WHITE, 0.30)
-    } else {
-        mix(c, Color32::BLACK, 0.22)
-    };
+    surface::gradient(
+        painter,
+        rect,
+        6.0,
+        mix(c, Color32::WHITE, 0.12),
+        mix(c, Color32::BLACK, if dark { 0.25 } else { 0.10 }),
+    );
     let initial = name
         .chars()
         .next()
@@ -2741,15 +2844,15 @@ fn badge(painter: &egui::Painter, rect: egui::Rect, name: &str, dark: bool) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        egui::FontId::proportional(10.0),
-        fg,
+        egui::FontId::proportional(16.0),
+        Color32::WHITE,
     );
 }
 
 /// 系统服务的图标：中性灰底 + 齿轮。
 ///
 /// 不走 [`badge`] 的彩色：那套颜色的语义是「某个应用」，系统服务恰恰要看起来
-/// 不属于任何应用。18pt 里能说清这件事的手段只剩「去饱和」—— 一圈灰底加一只
+/// 不属于任何应用。用中性灰底加一只
 /// 齿轮，扫一眼就知道这行是 `mDNSResponder` 那种后台东西，不是装的应用。
 fn service_badge(
     painter: &egui::Painter,
@@ -2758,21 +2861,17 @@ fn service_badge(
     p: &Palette,
     dark: bool,
 ) {
-    let bg = if dark {
-        Color32::from_white_alpha(16)
-    } else {
-        Color32::from_black_alpha(12)
-    };
+    let bg = mix(p.unit, p.surface, if dark { 0.50 } else { 0.30 });
     painter.rect_filled(rect, CornerRadius::same(6), bg);
     painter.image(
         gear.id(),
         rect,
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        mix(p.subtext, p.text, 0.35),
+        Color32::from_rgb(241, 245, 255),
     );
 }
 
-/// 一格速率：数值（等宽）贴右，单位小一号、淡一档。
+/// 一格速率：数值贴右，单位小一号、淡一档；极端大数约束在本列内。
 ///
 /// 不用 `format_speed` 整串落字：`1.3 MB/s` 里单位占了一半宽度，密度太低，
 /// 一眼扫过去全是 `/s`。拆开之后数字更突出，单位退成注脚。
@@ -2790,9 +2889,17 @@ fn rate_cell(
     let (val, unit) = text.split_once(' ').unwrap_or((text.as_str(), "B/s"));
     let unit_text = format!(" {unit}");
     let unit_galley =
-        painter.layout_no_wrap(unit_text, egui::FontId::proportional(8.5), unit_color);
-    let val_galley =
-        painter.layout_no_wrap(val.to_owned(), egui::FontId::monospace(val_size), val_color);
+        painter.layout_no_wrap(unit_text, egui::FontId::proportional(9.5), unit_color);
+    let mut val_galley =
+        painter.layout_no_wrap(val.to_owned(), theme::display_font(val_size), val_color);
+    let max_value_width = NUM_W_TX - NUM_UNIT_W - 3.0;
+    if val_galley.size().x > max_value_width {
+        val_galley = painter.layout_no_wrap(
+            val.to_owned(),
+            theme::display_font(val_size * max_value_width / val_galley.size().x),
+            val_color,
+        );
+    }
     let unit_w = unit_galley.size().x;
     let val_w = val_galley.size().x;
     // 数值右边缘固定在「列右边界 − 单位宽」，与这一行的单位是 K 还是 M 无关
@@ -2814,7 +2921,7 @@ fn rate_cell(
 /// 宽度必须由自己 allocate 定死。`allocate_ui_with_layout` 会按子 ui 的
 /// 实际内容推进游标（数值 82.1 KB/s 只有 100pt 宽），两栏就缩不到等分，
 /// 中间的竖线会歪到左半边去。
-#[allow(clippy::too_many_arguments)] // 布局辅助函数的尺寸、文字和颜色分别由调用方指定。
+#[allow(clippy::too_many_arguments)]
 fn metric(
     ui: &mut egui::Ui,
     w: f32,
@@ -2822,97 +2929,116 @@ fn metric(
     arrow: &str,
     label: &str,
     value: Option<String>,
+    trend: &[f64],
     color: Color32,
     p: &Palette,
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect(
+    let bottom = mix(p.surface, color, if p.dark { 0.12 } else { 0.06 });
+    surface::gradient(painter, rect, 12.0, p.surface, bottom);
+    surface::sparkline(painter, rect.shrink(1.0), trend, color, p.dark);
+    painter.rect_stroke(
         rect,
-        CornerRadius::same(10),
-        p.surface,
-        Stroke::new(0.5, p.border),
+        12.0,
+        Stroke::new(0.8, mix(p.border, color, if p.dark { 0.20 } else { 0.08 })),
         egui::StrokeKind::Inside,
     );
-    let inner = rect.shrink2(egui::vec2(10.0, 8.0));
-    let label_font = egui::FontId::proportional(11.0);
 
-    // 箭头跟着数据方向着色：和状态栏、列表里的颜色是同一套语义
-    painter.text(
-        inner.left_top(),
-        egui::Align2::LEFT_TOP,
-        arrow,
-        label_font.clone(),
+    let down = arrow == "↓";
+    let circle = egui::pos2(rect.left() + 26.0, rect.top() + 47.0);
+    let disc = egui::Rect::from_center_size(circle, Vec2::splat(28.0));
+    let disc_top = mix(p.surface, color, if p.dark { 0.82 } else { 0.20 });
+    let disc_bottom = mix(p.surface, color, if p.dark { 0.53 } else { 0.40 });
+    surface::gradient(painter, disc, 14.0, disc_top, disc_bottom);
+    painter.circle_stroke(
+        circle,
+        14.0,
+        Stroke::new(0.6, mix(disc_top, disc_bottom, 0.5)),
+    );
+    surface::direction(
+        painter,
+        circle,
+        down,
+        5.5,
+        if p.dark { Color32::WHITE } else { color },
+    );
+
+    let text_left = rect.left() + 56.0;
+    surface::direction(
+        painter,
+        egui::pos2(text_left + 3.0, rect.top() + 22.0),
+        down,
+        3.8,
         color,
     );
-    let arrow_w = painter
-        .layout_no_wrap(arrow.to_owned(), label_font.clone(), color)
-        .size()
-        .x;
     painter.text(
-        egui::pos2(inner.left() + arrow_w + 4.0, inner.top()),
-        egui::Align2::LEFT_TOP,
+        egui::pos2(text_left + 12.0, rect.top() + 22.0),
+        egui::Align2::LEFT_CENTER,
         label,
-        label_font,
+        egui::FontId::proportional(12.0),
         p.subtext,
     );
-
-    let value_top = inner.top() + 22.0;
     match value {
         Some(v) => {
             let (number, unit) = v.split_once(' ').unwrap_or((&v, "B/s"));
+            let value_color = if p.dark {
+                p.text
+            } else {
+                mix(p.text, color, 0.18)
+            };
             let unit = painter.layout_no_wrap(
                 unit.to_owned(),
-                egui::FontId::proportional(10.5),
+                egui::FontId::proportional(11.0),
                 p.subtext,
             );
-            let mut font_size = 23.0;
+            let mut font_size = 28.0;
             let mut number = painter.layout_no_wrap(
                 number.to_owned(),
-                egui::FontId::monospace(font_size),
-                color,
+                theme::display_font(font_size),
+                value_color,
             );
-            let available = (inner.width() - unit.size().x - 5.0).max(1.0);
+            let available = (rect.right() - 10.0 - text_left - unit.size().x - 5.0).max(1.0);
             if number.size().x > available {
                 font_size *= available / number.size().x;
                 number = painter.layout_no_wrap(
                     number.text().to_owned(),
-                    egui::FontId::monospace(font_size),
-                    color,
+                    theme::display_font(font_size),
+                    value_color,
                 );
             }
-            let bottom = inner.bottom();
-            let unit_left = inner.left() + number.size().x + 5.0;
+            let bottom = rect.top() + 64.0;
+            let unit_left = text_left + number.size().x + 5.0;
             painter.galley(
-                egui::pos2(inner.left(), bottom - number.size().y),
+                egui::pos2(text_left, bottom - number.size().y),
                 number,
-                color,
+                value_color,
             );
             painter.galley(
-                egui::pos2(unit_left, bottom - unit.size().y - 2.0),
+                egui::pos2(unit_left, bottom - unit.size().y - 3.0),
                 unit,
                 p.subtext,
             );
         }
         None => {
-            // 数值占位条。静态的，不跟列表骨架一起呼吸——一屏里两个不同节奏的
-            // 脉冲反而显得乱，这里只要「还没好」这一个信息。
             painter.rect_filled(
                 egui::Rect::from_min_size(
-                    egui::pos2(inner.left(), value_top + 2.0),
-                    Vec2::new((w * 0.62).min(96.0), 12.0),
+                    egui::pos2(text_left, rect.top() + 43.0),
+                    Vec2::new(w - 70.0, 16.0),
                 ),
-                CornerRadius::same(4),
-                p.subtext.gamma_multiply(0.35),
+                5.0,
+                p.subtext.gamma_multiply(0.25),
             );
         }
     }
+    response
 }
 
 /// 分段控件：实时 / 1分钟 / 5分钟 / 1小时。画在给定矩形里，
 /// 因为它现在跟「应用」标题共处一行，宽度由调用方决定。
 fn segmented_at(ui: &mut egui::Ui, bar: egui::Rect, current: &mut Window, p: &Palette, lang: Lang) {
-    ui.painter().rect_filled(bar, CornerRadius::same(6), p.chip);
+    ui.painter()
+        .rect_filled(bar, CornerRadius::same(14), p.chip);
 
     let all = Window::all();
     let item_w = bar.width() / all.len() as f32;
@@ -2926,8 +3052,7 @@ fn segmented_at(ui: &mut egui::Ui, bar: egui::Rect, current: &mut Window, p: &Pa
         egui::pos2(bar.left() + pos * item_w, bar.top()),
         Vec2::new(item_w, bar.height()),
     );
-    ui.painter()
-        .rect_filled(pill.shrink(2.0), CornerRadius::same(5), p.selection);
+    surface::pill(ui.painter(), pill.shrink(2.0), p);
 
     for (i, w) in all.iter().enumerate() {
         let r = egui::Rect::from_min_size(
@@ -2941,10 +3066,11 @@ fn segmented_at(ui: &mut egui::Ui, bar: egui::Rect, current: &mut Window, p: &Pa
             r.center(),
             egui::Align2::CENTER_CENTER,
             w.label(lang),
-            egui::FontId::proportional(10.5),
-            if selected { p.accent } else { p.subtext },
+            egui::FontId::proportional(12.0),
+            if selected { p.on_selection } else { p.subtext },
         );
 
+        surface::focus(ui.painter(), r, &resp, p);
         if resp.clicked() && !selected {
             *current = *w;
         }
@@ -3376,6 +3502,81 @@ mod tests {
             }
             if frame >= 62 {
                 assert_eq!((offset, max), (0.0, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn redesigned_selectors_accept_pointer_and_keyboard_in_both_themes() {
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            let palette = theme::palette(dark);
+            let mut appearance = ThemeMode::System;
+            let mut window = Window::Live;
+            let mut click_at = egui::Pos2::ZERO;
+            let mut keyboard_id = egui::Id::NULL;
+            for frame in 0..5 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(WINDOW_W, PANEL_H),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                };
+                if frame == 1 || frame == 2 {
+                    input.events.push(egui::Event::PointerMoved(click_at));
+                    input.events.push(egui::Event::PointerButton {
+                        pos: click_at,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 1,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                if frame == 3 {
+                    ctx.memory_mut(|m| m.request_focus(keyboard_id));
+                    input.events.push(egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.inner_margin(PANEL_PADDING))
+                        .show(ctx, |ui| {
+                            let top = ui.cursor().top();
+                            click_at = egui::pos2(ui.max_rect().right() - 20.0, top + 17.0);
+                            option_row(
+                                ui,
+                                &palette,
+                                "Appearance",
+                                &mut appearance,
+                                &[
+                                    (ThemeMode::System, "System"),
+                                    (ThemeMode::Light, "Light"),
+                                    (ThemeMode::Dark, "Dark"),
+                                ],
+                            );
+                            let (bar, _) = ui
+                                .allocate_exact_size(Vec2::new(SEG_W, SEG_H), egui::Sense::hover());
+                            keyboard_id = ui.id().with(("win", 3_usize));
+                            segmented_at(ui, bar, &mut window, &palette, Lang::En);
+                        });
+                });
+                if frame >= 2 {
+                    assert_eq!(appearance, ThemeMode::Dark);
+                }
+                if frame >= 3 {
+                    assert_eq!(window, Window::Hour1);
+                }
             }
         }
     }

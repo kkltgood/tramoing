@@ -20,7 +20,10 @@ mod icon;
 mod icons;
 mod instance;
 mod settings;
+mod surface;
 mod theme;
+#[cfg(debug_assertions)]
+mod ui_capture;
 mod update;
 
 use eframe::egui;

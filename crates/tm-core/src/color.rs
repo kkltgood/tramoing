@@ -20,13 +20,13 @@ impl Rgb {
 }
 
 /// 深色底上的下行色：绿。绿色表示「进来」
-const DOWN_ON_DARK: Rgb = Rgb(140, 200, 150);
+const DOWN_ON_DARK: Rgb = Rgb(67, 211, 148);
 /// 深色底上的上行色：蓝
-const UP_ON_DARK: Rgb = Rgb(94, 178, 255);
+const UP_ON_DARK: Rgb = Rgb(58, 183, 255);
 /// 浅色底上的下行色：同一支绿压暗，免得在浅底上发飘
-const DOWN_ON_LIGHT: Rgb = Rgb(40, 130, 80);
+const DOWN_ON_LIGHT: Rgb = Rgb(12, 157, 91);
 /// 浅色底上的上行色
-const UP_ON_LIGHT: Rgb = Rgb(20, 110, 200);
+const UP_ON_LIGHT: Rgb = Rgb(31, 119, 244);
 
 /// 下行（下载）速率色。`on_dark` 指**底色**是深色。
 pub fn download(on_dark: bool) -> Rgb {

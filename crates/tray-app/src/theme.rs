@@ -80,6 +80,8 @@ fn candidates() -> Vec<Candidate> {
 
 /// 尝试安装中文字体，成功返回所用文件路径。
 pub fn install_cjk(ctx: &egui::Context) -> Option<String> {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut cjk_path = None;
     for c in candidates() {
         let Ok(bytes) = std::fs::read(&c.path) else {
             continue;
@@ -92,7 +94,6 @@ pub fn install_cjk(ctx: &egui::Context) -> Option<String> {
         // `.ttc` 是字体集合，用第 index 个字面；单文件字体这个值恒为 0
         data.index = c.index;
 
-        let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert("cjk".to_owned(), Arc::new(data));
         // 放在最前面：中英文混排时优先用它的中文字形
         if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
@@ -102,10 +103,65 @@ pub fn install_cjk(ctx: &egui::Context) -> Option<String> {
         if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
             family.push("cjk".to_owned());
         }
-        ctx.set_fonts(fonts);
-        return Some(c.path.display().to_string());
+        cjk_path = Some(c.path.display().to_string());
+        break;
     }
-    None
+
+    // 正文与数字分别使用系统的常规、半粗字面，中文仍由上面的字体补齐。
+    // 不随应用分发系统字体；缺失时保留 egui 自带字体。
+    #[cfg(target_os = "macos")]
+    let faces = [
+        (
+            "body",
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial.ttf"),
+        ),
+        (
+            "display",
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        ),
+    ];
+    #[cfg(windows)]
+    let faces = {
+        let dir = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        [
+            ("body", dir.join("segoeui.ttf")),
+            ("display", dir.join("seguisb.ttf")),
+        ]
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let faces: [(&str, PathBuf); 0] = [];
+    for (name, path) in faces {
+        if let Ok(bytes) = std::fs::read(path) {
+            if looks_like_font(&bytes) {
+                fonts
+                    .font_data
+                    .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+            }
+        }
+    }
+    if fonts.font_data.contains_key("body") {
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "body".into());
+    }
+    let mut display = fonts.families[&egui::FontFamily::Proportional].clone();
+    if fonts.font_data.contains_key("display") {
+        display.insert(0, "display".into());
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("display".into()), display);
+    ctx.set_fonts(fonts);
+    cjk_path
+}
+
+pub fn display_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("display".into()))
 }
 
 /// 只接受字体文件（TrueType / OpenType / 字体集合），排除把图片之类当字体读进去。
@@ -121,11 +177,17 @@ fn looks_like_font(bytes: &[u8]) -> bool {
 
 /// 一套配色。跟随系统明暗模式。
 pub struct Palette {
+    pub dark: bool,
     pub panel: egui::Color32,
+    pub panel_top: egui::Color32,
+    pub panel_bottom: egui::Color32,
+    pub wave: egui::Color32,
     /// 卡片、设置分组的底色。
     pub surface: egui::Color32,
     /// 分段选项的选中底色。
     pub selection: egui::Color32,
+    pub selection_top: egui::Color32,
+    pub on_selection: egui::Color32,
     pub text: egui::Color32,
     pub subtext: egui::Color32,
     /// 速率单位（`B/s`）、计数（`· 3`）这类「注脚」文字。
@@ -159,40 +221,52 @@ fn srgb(c: tm_core::Rgb) -> egui::Color32 {
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            panel: egui::Color32::from_rgb(27, 29, 34),
-            surface: egui::Color32::from_rgb(35, 38, 44),
-            selection: egui::Color32::from_rgb(47, 65, 84),
-            text: egui::Color32::from_rgb(238, 238, 242),
-            subtext: egui::Color32::from_rgb(164, 171, 183),
-            unit: egui::Color32::from_rgb(148, 155, 168),
-            accent: egui::Color32::from_rgb(94, 178, 255),
+            dark: true,
+            panel: egui::Color32::from_rgb(24, 34, 55),
+            panel_top: egui::Color32::from_rgb(30, 43, 70),
+            panel_bottom: egui::Color32::from_rgb(23, 32, 51),
+            wave: egui::Color32::from_rgb(36, 55, 96),
+            surface: egui::Color32::from_rgb(32, 44, 67),
+            selection: egui::Color32::from_rgb(37, 139, 245),
+            selection_top: egui::Color32::from_rgb(68, 173, 255),
+            on_selection: egui::Color32::WHITE,
+            text: egui::Color32::from_rgb(245, 247, 255),
+            subtext: egui::Color32::from_rgb(181, 193, 219),
+            unit: egui::Color32::from_rgb(166, 182, 210),
+            accent: egui::Color32::from_rgb(67, 165, 255),
             download: srgb(tm_core::color::download(true)),
             upload: srgb(tm_core::color::upload(true)),
-            chip: egui::Color32::from_rgb(28, 31, 37),
-            border: egui::Color32::from_rgb(54, 59, 69),
+            chip: egui::Color32::from_rgb(26, 38, 62),
+            border: egui::Color32::from_rgb(51, 68, 101),
             warn: egui::Color32::from_rgb(240, 180, 90),
-            switch_off: egui::Color32::from_rgb(66, 66, 72),
+            switch_off: egui::Color32::from_rgb(66, 82, 112),
         }
     } else {
         // 浅色底上的每一档灰都往上压了一格：11pt 的中文在纯白面板上，
         // 原来那套 (#787880 / 10% 底槽 / 10% 描边) 读起来像没画完。
         // 层次靠字号和颜色深浅区分，不靠「淡到几乎看不见」。
         Palette {
-            panel: egui::Color32::from_rgb(246, 248, 251),
-            surface: egui::Color32::WHITE,
-            selection: egui::Color32::from_rgb(225, 238, 252),
-            text: egui::Color32::from_rgb(24, 24, 28),
-            subtext: egui::Color32::from_rgb(91, 101, 117),
-            unit: egui::Color32::from_rgb(105, 115, 130),
-            accent: egui::Color32::from_rgb(20, 110, 200),
+            dark: false,
+            panel: egui::Color32::from_rgb(237, 243, 255),
+            panel_top: egui::Color32::from_rgb(222, 233, 255),
+            panel_bottom: egui::Color32::from_rgb(242, 246, 255),
+            wave: egui::Color32::from_rgb(213, 228, 255),
+            surface: egui::Color32::from_rgb(249, 251, 255),
+            selection: egui::Color32::from_rgb(36, 91, 244),
+            selection_top: egui::Color32::from_rgb(59, 131, 255),
+            on_selection: egui::Color32::WHITE,
+            text: egui::Color32::from_rgb(15, 28, 73),
+            subtext: egui::Color32::from_rgb(54, 73, 117),
+            unit: egui::Color32::from_rgb(67, 85, 126),
+            accent: egui::Color32::from_rgb(38, 96, 244),
             download: srgb(tm_core::color::download(false)),
             upload: srgb(tm_core::color::upload(false)),
             // 底槽 = 分段控件的轨道：太淡就看不出「这是一组可选项」
-            chip: egui::Color32::from_rgb(237, 240, 245),
+            chip: egui::Color32::from_rgb(225, 234, 251),
             // 描边同时用于行卡片、分隔线和面板外框，26/255 在浅底上几乎没有边
-            border: egui::Color32::from_rgb(221, 226, 234),
+            border: egui::Color32::from_rgb(214, 225, 247),
             warn: egui::Color32::from_rgb(166, 96, 8),
-            switch_off: egui::Color32::from_rgb(184, 184, 192),
+            switch_off: egui::Color32::from_rgb(173, 190, 220),
         }
     }
 }

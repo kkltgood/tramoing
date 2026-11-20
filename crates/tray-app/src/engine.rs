@@ -1,5 +1,5 @@
 //! 后台采样、原始字节记账、按时间推进的窗口和可重试的历史写入。
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ use tm_store::Store;
 const FLUSH_EVERY: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(4);
 const RESTART_AFTER: Duration = Duration::from_secs(15);
+pub const TREND_SAMPLES: usize = 60;
 type Deltas = Vec<(AppKey, u64, u64)>;
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +31,8 @@ pub struct Snapshot {
     pub windowed: WindowedRates,
     pub total_rx: f64,
     pub total_tx: f64,
+    /// 最近的成功采样点，由采样线程维护，面板收起时也继续更新。
+    pub trend: Vec<[f64; 2]>,
     pub session_rx: u64,
     pub session_tx: u64,
     pub day_rx: u64,
@@ -240,6 +243,7 @@ where
             let mut day = (0, 0);
             let mut retry_at = Instant::now();
             let mut backoff = 1u64;
+            let mut trend = VecDeque::with_capacity(TREND_SAMPLES);
 
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -261,11 +265,13 @@ where
                     }
                 }
 
+                let mut sampled = false;
                 if let Some(s) = sampler.as_mut() {
                     match s.sample() {
                         Ok(samples) => {
                             if s.take_reset() {
                                 calc.reset_baseline();
+                                trend.clear();
                             }
                             last_good = Instant::now();
                             error = None;
@@ -274,6 +280,7 @@ where
                             let deltas = calc.take_deltas();
                             tracker.push_at(last_good, &deltas);
                             pending.add(SystemTime::now(), &deltas);
+                            sampled = true;
                         }
                         Err(SamplerError::Timeout) => {
                             if last_good.elapsed() >= STALE_AFTER {
@@ -342,6 +349,15 @@ where
                 }
 
                 let (total_rx, total_tx) = calc.total_bps();
+                if error.is_some() {
+                    // 中断前后的点不连接，避免把缺失采样画成连续的流量。
+                    trend.clear();
+                } else if sampled {
+                    if trend.len() == TREND_SAMPLES {
+                        trend.pop_front();
+                    }
+                    trend.push_back([total_rx, total_tx]);
+                }
                 let (session_rx, session_tx) = calc.session_total();
                 let snapshot = Snapshot {
                     rates: calc.snapshot(),
@@ -353,6 +369,7 @@ where
                     },
                     total_rx,
                     total_tx,
+                    trend: trend.iter().copied().collect(),
                     session_rx,
                     session_tx,
                     day_rx: day.0,

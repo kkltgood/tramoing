@@ -14,9 +14,9 @@ use std::thread;
 use eframe::egui;
 
 /// 列表里图标的显示边长（pt）。位图按 2x 渲染，见 `tm_macos::ICON_SIDE`。
-pub const ICON_PT: f32 = 18.0;
+pub const ICON_PT: f32 = 23.0;
 
-/// 齿轮纹理的像素边长：18pt 在 2x 屏上的尺寸，和 `tm_macos::ICON_SIDE` 对齐。
+/// 齿轮纹理按显示尺寸的 2x 渲染。
 const SERVICE_SIDE: u32 = (ICON_PT as u32) * 2;
 
 /// 首字母色块的底色。挑的都是和面板配色不冲突的中低饱和色。
