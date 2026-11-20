@@ -42,6 +42,8 @@ pub mod sampler;
 pub mod screen;
 #[cfg(windows)]
 pub mod theme;
+#[cfg(windows)]
+pub mod utilization;
 
 #[cfg(windows)]
 pub use sampler::WindowsSampler;

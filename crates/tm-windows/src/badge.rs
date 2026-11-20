@@ -12,26 +12,163 @@ use std::sync::Once;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const CLASS: &str = "Tramoing.TaskbarSpeed";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Content {
+    pub speed: Option<Speed>,
+    pub performance: Option<Performance>,
+    pub light: bool,
+    pub colors: tm_core::color::DisplayColors,
+    pub performance_first: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Speed {
     pub down: String,
     pub up: String,
-    pub light: bool,
     pub colored: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Performance {
+    pub cpu: String,
+    pub gpu: String,
+    pub colored: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    Speed,
+    Performance,
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    group: Group,
+    start: (i32, i32),
+    original_order: bool,
+    preview_order: bool,
+    moved: bool,
+}
+
+impl Drag {
+    fn new(group: Group, x: i32, y: i32, performance_first: bool) -> Self {
+        Self {
+            group,
+            start: (x, y),
+            original_order: performance_first,
+            preview_order: performance_first,
+            moved: false,
+        }
+    }
+
+    fn track(
+        &mut self,
+        x: i32,
+        y: i32,
+        area: RECT,
+        layout: &surface::Layout,
+        threshold: (i32, i32),
+    ) {
+        self.moved |=
+            (x - self.start.0).abs() > threshold.0 || (y - self.start.1).abs() > threshold.1;
+        self.preview_order = self.original_order;
+        if !self.moved || !contains(area, x, y) {
+            return;
+        }
+        let (Some(speed), Some(performance)) = (layout.speed, layout.performance) else {
+            return;
+        };
+        let other = if self.group == Group::Speed {
+            performance
+        } else {
+            speed
+        };
+        let before = if layout.stacked() {
+            y < (other.top + other.bottom) / 2
+        } else {
+            x < (other.left + other.right) / 2
+        };
+        self.preview_order = if self.group == Group::Performance {
+            before
+        } else {
+            !before
+        };
+    }
 }
 
 struct WindowState {
     hwnd: Cell<HWND>,
     content: RefCell<Content>,
-    click: fn(Option<Rect>),
-    pressed: Cell<bool>,
+    click: fn(Option<Rect>, bool),
+    reordered: fn(bool),
+    drag: Cell<Option<Drag>>,
     needs_paint: Cell<bool>,
+}
+
+impl WindowState {
+    fn display_content(&self) -> Content {
+        let mut content = self.content.borrow().clone();
+        if let Some(drag) = self.drag.get() {
+            content.performance_first = drag.preview_order;
+        }
+        content
+    }
+
+    unsafe fn repaint(&self) -> Result<(), &'static str> {
+        surface::present(self.hwnd.get(), &self.display_content())?;
+        self.needs_paint.set(false);
+        Ok(())
+    }
+
+    unsafe fn cancel_drag(&self) {
+        if self.drag.take().is_some() {
+            self.needs_paint.set(true);
+            if GetCapture() == self.hwnd.get() {
+                ReleaseCapture();
+            }
+            let _ = self.repaint();
+        }
+    }
+
+    unsafe fn track_drag(&self, x: i32, y: i32) {
+        let (Some(mut drag), Some(rect)) = (self.drag.get(), client_rect(self.hwnd.get())) else {
+            return;
+        };
+        let dpi = GetDpiForWindow(self.hwnd.get()).max(96);
+        let layout = surface::layout(&self.content.borrow(), rect.right, rect.bottom, dpi as i32);
+        let previous = drag.preview_order;
+        drag.track(
+            x,
+            y,
+            rect,
+            &layout,
+            (
+                GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1),
+                GetSystemMetricsForDpi(SM_CYDRAG, dpi).max(1),
+            ),
+        );
+        self.drag.set(Some(drag));
+        if previous != drag.preview_order {
+            self.needs_paint.set(true);
+            let _ = self.repaint();
+        }
+        if drag.moved && layout.speed.is_some() && layout.performance.is_some() {
+            SetCursor(LoadCursorW(
+                null_mut(),
+                if layout.stacked() {
+                    IDC_SIZENS
+                } else {
+                    IDC_SIZEWE
+                },
+            ));
+        }
+    }
 }
 
 struct Reservation {
@@ -47,18 +184,20 @@ pub struct TaskbarBadge {
 }
 
 impl TaskbarBadge {
-    pub fn new(click: fn(Option<Rect>)) -> Self {
+    pub fn new(click: fn(Option<Rect>, bool), reordered: fn(bool)) -> Self {
         Self {
             state: Box::new(WindowState {
                 hwnd: Cell::new(null_mut()),
                 content: RefCell::new(Content {
-                    down: "0".into(),
-                    up: "0".into(),
+                    speed: None,
+                    performance: None,
                     light: false,
-                    colored: false,
+                    colors: Default::default(),
+                    performance_first: false,
                 }),
                 click,
-                pressed: Cell::new(false),
+                reordered,
+                drag: Cell::new(None),
                 needs_paint: Cell::new(true),
             }),
             shell: null_mut(),
@@ -68,11 +207,21 @@ impl TaskbarBadge {
 
     /// None 表示禁用。成功时窗口的 GetParent 必须是当前 Shell_TrayWnd。
     pub fn update(&mut self, content: Option<Content>) -> Result<(), &'static str> {
-        let Some(content) = content else {
+        let Some(content) = content.filter(|c| c.speed.is_some() || c.performance.is_some()) else {
             self.detach();
             return Ok(());
         };
-        let changed = *self.state.content.borrow() != content;
+        let previous = self.state.content.borrow();
+        let changed = *previous != content;
+        let layout_changed = previous.speed.is_some() != content.speed.is_some()
+            || previous.performance.is_some() != content.performance.is_some()
+            || previous.performance_first != content.performance_first;
+        drop(previous);
+        if layout_changed {
+            unsafe {
+                self.state.cancel_drag();
+            }
+        }
         *self.state.content.borrow_mut() = content;
         if changed {
             self.state.needs_paint.set(true);
@@ -92,7 +241,7 @@ impl TaskbarBadge {
                     // 背景透出任务栏，父窗口仍然是任务栏。
                     WS_EX_NOACTIVATE | WS_EX_LAYERED,
                     wide(CLASS).as_ptr(),
-                    wide("Tramoing Speed").as_ptr(),
+                    wide("Tramoing Monitor").as_ptr(),
                     WS_CHILD | WS_CLIPSIBLINGS,
                     0,
                     0,
@@ -112,12 +261,12 @@ impl TaskbarBadge {
             }
             let result = self.layout().and_then(|()| {
                 if self.state.needs_paint.get() {
-                    surface::present(self.state.hwnd.get(), &self.state.content.borrow())?;
-                    self.state.needs_paint.set(false);
+                    self.state.repaint()?;
                 }
                 Ok(())
             });
             if result.is_err() {
+                self.state.cancel_drag();
                 ShowWindow(self.state.hwnd.get(), SW_HIDE);
                 self.restore();
             }
@@ -128,7 +277,7 @@ impl TaskbarBadge {
     unsafe fn layout(&mut self) -> Result<(), &'static str> {
         let band = client_rect(self.shell).ok_or("无法读取任务栏布局")?;
         let dpi = GetDpiForWindow(self.shell).max(96) as i32;
-        let width = surface::WIDTH_DIP * dpi / 96;
+        let width = surface::width_dip(&self.state.content.borrow()) * dpi / 96;
         let gap = 4 * dpi / 96;
         let tray = FindWindowExW(
             self.shell,
@@ -136,7 +285,7 @@ impl TaskbarBadge {
             wide("TrayNotifyWnd").as_ptr(),
             null(),
         );
-        let tray_rect = relative_rect(tray, self.shell).ok_or("当前任务栏布局不支持网速区域")?;
+        let tray_rect = relative_rect(tray, self.shell).ok_or("当前任务栏布局不支持监控区域")?;
         let modern = !FindWindowExW(
             self.shell,
             null_mut(),
@@ -145,10 +294,21 @@ impl TaskbarBadge {
         )
         .is_null();
         let vertical = band.bottom > band.right;
+        let stacked = vertical && band.right < width;
+        let height = if stacked {
+            let content = self.state.content.borrow();
+            if band.right < surface::minimum_width_dip(&content) * dpi / 96 {
+                return Err("任务栏太窄，无法放入性能区域");
+            }
+            36 * (i32::from(content.speed.is_some()) + i32::from(content.performance.is_some()))
+        } else {
+            36
+        } * dpi
+            / 96;
         let mut target = if vertical {
             RECT {
                 left: 0,
-                top: tray_rect.top - 36 * dpi / 96 - gap,
+                top: tray_rect.top - height - gap,
                 right: band.right,
                 bottom: tray_rect.top - gap,
             }
@@ -212,7 +372,7 @@ impl TaskbarBadge {
         {
             // 纵向 left=0 是合法的。
             if !(vertical && target.top >= gap && target.bottom <= band.bottom) {
-                return Err("任务栏空间不足，无法放入网速区域");
+                return Err("任务栏空间不足，无法放入监控区域");
             }
         }
         let rebar = FindWindowExW(
@@ -221,12 +381,12 @@ impl TaskbarBadge {
             wide("ReBarWindow32").as_ptr(),
             null(),
         );
-        let task_rect = relative_rect(rebar, self.shell).ok_or("当前任务栏布局不支持网速区域")?;
+        let task_rect = relative_rect(rebar, self.shell).ok_or("当前任务栏布局不支持监控区域")?;
         if modern {
             self.restore();
             // 新任务栏的按钮实际由 XAML 绘制，不能靠缩小旧 ReBar 假装预留成功。
             if vertical || task_rect.right + gap > target.left {
-                return Err("任务栏按钮已占满网速区域，请减少固定按钮");
+                return Err("任务栏按钮已占满监控区域，请减少固定按钮");
             }
         } else {
             if let Some(reservation) = &self.reservation {
@@ -251,10 +411,10 @@ impl TaskbarBadge {
                 (applied.right - applied.left, applied.bottom - applied.top)
             };
             if main_size < 100 * dpi / 96 || cross_size < 20 {
-                return Err("任务栏空间不足，无法放入网速区域");
+                return Err("任务栏空间不足，无法放入监控区域");
             }
             if !same_rect(task_rect, applied) && !move_child(rebar, applied) {
-                return Err("无法为网速区域预留任务栏空间");
+                return Err("无法为监控区域预留任务栏空间");
             }
             self.reservation = Some(Reservation {
                 hwnd: rebar,
@@ -273,7 +433,7 @@ impl TaskbarBadge {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         ) == 0
         {
-            return Err("任务栏网速区域定位失败");
+            return Err("任务栏监控区域定位失败");
         }
         Ok(())
     }
@@ -293,6 +453,9 @@ impl TaskbarBadge {
 
     fn detach(&mut self) {
         self.restore();
+        unsafe {
+            self.state.cancel_drag();
+        }
         let hwnd = self.state.hwnd.replace(null_mut());
         unsafe {
             if !hwnd.is_null() && IsWindow(hwnd) != 0 {
@@ -342,33 +505,78 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         (WM_ERASEBKGND, _) => 1,
         (WM_MOUSEACTIVATE, _) => MA_NOACTIVATE as isize,
         (WM_LBUTTONDOWN, Some(state)) => {
-            state.pressed.set(true);
-            SetCapture(hwnd);
-            0
-        }
-        (WM_LBUTTONUP, Some(state)) => {
-            let pressed = state.pressed.replace(false);
-            ReleaseCapture();
-            let x = lp as i16 as i32;
-            let y = (lp >> 16) as i16 as i32;
-            if pressed
-                && client_rect(hwnd)
-                    .is_some_and(|r| x >= 0 && y >= 0 && x < r.right && y < r.bottom)
-            {
-                (state.click)(screen_rect(hwnd));
+            if let Some(rect) = client_rect(hwnd) {
+                let (x, y) = mouse_point(lp);
+                let content = state.content.borrow();
+                let layout = surface::layout(
+                    &content,
+                    rect.right,
+                    rect.bottom,
+                    GetDpiForWindow(hwnd).max(96) as i32,
+                );
+                if let Some(group) = layout.group_at(x, y) {
+                    state
+                        .drag
+                        .set(Some(Drag::new(group, x, y, content.performance_first)));
+                    drop(content);
+                    SetCapture(hwnd);
+                }
             }
             0
         }
-        (WM_CAPTURECHANGED, Some(state)) => {
-            state.pressed.set(false);
+        (WM_MOUSEMOVE, Some(state)) => {
+            let (x, y) = mouse_point(lp);
+            state.track_drag(x, y);
+            0
+        }
+        (WM_LBUTTONUP, Some(state)) => {
+            let (x, y) = mouse_point(lp);
+            state.track_drag(x, y);
+            let drag = state.drag.take();
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+            if let Some(drag) = drag {
+                if let Some(rect) = client_rect(hwnd).filter(|r| contains(*r, x, y)) {
+                    if drag.moved {
+                        if drag.preview_order != drag.original_order {
+                            state.content.borrow_mut().performance_first = drag.preview_order;
+                            (state.reordered)(drag.preview_order);
+                        }
+                    } else {
+                        let layout = surface::layout(
+                            &state.content.borrow(),
+                            rect.right,
+                            rect.bottom,
+                            GetDpiForWindow(hwnd).max(96) as i32,
+                        );
+                        if layout.group_at(x, y) == Some(drag.group) {
+                            (state.click)(screen_rect(hwnd), drag.group == Group::Performance);
+                        }
+                    }
+                }
+                state.needs_paint.set(true);
+                let _ = state.repaint();
+                SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+            }
+            0
+        }
+        (WM_CAPTURECHANGED | WM_CANCELMODE, Some(state)) => {
+            state.cancel_drag();
             0
         }
         (WM_NCDESTROY, Some(state)) => {
+            state.drag.set(None);
             state.hwnd.set(null_mut());
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        (WM_THEMECHANGED | WM_DPICHANGED | WM_SIZE, Some(state)) => {
+        (WM_DPICHANGED | WM_SIZE, Some(state)) => {
+            state.cancel_drag();
+            state.needs_paint.set(true);
+            0
+        }
+        (WM_THEMECHANGED, Some(state)) => {
             state.needs_paint.set(true);
             0
         }
@@ -378,6 +586,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+fn mouse_point(lp: LPARAM) -> (i32, i32) {
+    (lp as i16 as i32, (lp >> 16) as i16 as i32)
+}
+fn contains(r: RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 fn same_rect(a: RECT, b: RECT) -> bool {
     (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
@@ -442,20 +656,105 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CLICKS: AtomicUsize = AtomicUsize::new(0);
+    static REORDERS: AtomicUsize = AtomicUsize::new(0);
+
+    fn combined_content(performance_first: bool) -> Content {
+        Content {
+            speed: Some(Speed {
+                down: "118B".into(),
+                up: "144B".into(),
+                colored: true,
+            }),
+            performance: Some(Performance {
+                cpu: "3%".into(),
+                gpu: "1%".into(),
+                colored: true,
+            }),
+            light: false,
+            colors: Default::default(),
+            performance_first,
+        }
+    }
+
+    #[test]
+    fn drag_reorders_both_groups_in_both_orientations_and_can_return_or_cancel() {
+        for dpi in [96, 120, 144, 168, 192] {
+            for performance_first in [false, true] {
+                let content = combined_content(performance_first);
+                for (width, height) in [(surface::width_dip(&content), 48), (80, 72)] {
+                    let area = RECT {
+                        left: 0,
+                        top: 0,
+                        right: width * dpi / 96,
+                        bottom: height * dpi / 96,
+                    };
+                    let layout = surface::layout(&content, area.right, area.bottom, dpi);
+                    for (group, source, destination) in [
+                        (
+                            Group::Speed,
+                            layout.speed.unwrap(),
+                            layout.performance.unwrap(),
+                        ),
+                        (
+                            Group::Performance,
+                            layout.performance.unwrap(),
+                            layout.speed.unwrap(),
+                        ),
+                    ] {
+                        let start = (source.left + 3, source.top + 3);
+                        let mut drag = Drag::new(group, start.0, start.1, performance_first);
+                        let threshold = (4 * dpi / 96, 4 * dpi / 96);
+                        drag.track(start.0 + 1, start.1 + 1, area, &layout, threshold);
+                        assert!(!drag.moved, "minor pointer jitter must remain a click");
+                        assert_eq!(drag.preview_order, performance_first);
+                        // 拖到另一组远端，跨过该组中点才换序。
+                        let target = if (group == Group::Performance) == performance_first {
+                            (destination.right - 2, destination.bottom - 2)
+                        } else {
+                            (destination.left + 1, destination.top + 1)
+                        };
+                        drag.track(target.0, target.1, area, &layout, threshold);
+                        assert!(drag.moved);
+                        assert_ne!(drag.preview_order, performance_first);
+                        // 预览期间采样数值可以刷新；排序判定始终使用原始布局，避免来回抖动。
+                        drag.track(target.0, target.1, area, &layout, threshold);
+                        assert_ne!(drag.preview_order, performance_first);
+                        drag.track(start.0, start.1, area, &layout, threshold);
+                        assert_eq!(drag.preview_order, performance_first);
+                        assert!(drag.moved, "dragging back must not open the panel");
+                        drag.track(-20, -20, area, &layout, threshold);
+                        assert_eq!(drag.preview_order, performance_first);
+                    }
+                }
+            }
+        }
+    }
 
     /// 需要交互式 Windows 桌面；不在无桌面的 CI 中修改 Explorer 布局。
     #[test]
     #[ignore = "requires interactive Windows taskbar"]
     fn native_child_lifecycle_and_clicks() {
-        let mut badge = TaskbarBadge::new(|rect| {
-            assert!(rect.is_some());
-            CLICKS.fetch_add(1, Ordering::Relaxed);
-        });
+        CLICKS.store(0, Ordering::Relaxed);
+        REORDERS.store(0, Ordering::Relaxed);
+        let mut badge = TaskbarBadge::new(
+            |rect, performance| {
+                assert!(rect.is_some());
+                CLICKS.fetch_add(if performance { 10 } else { 1 }, Ordering::Relaxed);
+            },
+            |first| {
+                REORDERS.fetch_add(if first { 1 } else { 10 }, Ordering::Relaxed);
+            },
+        );
         let content = Content {
-            down: "12M".into(),
-            up: "3.4K".into(),
+            speed: Some(Speed {
+                down: "12M".into(),
+                up: "3.4K".into(),
+                colored: true,
+            }),
+            performance: None,
             light: false,
-            colored: true,
+            colors: Default::default(),
+            performance_first: false,
         };
         badge.update(Some(content.clone())).unwrap();
         unsafe {
@@ -486,6 +785,88 @@ mod tests {
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, 4 | (4 << 16));
             SendMessageW(hwnd, WM_LBUTTONUP, 0, 4 | (4 << 16));
             assert_eq!(CLICKS.load(Ordering::Relaxed), 1);
+            let mut combined = content.clone();
+            combined.performance = Some(Performance {
+                cpu: "100%".into(),
+                gpu: " --%".into(),
+                colored: true,
+            });
+            badge.update(Some(combined.clone())).unwrap();
+            let combined_rect = client_rect(hwnd).unwrap();
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let perf = surface::layout(&combined, combined_rect.right, combined_rect.bottom, dpi)
+                .performance
+                .unwrap();
+            let point = (perf.left + 3) as isize | (((perf.top + 3) as isize) << 16);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, point);
+            assert_eq!(CLICKS.load(Ordering::Relaxed), 11);
+            let coord = |x: i32, y: i32| x as u16 as isize | ((y as u16 as isize) << 16);
+            // 从性能区域拖向左侧：原生窗口即时预览，松开只发送排序事件。
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, coord(2, 4));
+            assert!(badge.state.display_content().performance_first);
+            combined.performance.as_mut().unwrap().cpu = "3%".into();
+            badge.update(Some(combined.clone())).unwrap(); // 模拟采样刷新
+            assert!(badge.state.display_content().performance_first);
+            assert_eq!(badge.state.display_content().performance.unwrap().cpu, "3%");
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(2, 4));
+            assert!(badge.state.content.borrow().performance_first);
+            assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
+            assert_eq!(CLICKS.load(Ordering::Relaxed), 11);
+            combined.performance_first = true;
+            badge.update(Some(combined.clone())).unwrap();
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(4, 4));
+            assert_eq!(
+                CLICKS.load(Ordering::Relaxed),
+                21,
+                "click follows the reordered content"
+            );
+            // 交换回来前被系统取消：不能保存预览、不能误触发点击。
+            let end = coord(combined_rect.right - 2, 4);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
+            assert!(!badge.state.display_content().performance_first);
+            SendMessageW(hwnd, WM_CANCELMODE, 0, 0);
+            assert!(badge.state.display_content().performance_first);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, end);
+            assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
+            // 松开于窗口外亦取消。
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(-10, -10));
+            assert!(badge.state.display_content().performance_first);
+            assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
+            // 捕获丢失恢复原序。
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
+            ReleaseCapture();
+            assert!(badge.state.drag.get().is_none());
+            assert!(badge.state.display_content().performance_first);
+            // 真正拖回右侧。
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, end);
+            assert!(!badge.state.content.borrow().performance_first);
+            assert_eq!(REORDERS.load(Ordering::Relaxed), 11);
+            assert_eq!(CLICKS.load(Ordering::Relaxed), 21);
+            combined.speed = None;
+            badge.update(Some(combined)).unwrap();
+            let only_perf = client_rect(hwnd).unwrap();
+            assert!(
+                only_perf.right < combined_rect.right || only_perf.bottom < combined_rect.bottom
+            );
+            badge.update(Some(content.clone())).unwrap();
+            assert!(same_rect(
+                client_rect(hwnd).unwrap(),
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: r.right - r.left,
+                    bottom: r.bottom - r.top,
+                }
+            ));
             // 模拟原生子窗口丢失，验证下一帧恢复，不重启用户的 Explorer。
             DestroyWindow(hwnd);
             assert!(badge.state.hwnd.get().is_null());

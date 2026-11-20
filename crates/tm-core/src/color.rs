@@ -12,10 +12,48 @@
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
+    /// 配置文件和颜色输入框共用 #RRGGBB 格式。
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let hex = text.trim().strip_prefix('#')?;
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        Some(Self((value >> 16) as u8, (value >> 8) as u8, value as u8))
+    }
+
+    pub fn to_hex(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.0, self.1, self.2)
+    }
+
     /// 转成 0.0–1.0 的三个分量（AppKit 要这个）。
     pub fn to_f64(self) -> (f64, f64, f64) {
         let f = |v: u8| v as f64 / 255.0;
         (f(self.0), f(self.1), f(self.2))
+    }
+}
+
+/// 菜单栏 / 任务栏的可选自定义色。None 保留随系统明暗切换的默认配色。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayColors {
+    pub download: Option<Rgb>,
+    pub upload: Option<Rgb>,
+    pub cpu: Option<Rgb>,
+    pub gpu: Option<Rgb>,
+}
+
+impl DisplayColors {
+    pub fn download(self, dark: bool) -> Rgb {
+        self.download.unwrap_or_else(|| download(dark))
+    }
+    pub fn upload(self, dark: bool) -> Rgb {
+        self.upload.unwrap_or_else(|| upload(dark))
+    }
+    pub fn cpu(self, dark: bool) -> Rgb {
+        self.cpu.unwrap_or_else(|| cpu(dark))
+    }
+    pub fn gpu(self, dark: bool) -> Rgb {
+        self.gpu.unwrap_or_else(|| gpu(dark))
     }
 }
 

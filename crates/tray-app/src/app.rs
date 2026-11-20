@@ -192,7 +192,9 @@ enum TrayEvent {
     /// 图标摆的话，点最左边的数字、面板却从右边托盘上方冒出来，看着像点
     /// 错了东西。这里直接以被点的贴片为锚点——点哪儿弹哪儿。
     #[cfg(windows)]
-    BadgeClick { at: IconRect },
+    BadgeClick { at: IconRect, performance: bool },
+    #[cfg(windows)]
+    BadgeReordered { performance_first: bool },
 }
 
 // tray-icon 只允许注册一个全局回调，所以用全局 channel 把事件转回 App。
@@ -207,7 +209,7 @@ pub struct App {
     shown_at: Instant,
     auto_hidden_at: Option<Instant>,
     tray: Option<TrayHandle>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     performance: crate::performance::Monitor,
     #[cfg(target_os = "macos")]
     performance_tray: Option<tm_macos::StatusItem>,
@@ -376,7 +378,7 @@ impl App {
         install_tray_handler();
 
         let icons = IconSet::new(ctx.clone());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let performance = {
             let wake = ctx.clone();
             let mut monitor = crate::performance::Monitor::new(move || wake.request_repaint());
@@ -392,7 +394,7 @@ impl App {
             shown_at: Instant::now(),
             auto_hidden_at: None,
             tray: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             performance,
             #[cfg(target_os = "macos")]
             performance_tray: None,
@@ -725,6 +727,22 @@ impl App {
             ),
             None => "Tramoing".to_owned(),
         };
+        #[cfg(windows)]
+        let tip = if self.settings.performance_enabled {
+            let reading = self.performance.reading();
+            format!(
+                "{tip}\nCPU {}    GPU {}{}",
+                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.cpu)),
+                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.gpu)),
+                if std::env::var_os("TM_FORCE_MOCK").is_some() {
+                    self.lang.t("\n演示数据", "\nDemo data")
+                } else {
+                    ""
+                }
+            )
+        } else {
+            tip
+        };
         if tip != self.tray_tip {
             #[cfg(target_os = "macos")]
             tray.set_tooltip(Some(tip.as_str()));
@@ -772,6 +790,7 @@ impl App {
                         up: &up,
                         down: &down,
                         colored: self.settings.tray_color,
+                        colors: self.settings.display_colors,
                     });
                 }
                 self.tray_title = key;
@@ -834,7 +853,12 @@ impl App {
             tray.appearance_is_dark()
         );
         if key != self.performance_title {
-            tray.set_utilization_lines(&cpu_text, &gpu_text, self.settings.performance_color);
+            tray.set_utilization_lines(
+                &cpu_text,
+                &gpu_text,
+                self.settings.performance_color,
+                self.settings.display_colors,
+            );
             self.performance_title = key;
         }
         let unavailable = self.lang.t("暂不可用", "Unavailable");
@@ -879,15 +903,28 @@ impl App {
     fn sync_badge(&mut self, ctx: &egui::Context) {
         use crate::badge_window::BadgeState;
 
-        let state = match &self.latest {
-            Some(snap) if self.settings.tray_badge => Some(BadgeState {
-                rx: snap.total_rx,
-                tx: snap.total_tx,
+        let state = if self.settings.tray_badge || self.settings.performance_enabled {
+            let reading = self.performance.reading();
+            Some(BadgeState {
+                speed: self
+                    .latest
+                    .as_ref()
+                    .filter(|_| self.settings.tray_badge)
+                    .map(|s| (s.total_rx, s.total_tx)),
+                performance: self.settings.performance_enabled.then(|| {
+                    (
+                        reading.as_ref().and_then(|r| r.cpu),
+                        reading.as_ref().and_then(|r| r.gpu),
+                    )
+                }),
                 light: self.taskbar_light,
                 colored: self.settings.tray_color,
-            }),
-            // 还没第一帧数据或用户关闭任务栏网速。
-            _ => None,
+                performance_colored: self.settings.performance_color,
+                colors: self.settings.display_colors,
+                performance_first: self.settings.taskbar_performance_first,
+            })
+        } else {
+            None
         };
         self.badge.show(ctx, state);
     }
@@ -957,8 +994,6 @@ impl eframe::App for App {
         self.sync_tray_title();
         #[cfg(target_os = "macos")]
         self.sync_performance_tray();
-        #[cfg(windows)]
-        self.sync_badge(ctx);
         self.icons.poll();
         if let Some(job) = &self.export_job {
             let message = match job.try_result() {
@@ -1095,9 +1130,32 @@ impl eframe::App for App {
                     }
                 }
                 #[cfg(windows)]
-                TrayEvent::BadgeClick { at } => self.toggle(ctx, at),
+                TrayEvent::BadgeClick { at, performance } => {
+                    if performance {
+                        self.initial_settings_scroll = Some(0.0);
+                        let switching = self.visible && self.view != View::Settings;
+                        self.goto(View::Settings);
+                        if switching {
+                            self.open(ctx, at);
+                        } else {
+                            self.toggle(ctx, at);
+                        }
+                    } else {
+                        self.toggle(ctx, at);
+                    }
+                }
+                #[cfg(windows)]
+                TrayEvent::BadgeReordered { performance_first } => {
+                    if self.settings.taskbar_performance_first != performance_first {
+                        self.settings.taskbar_performance_first = performance_first;
+                        self.settings.save();
+                    }
+                }
             }
         }
+        // 先处理拖动落盘，再推送数值，避免旧顺序在松开鼠标的这一帧闪回。
+        #[cfg(windows)]
+        self.sync_badge(ctx);
 
         // 失焦自动收起，模拟原生 popover。
         // 前提是这次展开**真的拿到过焦点**：Windows 的前台窗口规则可能让
@@ -1371,10 +1429,11 @@ impl App {
 
         // 中间选项独立滚动，标题、返回和开机自启始终留在原位。
         let options_height = (bounds.bottom() - 42.0 - TOAST_H - 15.0 - ui.cursor().top()).max(1.0);
+        let bar_dark = self.bar_is_dark();
         ui.spacing_mut().scroll.floating_width = 3.0;
         settings_scroll_area(options_height, self.initial_settings_scroll.take()).show(ui, |ui| {
             ui.set_width(ui.available_width() - 8.0);
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             {
                 self.performance_options(ui, p, lang, &mut changed);
                 ui.add_space(12.0);
@@ -1446,6 +1505,25 @@ impl App {
                     ) {
                         changed = true;
                     }
+                }
+
+                if self.settings.tray_color {
+                    changed |= color_option_row(
+                        ui,
+                        p,
+                        lang,
+                        lang.t("下载颜色", "Download color"),
+                        &mut self.settings.display_colors.download,
+                        tm_core::color::download(bar_dark),
+                    );
+                    changed |= color_option_row(
+                        ui,
+                        p,
+                        lang,
+                        lang.t("上传颜色", "Upload color"),
+                        &mut self.settings.display_colors.upload,
+                        tm_core::color::upload(bar_dark),
+                    );
                 }
 
                 // ---- 外观 ----
@@ -1576,7 +1654,20 @@ impl App {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    fn bar_is_dark(&self) -> bool {
+        #[cfg(windows)]
+        {
+            !self.taskbar_light
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.tray
+                .as_ref()
+                .is_none_or(|tray| tray.appearance_is_dark())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
     fn performance_options(
         &mut self,
         ui: &mut egui::Ui,
@@ -1585,10 +1676,15 @@ impl App {
         changed: &mut bool,
     ) {
         let top = ui.cursor().top();
+        let bar_dark = self.bar_is_dark();
         settings_group(
             ui,
             p,
-            lang.t("菜单栏性能", "Menu bar performance"),
+            if cfg!(windows) {
+                lang.t("任务栏性能", "Taskbar performance")
+            } else {
+                lang.t("菜单栏性能", "Menu bar performance")
+            },
             |ui| {
                 *changed |= option_row(
                     ui,
@@ -1597,6 +1693,19 @@ impl App {
                     &mut self.settings.performance_enabled,
                     &[(false, lang.t("关闭", "Off")), (true, lang.t("开启", "On"))],
                 );
+                #[cfg(windows)]
+                {
+                    *changed |= option_row(
+                        ui,
+                        p,
+                        lang.t("显示顺序", "Order"),
+                        &mut self.settings.taskbar_performance_first,
+                        &[
+                            (false, lang.t("网速在前", "Network first")),
+                            (true, lang.t("性能在前", "CPU/GPU first")),
+                        ],
+                    );
+                }
                 *changed |= option_row(
                     ui,
                     p,
@@ -1618,6 +1727,24 @@ impl App {
                         (false, lang.t("单色", "Mono")),
                     ],
                 );
+                if self.settings.performance_color {
+                    *changed |= color_option_row(
+                        ui,
+                        p,
+                        lang,
+                        lang.t("CPU 颜色", "CPU color"),
+                        &mut self.settings.display_colors.cpu,
+                        tm_core::color::cpu(bar_dark),
+                    );
+                    *changed |= color_option_row(
+                        ui,
+                        p,
+                        lang,
+                        lang.t("GPU 颜色", "GPU color"),
+                        &mut self.settings.display_colors.gpu,
+                        tm_core::color::gpu(bar_dark),
+                    );
+                }
             },
         );
         let line = egui::Rect::from_min_size(
@@ -1647,10 +1774,20 @@ impl App {
                 "开启后在网速旁以同一组两行显示 CPU 和 GPU 使用率",
                 "Show CPU above GPU in one item beside network speed",
             )
+        } else if reading
+            .as_ref()
+            .is_none_or(|r| r.cpu.is_none() && r.gpu.is_none())
+        {
+            lang.t("等待性能采样", "Waiting for performance sample")
         } else if reading.as_ref().is_some_and(|r| r.gpu.is_none()) {
             lang.t(
                 "GPU 驱动未提供利用率，使用 --% 表示不可用",
                 "GPU driver does not report utilization; --% means unavailable",
+            )
+        } else if cfg!(windows) {
+            lang.t(
+                "CPU 为整机平均占用；GPU 显示所有设备中最忙引擎的使用率",
+                "CPU is the system average; GPU is the busiest engine across all devices",
             )
         } else {
             lang.t(
@@ -1660,6 +1797,15 @@ impl App {
         };
         ui.interact(line, ui.id().with("performance-hint"), egui::Sense::hover())
             .on_hover_text(hint);
+        #[cfg(windows)]
+        ui.label(
+            RichText::new(lang.t(
+                "在任务栏按住网速或 CPU/GPU 拖动，可交换前后位置",
+                "Drag either taskbar group to reorder.",
+            ))
+            .size(10.5)
+            .color(p.subtext),
+        );
     }
 
     /// 设置改动后立刻生效并落盘。
@@ -1672,12 +1818,13 @@ impl App {
         // 清掉缓存，逼 `sync_tray_title` 下一帧重画：只改了配色时文字没变，
         // 不清缓存就不会重新上色。
         self.tray_title.clear();
+        #[cfg(any(target_os = "macos", windows))]
+        self.performance.configure(
+            self.settings.performance_enabled,
+            self.settings.performance_interval,
+        );
         #[cfg(target_os = "macos")]
         {
-            self.performance.configure(
-                self.settings.performance_enabled,
-                self.settings.performance_interval,
-            );
             self.performance_title.clear();
             self.performance_tray_retry = Instant::now();
             self.sync_performance_tray();
@@ -2798,6 +2945,92 @@ fn option_row<T: Copy + PartialEq>(
     changed
 }
 
+/// 自定义色即时生效；十六进制输入未完成时保留草稿，合法后才保存。
+fn color_option_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    lang: Lang,
+    label: &str,
+    current: &mut Option<tm_core::color::Rgb>,
+    automatic: tm_core::color::Rgb,
+) -> bool {
+    use tm_core::color::Rgb;
+    let before = *current;
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), egui::Sense::hover());
+    let ctl_w = 218.0_f32.min(rect.width() * 0.65);
+    let ctl = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - ctl_w, rect.top() + 3.0),
+        egui::pos2(rect.right(), rect.bottom() - 3.0),
+    );
+    let label_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(2.0, 0.0),
+        egui::pos2(ctl.left() - 6.0, rect.bottom()),
+    );
+    ellipsis_text(ui.painter(), label_rect, label, 12.0, p.text, Align::Min);
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("color-row", label))
+            .max_rect(ctl)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    row.spacing_mut().item_spacing.x = 6.0;
+    row.spacing_mut().interact_size = Vec2::new(32.0, 24.0);
+    let color = current.unwrap_or(automatic);
+    let mut srgb = [color.0, color.1, color.2];
+    let swatch = row.color_edit_button_srgb(&mut srgb).on_hover_text(lang.t(
+        "点击选择颜色，也可输入 #RRGGBB",
+        "Pick a color or enter #RRGGBB",
+    ));
+    swatch.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if swatch.changed() {
+        *current = Some(Rgb(srgb[0], srgb[1], srgb[2]));
+    }
+
+    let draft_id = row.id().with("hex-draft");
+    let mut draft = row
+        .data(|data| data.get_temp::<String>(draft_id))
+        .unwrap_or_else(|| current.unwrap_or(automatic).to_hex());
+    if swatch.changed() {
+        draft = current.unwrap_or(automatic).to_hex();
+    }
+    let input = row.add_sized(
+        [86.0, 24.0],
+        egui::TextEdit::singleline(&mut draft)
+            .font(egui::TextStyle::Monospace)
+            .char_limit(7)
+            .hint_text("#RRGGBB"),
+    );
+    input.clone().on_hover_text(format!("{label} · #RRGGBB"));
+    if input.changed() {
+        if let Some(color) = Rgb::from_hex(&draft) {
+            *current = Some(color);
+        }
+    }
+    let reset = row
+        .add_enabled(
+            current.is_some(),
+            egui::Button::new(lang.t("默认", "Default")).min_size(Vec2::new(56.0, 24.0)),
+        )
+        .on_hover_text(lang.t(
+            "恢复随系统明暗切换的默认颜色",
+            "Restore the color for the system theme",
+        ));
+    if reset.clicked() {
+        *current = None;
+    }
+    // has_focus 会读取 Context，必须在持有 data_mut 写锁之前查询。
+    let keep_draft = input.has_focus() && !reset.clicked();
+    row.data_mut(|data| {
+        if keep_draft {
+            data.insert_temp(draft_id, draft);
+        } else {
+            data.remove::<String>(draft_id);
+        }
+    });
+    *current != before
+}
+
 /// 设置项：左边标签，右边一个开关。返回是否被点击。
 ///
 /// 行矩形由调用方给定，不走流式布局：设置页底部那行要贴着面板底边定位
@@ -3521,7 +3754,7 @@ fn install_tray_handler() {
 /// 贴片窗口拿不到 `&mut App`，所以只往 channel 里塞一条事件，真正的开合
 /// 仍然在 `update()` 里按状态决定——两边各记一份「面板开没开」迟早对不上。
 #[cfg(windows)]
-pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>) {
+pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>, performance: bool) {
     let Some(r) = at else {
         // 连自己的矩形都拿不到（窗口正在销毁）：退回按托盘图标摆
         if let Some(tx) = TRAY_TX.get() {
@@ -3539,7 +3772,17 @@ pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>) {
         h: r.h as f32,
     };
     if let Some(tx) = TRAY_TX.get() {
-        let _ = tx.send(TrayEvent::BadgeClick { at });
+        let _ = tx.send(TrayEvent::BadgeClick { at, performance });
+    }
+    if let Some(ctx) = CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn badge_reordered(performance_first: bool) {
+    if let Some(tx) = TRAY_TX.get() {
+        let _ = tx.send(TrayEvent::BadgeReordered { performance_first });
     }
     if let Some(ctx) = CTX.get() {
         ctx.request_repaint();
@@ -3854,6 +4097,54 @@ mod tests {
                 if frame >= 3 {
                     assert_eq!(window, Window::Hour1);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn color_rows_render_in_both_languages_without_changing_automatic_values() {
+        use tm_core::color::Rgb;
+        for dark in [false, true] {
+            for lang in [Lang::Zh, Lang::En] {
+                let ctx = egui::Context::default();
+                theme::install_cjk(&ctx);
+                let mut automatic = None;
+                let mut custom = Some(Rgb(255, 128, 0));
+                for _ in 0..3 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(WINDOW_W, PANEL_H),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                settings_group(ui, &theme::palette(dark), "Colors", |ui| {
+                                    assert!(!color_option_row(
+                                        ui,
+                                        &theme::palette(dark),
+                                        lang,
+                                        lang.t("CPU 颜色", "CPU color"),
+                                        &mut automatic,
+                                        tm_core::color::cpu(dark)
+                                    ));
+                                    assert!(!color_option_row(
+                                        ui,
+                                        &theme::palette(dark),
+                                        lang,
+                                        lang.t("GPU 颜色", "GPU color"),
+                                        &mut custom,
+                                        tm_core::color::gpu(dark)
+                                    ));
+                                });
+                            });
+                        },
+                    );
+                }
+                assert_eq!(automatic, None);
+                assert_eq!(custom, Some(Rgb(255, 128, 0)));
             }
         }
     }

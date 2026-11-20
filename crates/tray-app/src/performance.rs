@@ -1,4 +1,4 @@
-//! 可启停的独立性能采样，不被 nettop 超时或历史库 I/O 阻塞。
+//! 可启停的独立性能采样，不被网络采集或历史库 I/O 阻塞。
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -112,7 +112,10 @@ impl Monitor {
             return;
         }
         self.interval = interval;
+        #[cfg(target_os = "macos")]
         let mut cpu = tm_macos::utilization::CpuSampler::default();
+        #[cfg(windows)]
+        let mut native = tm_windows::utilization::Sampler::default();
         let mock = std::env::var_os("TM_FORCE_MOCK").is_some();
         let started = Instant::now();
         match Worker::spawn(
@@ -125,7 +128,14 @@ impl Monitor {
                         Some(14.0 + 6.0 * (t * 0.3).cos()),
                     )
                 } else {
-                    (cpu.sample(), tm_macos::utilization::gpu_percent())
+                    #[cfg(target_os = "macos")]
+                    {
+                        (cpu.sample(), tm_macos::utilization::gpu_percent())
+                    }
+                    #[cfg(windows)]
+                    {
+                        native.sample()
+                    }
                 }
             },
             self.wake.clone(),

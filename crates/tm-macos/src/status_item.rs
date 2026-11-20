@@ -23,6 +23,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSDictionary, NSMutableAttributedString, NSNumber, NSObjectProtocol, NSRange, NSSize, NSString,
 };
+use tm_core::color::{DisplayColors, Rgb};
 
 struct ClickTargetIvars {
     on_click: Box<dyn Fn() + Send + Sync>,
@@ -39,6 +40,7 @@ pub enum Tone {
     Up,
     Cpu,
     Gpu,
+    Custom(Rgb),
     /// 不区分方向：分隔空格、纯文字模式
     Plain,
 }
@@ -55,6 +57,7 @@ pub struct SpeedLines<'a> {
     pub down: &'a str,
     /// 箭头是否按方向着色；关掉后整段跟随系统标签色
     pub colored: bool,
+    pub colors: DisplayColors,
 }
 
 /// 行高与字号。
@@ -105,10 +108,19 @@ fn tone_color(tone: Tone, dark: bool) -> Retained<NSColor> {
         Tone::Up => tm_core::color::upload(dark),
         Tone::Cpu => tm_core::color::cpu(dark),
         Tone::Gpu => tm_core::color::gpu(dark),
+        Tone::Custom(rgb) => rgb,
         Tone::Plain => return NSColor::labelColor(),
     };
     let (r, g, b) = rgb.to_f64();
     NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
+}
+
+fn configured_tone(colored: bool, custom: Option<Rgb>, default: Tone) -> Tone {
+    if colored {
+        custom.map(Tone::Custom).unwrap_or(default)
+    } else {
+        Tone::Plain
+    }
 }
 
 define_class!(
@@ -202,21 +214,23 @@ impl StatusItem {
 
     /// 设置上下两行的速度文字。
     pub fn set_speed_lines(&self, spec: &SpeedLines) {
-        let up_tone = if spec.colored { Tone::Up } else { Tone::Plain };
-        let down_tone = if spec.colored {
-            Tone::Down
-        } else {
-            Tone::Plain
-        };
+        let up_tone = configured_tone(spec.colored, spec.colors.upload, Tone::Up);
+        let down_tone = configured_tone(spec.colored, spec.colors.download, Tone::Down);
 
-        // 箭头带色、数字跟系统标签色走：数字是主要信息，染色反而降对比度，
-        // 箭头染一下 + 固定的上下位置就已经能把两个方向分开了。
+        // 自动配色保留原来的标签色数字；自定义色应用到对应整行。
+        // 窄空格保留标签与数字的分隔，同时收紧菜单栏宽度。
         self.apply_parts(&[
-            ("↑ ", up_tone),
-            (spec.up, Tone::Plain),
+            ("↑\u{2009}", up_tone),
+            (
+                spec.up,
+                configured_tone(spec.colored, spec.colors.upload, Tone::Plain),
+            ),
             ("\n", Tone::Plain),
-            ("↓ ", down_tone),
-            (spec.down, Tone::Plain),
+            ("↓\u{2009}", down_tone),
+            (
+                spec.down,
+                configured_tone(spec.colored, spec.colors.download, Tone::Plain),
+            ),
         ]);
     }
 
@@ -226,13 +240,25 @@ impl StatusItem {
     }
 
     /// CPU 在上、GPU 在下，共用一个状态项及与网速相同的两行字形和固定宽度数值。
-    pub fn set_utilization_lines(&self, cpu: &str, gpu: &str, colored: bool) {
+    pub fn set_utilization_lines(
+        &self,
+        cpu: &str,
+        gpu: &str,
+        colored: bool,
+        colors: DisplayColors,
+    ) {
         self.apply_parts(&[
-            ("CPU ", if colored { Tone::Cpu } else { Tone::Plain }),
-            (cpu, Tone::Plain),
+            (
+                "CPU\u{2009}",
+                configured_tone(colored, colors.cpu, Tone::Cpu),
+            ),
+            (cpu, configured_tone(colored, colors.cpu, Tone::Plain)),
             ("\n", Tone::Plain),
-            ("GPU ", if colored { Tone::Gpu } else { Tone::Plain }),
-            (gpu, Tone::Plain),
+            (
+                "GPU\u{2009}",
+                configured_tone(colored, colors.gpu, Tone::Gpu),
+            ),
+            (gpu, configured_tone(colored, colors.gpu, Tone::Plain)),
         ]);
     }
 
@@ -269,7 +295,7 @@ impl StatusItem {
         let s =
             NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &text);
 
-        // 整段先统一字体，再按段落刷颜色。UTF-16 长度：我们只用 ASCII 和箭头，
+        // 整段先统一字体，再按段落刷颜色。UTF-16 长度：标题包含箭头与窄空格，
         // 与字节长度不同，不能用 joined.len()。
         let total = joined.encode_utf16().count();
         unsafe {
@@ -487,6 +513,19 @@ fn make_template_image(rgba: &[u8], width: u32, height: u32) -> Option<Retained<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_tones_apply_to_text_and_mono_uses_system_label() {
+        let custom = Rgb(255, 128, 0);
+        for default in [Tone::Cpu, Tone::Gpu, Tone::Down, Tone::Up, Tone::Plain] {
+            assert_eq!(
+                configured_tone(true, Some(custom), default),
+                Tone::Custom(custom)
+            );
+            assert_eq!(configured_tone(true, None, default), default);
+            assert_eq!(configured_tone(false, Some(custom), default), Tone::Plain);
+        }
+    }
 
     #[test]
     fn each_status_target_keeps_its_own_callback_and_releases_it() {

@@ -19,7 +19,7 @@ mod export;
 mod icon;
 mod icons;
 mod instance;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod performance;
 mod settings;
 mod surface;

@@ -6,6 +6,7 @@
 //! 配置文件坏掉不能让整个程序起不来。
 
 use std::path::PathBuf;
+use tm_core::color::{DisplayColors, Rgb};
 
 /// 状态栏显示内容。
 ///
@@ -55,11 +56,15 @@ pub struct Settings {
     pub tray_color: bool,
     /// 是否显示 Windows 原生任务栏网速区域。
     pub tray_badge: bool,
-    /// macOS：CPU / GPU 共用一个双行状态项，由总开关同时控制。
+    /// Windows 任务栏：性能在网速之前；拖动两组或设置页均可修改。
+    pub taskbar_performance_first: bool,
+    /// CPU / GPU 共用一个双行区块（macOS 菜单栏 / Windows 任务栏）。
     pub performance_enabled: bool,
     pub performance_color: bool,
     /// 性能采样间隔，只提供 1 / 2 / 5 秒。
     pub performance_interval: u64,
+    /// 两个平台共用的四项显示色；未配置时继续跟随系统明暗主题。
+    pub display_colors: DisplayColors,
     /// 启动后自动检查新版本。
     ///
     /// **默认关闭**（2026-11-19 决定先不上线）：清单地址还没定，
@@ -85,9 +90,11 @@ impl Default for Settings {
             alert_mb: 0,
             tray_color: true,
             tray_badge: true,
+            taskbar_performance_first: false,
             performance_enabled: false,
             performance_color: true,
             performance_interval: 2,
+            display_colors: DisplayColors::default(),
             update_check: false,
             last_check: 0,
         }
@@ -174,6 +181,11 @@ impl Settings {
                     "off" | "false" | "0" => s.tray_badge = false,
                     _ => {}
                 },
+                "taskbar_performance_first" => {
+                    if let Some(value) = parse_bool(v) {
+                        s.taskbar_performance_first = value;
+                    }
+                }
                 "update_check" => match v {
                     "on" | "true" | "1" => s.update_check = true,
                     "off" | "false" | "0" => s.update_check = false,
@@ -192,6 +204,21 @@ impl Settings {
                 "performance_interval" => {
                     if let Ok(value @ (1 | 2 | 5)) = v.parse::<u64>() {
                         s.performance_interval = value;
+                    }
+                }
+                "download_color" | "upload_color" | "cpu_color" | "gpu_color" => {
+                    let color = if v.eq_ignore_ascii_case("auto") {
+                        Some(None)
+                    } else {
+                        Rgb::from_hex(v).map(Some)
+                    };
+                    if let Some(color) = color {
+                        match k {
+                            "download_color" => s.display_colors.download = color,
+                            "upload_color" => s.display_colors.upload = color,
+                            "cpu_color" => s.display_colors.cpu = color,
+                            _ => s.display_colors.gpu = color,
+                        }
                     }
                 }
                 "last_check" => {
@@ -231,9 +258,14 @@ impl Settings {
              alert_mb={}\n\
              tray_color={}\n\
              tray_badge={}\n\
+             taskbar_performance_first={}\n\
              performance_enabled={}\n\
              performance_color={}\n\
              performance_interval={}\n\
+             download_color={}\n\
+             upload_color={}\n\
+             cpu_color={}\n\
+             gpu_color={}\n\
              update_check={}\n\
              last_check={}\n",
             self.max_apps,
@@ -241,6 +273,11 @@ impl Settings {
             self.alert_mb,
             if self.tray_color { "on" } else { "off" },
             if self.tray_badge { "on" } else { "off" },
+            if self.taskbar_performance_first {
+                "on"
+            } else {
+                "off"
+            },
             if self.performance_enabled {
                 "on"
             } else {
@@ -248,10 +285,18 @@ impl Settings {
             },
             if self.performance_color { "on" } else { "off" },
             self.performance_interval,
+            serialize_color(self.display_colors.download),
+            serialize_color(self.display_colors.upload),
+            serialize_color(self.display_colors.cpu),
+            serialize_color(self.display_colors.gpu),
             if self.update_check { "on" } else { "off" },
             self.last_check
         )
     }
+}
+
+fn serialize_color(color: Option<Rgb>) -> String {
+    color.map(Rgb::to_hex).unwrap_or_else(|| "auto".into())
 }
 
 /// 把任意数字吸附到界面上真实提供的三档。
@@ -325,9 +370,16 @@ mod tests {
             alert_mb: 500,
             tray_color: false,
             tray_badge: false,
+            taskbar_performance_first: true,
             performance_enabled: true,
             performance_color: false,
             performance_interval: 5,
+            display_colors: DisplayColors {
+                download: Some(Rgb(255, 123, 0)),
+                upload: Some(Rgb(1, 2, 3)),
+                cpu: Some(Rgb(0, 255, 255)),
+                gpu: None,
+            },
             update_check: false,
             last_check: 1_700_000_000,
         };
@@ -406,5 +458,45 @@ mod tests {
             );
         }
         assert!(!Settings::parse("performance_enabled=maybe").performance_enabled);
+    }
+
+    #[test]
+    fn taskbar_order_defaults_to_network_and_survives_restart() {
+        assert!(!Settings::parse("theme=dark").taskbar_performance_first);
+        for value in ["on", "true", "1"] {
+            let settings = Settings::parse(&format!("taskbar_performance_first={value}"));
+            assert!(settings.taskbar_performance_first);
+            assert_eq!(Settings::parse(&settings.serialize()), settings);
+        }
+        assert!(!Settings::parse("taskbar_performance_first=invalid").taskbar_performance_first);
+        let back = Settings::parse("taskbar_performance_first=on\ntaskbar_performance_first=off");
+        assert!(!back.taskbar_performance_first);
+        assert_eq!(Settings::parse(&back.serialize()), back);
+    }
+
+    #[test]
+    fn display_colors_validate_hex_preserve_black_and_restore_theme_defaults() {
+        let settings = Settings::parse(
+            "download_color=#ff8800\nupload_color=#000000\ncpu_color=#aaBBcc\ngpu_color=auto",
+        );
+        assert_eq!(settings.display_colors.download, Some(Rgb(255, 136, 0)));
+        assert_eq!(settings.display_colors.upload, Some(Rgb(0, 0, 0)));
+        assert_eq!(settings.display_colors.cpu, Some(Rgb(170, 187, 204)));
+        assert_eq!(settings.display_colors.gpu, None);
+        assert_eq!(Settings::parse(&settings.serialize()), settings);
+        assert_eq!(
+            Settings::parse("theme=dark").display_colors,
+            DisplayColors::default()
+        );
+        for bad in ["#xyzxyz", "#123", "#11223344", "#中文", "red", "123456", ""] {
+            let settings = Settings::parse(&format!("cpu_color=#112233\ncpu_color={bad}"));
+            assert_eq!(settings.display_colors.cpu, Some(Rgb(17, 34, 51)));
+        }
+        assert_eq!(
+            Settings::parse("cpu_color=#112233\ncpu_color=auto")
+                .display_colors
+                .cpu,
+            None
+        );
     }
 }

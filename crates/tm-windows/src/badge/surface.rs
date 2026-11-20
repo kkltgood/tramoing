@@ -1,5 +1,5 @@
 //! 灰度字形覆盖率 → 预乘 BGRA，交给 DWM 与真实任务栏背景合成。
-use super::{client_rect, wide, Content};
+use super::{client_rect, wide, Content, Group};
 use std::ptr::{null, null_mut};
 use tm_core::color::Rgb;
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
@@ -12,11 +12,105 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA
 const HIT_ALPHA: u32 = 1;
 
 // 12px 字号下保留最宽四字符（如 999M）的空间，收紧箭头列及左右留白。
-pub(super) const WIDTH_DIP: i32 = 44;
-const ARROW_LEFT_DIP: i32 = 2;
-const ARROW_RIGHT_DIP: i32 = 10;
-const NUMBER_LEFT_DIP: i32 = 11;
-const RIGHT_PADDING_DIP: i32 = 2;
+pub(super) const WIDTH_DIP: i32 = 40;
+const PERFORMANCE_WIDTH_DIP: i32 = 58;
+// 两组之间明确留白，不能把速率单位和 CPU/GPU 标签连成一个词。
+const GROUP_GAP_DIP: i32 = 4;
+const ARROW_LEFT_DIP: i32 = 1;
+const ARROW_RIGHT_DIP: i32 = 8;
+const NUMBER_LEFT_DIP: i32 = 8;
+const PERFORMANCE_LABEL_RIGHT_DIP: i32 = 24;
+const PERFORMANCE_NUMBER_LEFT_DIP: i32 = 27;
+const RIGHT_PADDING_DIP: i32 = 1;
+
+pub(super) fn width_dip(content: &Content) -> i32 {
+    i32::from(content.speed.is_some()) * WIDTH_DIP
+        + i32::from(content.performance.is_some()) * PERFORMANCE_WIDTH_DIP
+        + i32::from(content.speed.is_some() && content.performance.is_some()) * GROUP_GAP_DIP
+}
+
+pub(super) fn minimum_width_dip(content: &Content) -> i32 {
+    if content.performance.is_some() {
+        PERFORMANCE_WIDTH_DIP
+    } else {
+        WIDTH_DIP
+    }
+}
+
+pub(super) struct Layout {
+    pub speed: Option<RECT>,
+    pub performance: Option<RECT>,
+}
+
+impl Layout {
+    pub fn group_at(&self, x: i32, y: i32) -> Option<Group> {
+        [
+            (Group::Speed, self.speed),
+            (Group::Performance, self.performance),
+        ]
+        .into_iter()
+        .find_map(|(group, rect)| rect.filter(|r| super::contains(*r, x, y)).map(|_| group))
+    }
+
+    pub fn stacked(&self) -> bool {
+        matches!((self.speed, self.performance), (Some(s), Some(p)) if s.top != p.top)
+    }
+}
+
+pub(super) fn layout(content: &Content, width: i32, height: i32, dpi: i32) -> Layout {
+    let full = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    let (speed, performance) = if content.speed.is_some() && content.performance.is_some() {
+        if width < width_dip(content) * dpi / 96 {
+            // Win10 竖向任务栏：两组上下排列，点击和绘制共用这份布局。
+            let (first, second) = (
+                RECT {
+                    bottom: height / 2,
+                    ..full
+                },
+                RECT {
+                    top: height / 2,
+                    ..full
+                },
+            );
+            if content.performance_first {
+                (second, first)
+            } else {
+                (first, second)
+            }
+        } else {
+            let (first_width, second_width) = if content.performance_first {
+                (PERFORMANCE_WIDTH_DIP, WIDTH_DIP)
+            } else {
+                (WIDTH_DIP, PERFORMANCE_WIDTH_DIP)
+            };
+            let first = RECT {
+                right: first_width * dpi / 96,
+                ..full
+            };
+            // 各组宽度按相同规则单独取整，避免换序时 125% / 175% 下少一个像素。
+            let second = RECT {
+                left: width - second_width * dpi / 96,
+                ..full
+            };
+            if content.performance_first {
+                (second, first)
+            } else {
+                (first, second)
+            }
+        }
+    } else {
+        (full, full)
+    };
+    Layout {
+        speed: content.speed.as_ref().map(|_| speed),
+        performance: content.performance.as_ref().map(|_| performance),
+    }
+}
 
 pub(super) unsafe fn present(hwnd: HWND, content: &Content) -> Result<(), &'static str> {
     let rect = client_rect(hwnd).ok_or("无法读取网速控件尺寸")?;
@@ -118,15 +212,8 @@ impl Drop for Surface {
     }
 }
 
-unsafe fn rasterize(
-    content: &Content,
-    width: i32,
-    height: i32,
-    dpi: i32,
-) -> Result<Surface, &'static str> {
-    let mut surface = Surface::new(width, height)?;
-    surface.pixels_mut().fill(0);
-    let font = CreateFontW(
+unsafe fn create_font(dpi: i32) -> HFONT {
+    CreateFontW(
         -12 * dpi / 96,
         0,
         0,
@@ -142,7 +229,18 @@ unsafe fn rasterize(
         ANTIALIASED_QUALITY as u32,
         DEFAULT_PITCH as u32,
         wide("Segoe UI").as_ptr(),
-    );
+    )
+}
+
+unsafe fn rasterize(
+    content: &Content,
+    width: i32,
+    height: i32,
+    dpi: i32,
+) -> Result<Surface, &'static str> {
+    let mut surface = Surface::new(width, height)?;
+    surface.pixels_mut().fill(0);
+    let font = create_font(dpi);
     if font.is_null() {
         return Err("无法创建网速字体");
     }
@@ -153,43 +251,25 @@ unsafe fn rasterize(
     }
     SetBkMode(surface.dc, TRANSPARENT as i32);
     SetTextColor(surface.dc, 0x00ff_ffff);
-    let line = (14 * dpi / 96).min(height / 2);
-    let top = (height - line * 2) / 2;
+    let layout = layout(content, width, height, dpi);
     let mut drawn = true;
-    for (i, (arrow, number)) in [("↓", &content.down), ("↑", &content.up)]
-        .iter()
-        .enumerate()
-    {
-        // 箭头的列宽和位置独立于数字；数字单独右对齐，单位切换也不会挤动箭头。
-        for (text, left, right, align) in [
-            (
-                *arrow,
-                ARROW_LEFT_DIP * dpi / 96,
-                ARROW_RIGHT_DIP * dpi / 96,
-                DT_CENTER,
-            ),
-            (
-                number.trim(),
-                NUMBER_LEFT_DIP * dpi / 96,
-                width - RIGHT_PADDING_DIP * dpi / 96,
-                DT_RIGHT,
-            ),
-        ] {
-            let text = wide(text);
-            let mut rect = RECT {
-                left,
-                right,
-                top: top + i as i32 * line,
-                bottom: top + (i as i32 + 1) * line,
-            };
-            drawn &= DrawTextW(
-                surface.dc,
-                text.as_ptr(),
-                (text.len() - 1) as i32,
-                &mut rect,
-                align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            ) != 0;
-        }
+    if let (Some(speed), Some(rect)) = (&content.speed, layout.speed) {
+        drawn &= draw_lines(
+            surface.dc,
+            rect,
+            dpi,
+            [("↓", &speed.down), ("↑", &speed.up)],
+            false,
+        );
+    }
+    if let (Some(performance), Some(rect)) = (&content.performance, layout.performance) {
+        drawn &= draw_lines(
+            surface.dc,
+            rect,
+            dpi,
+            [("CPU", &performance.cpu), ("GPU", &performance.gpu)],
+            true,
+        );
     }
     SelectObject(surface.dc, old);
     DeleteObject(font);
@@ -203,23 +283,98 @@ unsafe fn rasterize(
         .chunks_exact_mut(width as usize)
         .enumerate()
     {
-        let color = if content.colored {
-            if y < height as usize / 2 {
-                tm_core::color::download(!content.light)
-            } else {
-                tm_core::color::upload(!content.light)
-            }
-        } else if content.light {
-            Rgb(24, 24, 28)
-        } else {
-            Rgb(238, 238, 242)
-        };
-        for pixel in row {
+        for (x, pixel) in row.iter_mut().enumerate() {
+            let color = text_color(content, &layout, x as i32, y as i32);
             let coverage = (*pixel & 0xff) as u8;
             *pixel = premultiply(coverage, color);
         }
     }
     Ok(surface)
+}
+
+unsafe fn draw_lines(
+    dc: HDC,
+    area: RECT,
+    dpi: i32,
+    lines: [(&str, &str); 2],
+    performance: bool,
+) -> bool {
+    let height = area.bottom - area.top;
+    let line = (14 * dpi / 96).min(height / 2);
+    let top = area.top + (height - line * 2) / 2;
+    let mut drawn = true;
+    for (i, (label, number)) in lines.into_iter().enumerate() {
+        // 固定标签列；百分比靠左贴近 CPU/GPU，速率右对齐以保持单位对齐。
+        for (text, left, right, align) in [
+            (
+                label,
+                ARROW_LEFT_DIP,
+                if performance {
+                    PERFORMANCE_LABEL_RIGHT_DIP
+                } else {
+                    ARROW_RIGHT_DIP
+                },
+                if performance { DT_LEFT } else { DT_CENTER },
+            ),
+            (
+                number.trim(),
+                if performance {
+                    PERFORMANCE_NUMBER_LEFT_DIP
+                } else {
+                    NUMBER_LEFT_DIP
+                },
+                0,
+                if performance { DT_LEFT } else { DT_RIGHT },
+            ),
+        ] {
+            let text = wide(text);
+            let mut rect = RECT {
+                left: area.left + left * dpi / 96,
+                right: if right == 0 {
+                    area.right - RIGHT_PADDING_DIP * dpi / 96
+                } else {
+                    area.left + right * dpi / 96
+                },
+                top: top + i as i32 * line,
+                bottom: top + (i as i32 + 1) * line,
+            };
+            drawn &= DrawTextW(
+                dc,
+                text.as_ptr(),
+                (text.len() - 1) as i32,
+                &mut rect,
+                align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            ) != 0;
+        }
+    }
+    drawn
+}
+
+fn text_color(content: &Content, layout: &Layout, x: i32, y: i32) -> Rgb {
+    let contains = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+    if let (Some(performance), Some(rect)) = (&content.performance, layout.performance) {
+        if performance.colored && contains(rect) {
+            return if y < (rect.top + rect.bottom) / 2 {
+                content.colors.cpu(!content.light)
+            } else {
+                content.colors.gpu(!content.light)
+            };
+        }
+    }
+    if let (Some(speed), Some(rect)) = (&content.speed, layout.speed) {
+        if speed.colored && contains(rect) {
+            return if y < (rect.top + rect.bottom) / 2 {
+                content.colors.download(!content.light)
+            } else {
+                content.colors.upload(!content.light)
+            };
+        }
+    }
+    if content.light {
+        Rgb(24, 24, 28)
+    } else {
+        Rgb(238, 238, 242)
+    }
 }
 
 fn premultiply(coverage: u8, color: Rgb) -> u32 {
@@ -234,6 +389,328 @@ fn premultiply(coverage: u8, color: Rgb) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::badge::{Performance, Speed};
+
+    fn content(light: bool, colored: bool) -> Content {
+        Content {
+            speed: Some(Speed {
+                down: "999M".into(),
+                up: "1.5G".into(),
+                colored: !colored,
+            }),
+            performance: Some(Performance {
+                cpu: "100%".into(),
+                gpu: " --%".into(),
+                colored,
+            }),
+            light,
+            colors: Default::default(),
+            performance_first: false,
+        }
+    }
+
+    #[test]
+    fn compact_columns_fit_the_widest_values_at_each_dpi() {
+        for dpi in [96, 120, 144, 168, 192] {
+            let surface = unsafe { Surface::new(1, 1).unwrap() };
+            let font = unsafe { create_font(dpi) };
+            assert!(!font.is_null());
+            let old = unsafe { SelectObject(surface.dc, font) };
+            let texts = [
+                "CPU", "GPU", "100%", "99%", "--%", "999M", "9.9M", "999B", "999K", "↓", "↑",
+            ];
+            let widths: Vec<_> = texts
+                .iter()
+                .map(|text| {
+                    let text = wide(text);
+                    let mut size = SIZE { cx: 0, cy: 0 };
+                    assert_ne!(
+                        unsafe {
+                            GetTextExtentPoint32W(
+                                surface.dc,
+                                text.as_ptr(),
+                                (text.len() - 1) as i32,
+                                &mut size,
+                            )
+                        },
+                        0
+                    );
+                    size.cx
+                })
+                .collect();
+            unsafe {
+                SelectObject(surface.dc, old);
+                DeleteObject(font);
+            }
+            for (i, width) in widths.into_iter().enumerate() {
+                let available = match i {
+                    0 | 1 => PERFORMANCE_LABEL_RIGHT_DIP * dpi / 96 - ARROW_LEFT_DIP * dpi / 96,
+                    2..=4 => {
+                        PERFORMANCE_WIDTH_DIP * dpi / 96
+                            - RIGHT_PADDING_DIP * dpi / 96
+                            - PERFORMANCE_NUMBER_LEFT_DIP * dpi / 96
+                    }
+                    5..=8 => {
+                        WIDTH_DIP * dpi / 96
+                            - RIGHT_PADDING_DIP * dpi / 96
+                            - NUMBER_LEFT_DIP * dpi / 96
+                    }
+                    _ => ARROW_RIGHT_DIP * dpi / 96 - ARROW_LEFT_DIP * dpi / 96,
+                };
+                assert!(
+                    width <= available,
+                    "{} at {dpi} DPI needs {width}px, available {available}px",
+                    texts[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_colors_reach_each_row_and_mono_ignores_them() {
+        use tm_core::color::DisplayColors;
+        for light in [false, true] {
+            let mut content = content(light, true);
+            content.speed.as_mut().unwrap().colored = true;
+            content.colors = DisplayColors {
+                download: Some(Rgb(255, 128, 0)),
+                upload: Some(Rgb(0, 192, 255)),
+                cpu: Some(Rgb(255, 80, 80)),
+                gpu: Some(Rgb(160, 240, 32)),
+            };
+            let width = width_dip(&content);
+            let mut surface = unsafe { rasterize(&content, width, 48, 96).unwrap() };
+            for color in [
+                content.colors.download,
+                content.colors.upload,
+                content.colors.cpu,
+                content.colors.gpu,
+            ] {
+                assert!(surface
+                    .pixels_mut()
+                    .contains(&premultiply(255, color.unwrap())));
+            }
+            content.speed.as_mut().unwrap().colored = false;
+            content.performance.as_mut().unwrap().colored = false;
+            let mut mono = unsafe { rasterize(&content, width, 48, 96).unwrap() };
+            let expected = premultiply(
+                255,
+                if light {
+                    Rgb(24, 24, 28)
+                } else {
+                    Rgb(238, 238, 242)
+                },
+            );
+            assert!(mono.pixels_mut().contains(&expected));
+            assert!(mono
+                .pixels_mut()
+                .iter()
+                .filter(|p| *p >> 24 == 255)
+                .all(|p| *p == expected));
+        }
+    }
+
+    #[test]
+    fn performance_layout_supports_independent_switches_and_vertical_taskbars() {
+        for (dpi, performance_first) in [96, 120, 144, 168, 192]
+            .into_iter()
+            .flat_map(|dpi| [false, true].map(|first| (dpi, first)))
+        {
+            let mut content = content(false, true);
+            content.performance_first = performance_first;
+            let width = width_dip(&content) * dpi / 96;
+            let horizontal = layout(&content, width, 48 * dpi / 96, dpi);
+            let speed = horizontal.speed.unwrap();
+            let perf = horizontal.performance.unwrap();
+            let (first, second) = if performance_first {
+                (perf, speed)
+            } else {
+                (speed, perf)
+            };
+            assert_eq!(first.left, 0);
+            assert!(second.left - first.right >= GROUP_GAP_DIP * dpi / 96);
+            assert_eq!(second.right, width);
+            assert_eq!(speed.right - speed.left, WIDTH_DIP * dpi / 96);
+            assert_eq!(perf.right - perf.left, PERFORMANCE_WIDTH_DIP * dpi / 96);
+            assert_eq!(horizontal.group_at(speed.left, 0), Some(Group::Speed));
+            assert_eq!(horizontal.group_at(perf.left, 0), Some(Group::Performance));
+            assert_eq!(horizontal.group_at(first.right, 0), None);
+            let vertical = layout(&content, 80 * dpi / 96, 72 * dpi / 96, dpi);
+            let speed = vertical.speed.unwrap();
+            let perf = vertical.performance.unwrap();
+            let (first, second) = if performance_first {
+                (perf, speed)
+            } else {
+                (speed, perf)
+            };
+            assert_eq!(first.bottom, second.top);
+            assert_eq!(vertical.group_at(0, speed.top), Some(Group::Speed));
+            assert_eq!(vertical.group_at(0, perf.top), Some(Group::Performance));
+            content.speed = None;
+            assert_eq!(width_dip(&content), PERFORMANCE_WIDTH_DIP);
+            let only = layout(
+                &content,
+                PERFORMANCE_WIDTH_DIP * dpi / 96,
+                48 * dpi / 96,
+                dpi,
+            );
+            assert!(only.speed.is_none());
+            assert_eq!(only.performance.unwrap().left, 0);
+            content.performance = None;
+            assert_eq!(width_dip(&content), 0);
+        }
+    }
+
+    #[test]
+    fn performance_raster_keeps_labels_fixed_and_colors_independent() {
+        for (dpi, performance_first) in [96, 120, 144, 168, 192]
+            .into_iter()
+            .flat_map(|dpi| [false, true].map(|first| (dpi, first)))
+        {
+            for light in [false, true] {
+                for colored in [false, true] {
+                    for (width_dip, height_dip) in [(102, 48), (80, 72)] {
+                        let (width, height) = (width_dip * dpi / 96, height_dip * dpi / 96);
+                        let mut content = content(light, colored);
+                        content.performance_first = performance_first;
+                        let layout = layout(&content, width, height, dpi);
+                        let perf = layout.performance.unwrap();
+                        let mut labels = None;
+                        for (cpu, gpu) in [("100%", " --%"), ("  0%", "  9%"), (" --%", "100%")] {
+                            content.performance.as_mut().unwrap().cpu = cpu.into();
+                            content.performance.as_mut().unwrap().gpu = gpu.into();
+                            let mut surface =
+                                unsafe { rasterize(&content, width, height, dpi).unwrap() };
+                            let pixels = surface.pixels_mut();
+                            assert_eq!(pixels[0], HIT_ALPHA << 24);
+                            let label_pixels: Vec<_> = (perf.top..perf.bottom)
+                                .flat_map(|y| {
+                                    let start = (y * width + perf.left) as usize;
+                                    pixels[start
+                                        ..start + (PERFORMANCE_NUMBER_LEFT_DIP * dpi / 96) as usize]
+                                        .iter()
+                                        .copied()
+                                })
+                                .collect();
+                            assert!(label_pixels.iter().any(|p| p >> 24 == 255));
+                            if let Some(expected) = &labels {
+                                assert_eq!(&label_pixels, expected);
+                            } else {
+                                labels = Some(label_pixels);
+                            }
+                            // 每个区块的上下两排都必须有完整不透明的字形，且配色不串列。
+                            for area in [layout.speed.unwrap(), perf] {
+                                for (top, bottom) in [
+                                    (area.top, (area.top + area.bottom) / 2),
+                                    ((area.top + area.bottom) / 2, area.bottom),
+                                ] {
+                                    let expected = premultiply(
+                                        255,
+                                        text_color(&content, &layout, area.left, top),
+                                    );
+                                    assert!((top..bottom).any(|y| {
+                                        let row = &pixels[(y * width + area.left) as usize
+                                            ..(y * width + area.right) as usize];
+                                        row.contains(&expected)
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_percentages_stay_by_labels_and_groups_have_visible_separation() {
+        for dpi in [96, 120, 144, 168, 192] {
+            for performance_first in [false, true] {
+                for (case, down, up, cpu, gpu) in [
+                    ("reported", "118B", "144B", "  3%", "  1%"),
+                    ("widest", "999M", "1.5G", "100%", " 99%"),
+                    ("unavailable", "  0B", "  9B", " --%", "100%"),
+                ] {
+                    let mut content = content(false, true);
+                    content.performance_first = performance_first;
+                    content.speed = Some(Speed {
+                        down: down.into(),
+                        up: up.into(),
+                        colored: true,
+                    });
+                    content.performance = Some(Performance {
+                        cpu: cpu.into(),
+                        gpu: gpu.into(),
+                        colored: true,
+                    });
+                    let width = width_dip(&content) * dpi / 96;
+                    let height = 36 * dpi / 96;
+                    let layout = layout(&content, width, height, dpi);
+                    let speed = layout.speed.unwrap();
+                    let perf = layout.performance.unwrap();
+                    let mut surface = unsafe { rasterize(&content, width, height, dpi).unwrap() };
+                    let pixels = surface.pixels_mut();
+                    let bounds = |left, right, top, bottom| {
+                        let occupied: Vec<_> = (left..right)
+                            .filter(|x| {
+                                (top..bottom)
+                                    .any(|y| pixels[(y * width + x) as usize] >> 24 > HIT_ALPHA)
+                            })
+                            .collect();
+                        (*occupied.first().unwrap(), *occupied.last().unwrap())
+                    };
+                    for (top, bottom) in [(0, height / 2), (height / 2, height)] {
+                        let value_left = perf.left + PERFORMANCE_NUMBER_LEFT_DIP * dpi / 96;
+                        let (_, label_end) = bounds(perf.left, value_left, top, bottom);
+                        let (number_start, _) = bounds(value_left, perf.right, top, bottom);
+                        let gap = number_start - label_end - 1;
+                        assert!(
+                            gap >= 3 * dpi / 96 && gap <= 7 * dpi / 96,
+                            "{case} at {dpi} DPI: label/value gap {gap}px is too large or missing"
+                        );
+                        let (first, second) = if performance_first {
+                            (perf, speed)
+                        } else {
+                            (speed, perf)
+                        };
+                        let (_, first_end) = bounds(first.left, first.right, top, bottom);
+                        let (second_start, _) = bounds(second.left, second.right, top, bottom);
+                        assert!(
+                            second_start - first_end > GROUP_GAP_DIP * dpi / 96,
+                            "{case} at {dpi} DPI: groups touch"
+                        );
+                    }
+                    // 可选输出直接来自生产 GDI 渲染，用截图中的数值复核真实字形。
+                    if let Some(dir) = std::env::var_os("TM_BADGE_REVIEW_DIR") {
+                        use std::io::Write;
+                        let dir = std::path::PathBuf::from(dir);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let mut file = std::io::BufWriter::new(
+                            std::fs::File::create(dir.join(format!(
+                                "{case}-{dpi}-{}.ppm",
+                                if performance_first {
+                                    "performance"
+                                } else {
+                                    "network"
+                                }
+                            )))
+                            .unwrap(),
+                        );
+                        write!(file, "P6\n{width} {height}\n255\n").unwrap();
+                        for &pixel in pixels.iter() {
+                            let alpha = pixel.to_be_bytes()[0] as u32;
+                            for (shift, background) in [(16, 26), (8, 32), (0, 44)] {
+                                let c = ((pixel >> shift) & 0xff)
+                                    + (background * (255 - alpha) + 127) / 255;
+                                file.write_all(&[c.min(255) as u8]).unwrap();
+                            }
+                        }
+                        file.flush().unwrap();
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn transparent_raster_keeps_arrows_fixed_across_rates_and_dpi() {
@@ -245,10 +722,15 @@ mod tests {
                     let mut baseline = None;
                     for (down, up) in [("  0B", "  9B"), ("1.6K", "875B"), ("999M", "1.5G")] {
                         let content = Content {
-                            down: down.into(),
-                            up: up.into(),
+                            speed: Some(Speed {
+                                down: down.into(),
+                                up: up.into(),
+                                colored,
+                            }),
+                            performance: None,
                             light,
-                            colored,
+                            colors: Default::default(),
+                            performance_first: false,
                         };
                         let mut surface =
                             unsafe { rasterize(&content, width, height, dpi).unwrap() };
