@@ -90,9 +90,9 @@ impl Aggregator {
     }
 
     pub fn total(&self) -> (u64, u64) {
-        self.map
-            .values()
-            .fold((0u64, 0u64), |acc, c| (acc.0 + c.rx, acc.1 + c.tx))
+        self.map.values().fold((0u64, 0u64), |acc, c| {
+            (acc.0.saturating_add(c.rx), acc.1.saturating_add(c.tx))
+        })
     }
 
     /// 只保留这些 pid，丢掉已退出的进程（防止长跑时无限增长）。

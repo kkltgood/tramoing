@@ -20,7 +20,7 @@
 
 use std::fs::File;
 use std::io;
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 /// 打开一对伪终端，返回 `(master, slave)`。
 ///
@@ -51,19 +51,31 @@ pub fn open(cols: u16, rows: u16) -> io::Result<(File, File)> {
         return Err(io::Error::last_os_error());
     }
 
-    // SAFETY: 上面刚拿到的两个合法 fd
-    unsafe {
-        let mut t: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(slave, &mut t) == 0 {
-            t.c_oflag &= !libc::OPOST;
-            t.c_lflag &= !libc::ECHO;
-            let _ = libc::tcsetattr(slave, libc::TCSANOW, &t);
+    // 先交给 File 管理，后续配置失败时也会关闭两个描述符。
+    // SAFETY: openpty 成功后返回两个独立且由调用方拥有的 fd。
+    let master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        // SAFETY: File 在整个调用期间持有合法 fd。
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
 
-    // SAFETY: fd 所有权移交给 File，Drop 时由 File 负责关闭
-    let master = unsafe { File::from_raw_fd(master) };
-    let slave = unsafe { File::from_raw_fd(slave) };
+    // SAFETY: 上面刚拿到的两个合法 fd
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave.as_raw_fd(), &mut t) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        t.c_oflag &= !libc::OPOST;
+        t.c_lflag &= !libc::ECHO;
+        if libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &t) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
     Ok((master, slave))
 }
 
@@ -71,6 +83,18 @@ pub fn open(cols: u16, rows: u16) -> io::Result<(File, File)> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn pty_descriptors_are_not_inherited_by_unrelated_children() {
+        use std::os::fd::AsRawFd;
+        let (master, slave) = open(120, 40).unwrap();
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            // SAFETY: the Files above own both descriptors throughout this check.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
 
     #[test]
     fn pty_roundtrip_has_no_carriage_return() {

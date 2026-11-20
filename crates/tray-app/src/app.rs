@@ -641,8 +641,24 @@ impl App {
     }
 
     fn drain_engine(&mut self) {
-        while let Ok(snap) = self.rx.try_recv() {
-            self.latest = Some(snap);
+        match self.rx.try_recv() {
+            Ok(snap) => self.latest = Some(snap),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let snapshot = self.latest.get_or_insert_with(Snapshot::default);
+                snapshot.total_rx = 0.0;
+                snapshot.total_tx = 0.0;
+                snapshot.rates.clear();
+                snapshot.windowed = Default::default();
+                snapshot.error = Some(
+                    self.lang
+                        .t(
+                            "采样线程已停止，请重新启动应用",
+                            "Sampler stopped; restart the app",
+                        )
+                        .into(),
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -1409,7 +1425,8 @@ impl App {
             .map(|s| (s.day_rx, s.day_tx))
             .unwrap_or((0, 0));
         let (srx, stx) = self.session();
-        let (rx, tx) = if day_rx + day_tx > 0 {
+        let has_day = day_rx > 0 || day_tx > 0;
+        let (rx, tx) = if has_day {
             (day_rx, day_tx)
         } else {
             (srx, stx)
@@ -1433,7 +1450,7 @@ impl App {
                     ui.label(
                         RichText::new(format!(
                             "{} {}",
-                            if day_rx + day_tx > 0 {
+                            if has_day {
                                 lang.t("24小时", "24h")
                             } else {
                                 lang.t("本次", "Session")
@@ -2209,8 +2226,10 @@ pub fn export_history_csv(zh: bool) -> String {
             return Ok((0, String::new()));
         }
         let store = tm_store::Store::open_read_only(&path).map_err(|e| e.to_string())?;
+        if store.row_count().map_err(|e| e.to_string())? == 0 {
+            return Ok((0, String::new()));
+        }
         let stamp = store.local_now_stamp().map_err(|e| e.to_string())?;
-        let name = format!("Tramoing-{stamp}.csv");
 
         // 先写「下载」目录；被 TCC 拒绝（用户点了不允许）就退到应用自己的目录，
         // 这两个位置都试过才算真失败。
@@ -2219,10 +2238,25 @@ pub fn export_history_csv(zh: bool) -> String {
             tm_store::default_export_dir(),
             tm_store::data_dir().join("exports"),
         ] {
-            let path = dir.join(&name);
-            match store.export_csv(0, i64::MAX, &path) {
-                Ok(rows) => return Ok((rows, tildify(&path.to_string_lossy()))),
-                Err(e) => last_err = e.to_string(),
+            for suffix in 0..1000 {
+                let name = if suffix == 0 {
+                    format!("Tramoing-{stamp}.csv")
+                } else {
+                    format!("Tramoing-{stamp}-{suffix}.csv")
+                };
+                let path = dir.join(name);
+                match store.export_csv(0, i64::MAX, &path) {
+                    Ok(rows) => return Ok((rows, tildify(&path.to_string_lossy()))),
+                    Err(tm_store::StoreError::Io(e))
+                        if e.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        last_err = e.to_string();
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        break;
+                    }
+                }
             }
         }
         Err(last_err)

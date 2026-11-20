@@ -18,6 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OpenFlags};
 use tm_core::AppKey;
 
+pub mod files;
+
 /// 保留多少天的历史
 pub const RETENTION_DAYS: i64 = 30;
 
@@ -84,9 +86,7 @@ impl Store {
     }
 
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+        std::fs::create_dir_all(files::parent_dir(path))?;
         let conn = Connection::open(path)?;
         let store = Self { conn };
         store.migrate()?;
@@ -271,17 +271,23 @@ impl Store {
         )?)
     }
 
-    /// 导出 CSV。返回写入的数据行数（不含表头）。
+    /// 导出 CSV。返回写入的数据行数（不含表头）；目标存在时返回 AlreadyExists。
     ///
     /// 时间戳交给 SQLite 的 `localtime` 转换：它用的是系统时区数据库，
     /// 夏令时切换、非整点时区都不用我们自己算。
     ///
     /// 文件开头写 UTF-8 BOM —— Windows 版 Excel 没有 BOM 会把中文列名读成乱码。
     pub fn export_csv(&self, from: i64, to: i64, path: &Path) -> Result<u64, StoreError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        // 快速跳过重名文件；提交时仍用 persist_noclobber 防止并发覆盖。
+        if path.try_exists()? {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "导出文件已存在").into(),
+            );
         }
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let parent = files::parent_dir(path);
+        std::fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let mut file = std::io::BufWriter::new(temporary.as_file_mut());
         use std::io::Write;
         write!(file, "\u{feff}")?;
         // 同时给出展示名和原始标识：前者给人看，后者用来做精确筛选
@@ -312,6 +318,12 @@ impl Store {
             count += 1;
         }
         file.flush()?;
+        drop(file);
+        temporary.as_file().sync_all()?;
+        // 同一分钟重复导出也不能覆盖用户之前保存或编辑过的文件。
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
         Ok(count)
     }
 }
@@ -390,6 +402,23 @@ pub fn default_path() -> PathBuf {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn csv_export_preserves_existing_files_and_cleans_failed_exports() {
+        let store = Store::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.csv");
+        std::fs::write(&path, b"user edited export").unwrap();
+        assert!(store.export_csv(0, i64::MAX, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"user edited export");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        store.conn.execute("DROP TABLE samples", []).unwrap();
+        let failed = dir.path().join("failed.csv");
+        assert!(store.export_csv(0, i64::MAX, &failed).is_err());
+        assert!(!failed.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn read_only_export_works_while_another_writer_holds_a_transaction() {
@@ -556,8 +585,8 @@ mod tests {
         s.add_deltas(at(1_700_000_000), &[(app("chrome"), 1000, 100)])
             .unwrap();
 
-        let dir = std::env::temp_dir().join("tm-test-export");
-        let path = dir.join("out.csv");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
         let n = s.export_csv(0, i64::MAX, &path).unwrap();
         assert_eq!(n, 1);
 
@@ -577,7 +606,6 @@ mod tests {
         );
         // datetime(...) 出来的形如 2023-11-14 22:13:00，本地时区不同但格式固定
         assert!(row.starts_with("20"), "时间列应是可读时间：{row}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -35,6 +35,11 @@ impl IconBitmap {
 /// 取 bundle 图标。不是 `.app` 或路径不存在时返回 `None`，
 /// 调用方回退到「首字母色块」，不会出现一个通用的空白文档图标。
 pub fn app_icon(bundle_path: &str) -> Option<IconBitmap> {
+    // Rust 的常驻后台线程没有 Cocoa 事件循环替它清理 autorelease 对象。
+    objc2::rc::autoreleasepool(|_| load_icon(bundle_path))
+}
+
+fn load_icon(bundle_path: &str) -> Option<IconBitmap> {
     if !bundle_path.ends_with(".app") || !std::path::Path::new(bundle_path).exists() {
         return None;
     }

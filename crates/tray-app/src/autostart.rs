@@ -86,10 +86,8 @@ mod imp {
     }
 
     fn write_plist(path: &Path, argv: &[String]) -> Result<(), String> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("创建 LaunchAgents 目录失败：{e}"))?;
-        }
-        std::fs::write(path, plist_xml(argv)).map_err(|e| format!("写入 LaunchAgent 失败：{e}"))
+        tm_store::files::atomic_write(path, plist_xml(argv).as_bytes())
+            .map_err(|e| format!("写入 LaunchAgent 失败：{e}"))
     }
 
     /// 从可执行文件路径反推 `.app` 包路径。

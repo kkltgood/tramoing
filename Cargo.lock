@@ -3842,6 +3842,7 @@ name = "tm-store"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "tempfile",
  "tm-core",
 ]
 
@@ -4002,6 +4003,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tm-core",
  "tm-macos",
  "tm-sampler",
@@ -4009,6 +4011,7 @@ dependencies = [
  "tm-windows",
  "tray-icon",
  "ureq",
+ "url",
  "winresource",
 ]
 

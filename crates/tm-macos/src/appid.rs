@@ -14,7 +14,7 @@
 //! 没有 `.app` 包裹的系统进程（`/usr/sbin/mDNSResponder`）直接拿可执行路径当键，
 //! 读不到路径的（别的用户起的进程）才退化成进程名。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tm_core::pretty_name;
 
@@ -99,7 +99,14 @@ pub fn identify(pid: u32, fallback: &str) -> AppIdentity {
 /// 采样每秒钟都会把同样的进程表送进来一次，不缓存的话每秒要做上百次 syscall。
 #[derive(Debug, Default)]
 pub struct AppResolver {
-    map: HashMap<u32, AppIdentity>,
+    map: HashMap<u32, CachedIdentity>,
+}
+
+#[derive(Debug)]
+struct CachedIdentity {
+    started: Option<(u64, u64)>,
+    fallback: String,
+    identity: AppIdentity,
 }
 
 impl AppResolver {
@@ -109,16 +116,43 @@ impl AppResolver {
 
     /// 解析 pid。`fallback` 取自 nettop 输出里的进程名，只在 syscall 拿不到身份时兜底。
     pub fn resolve(&mut self, pid: u32, fallback: &str) -> AppIdentity {
-        if let Some(id) = self.map.get(&pid) {
-            return id.clone();
+        self.resolve_identity(pid, procname::start_time(pid), fallback, || {
+            identify(pid, fallback)
+        })
+    }
+
+    fn resolve_identity(
+        &mut self,
+        pid: u32,
+        started: Option<(u64, u64)>,
+        fallback: &str,
+        load: impl FnOnce() -> AppIdentity,
+    ) -> AppIdentity {
+        if let Some(cached) = self.map.get(&pid) {
+            if cached.started.is_some()
+                && (started == cached.started || started.is_none())
+                && cached.fallback == fallback
+                && cached.identity.key.starts_with('/')
+            {
+                // nettop 的最后一帧可能来自刚退出的进程，此时保留已知归属。
+                return cached.identity.clone();
+            }
         }
-        let id = identify(pid, fallback);
-        self.map.insert(pid, id.clone());
+        let id = load();
+        self.map.insert(
+            pid,
+            CachedIdentity {
+                started,
+                fallback: fallback.to_owned(),
+                identity: id.clone(),
+            },
+        );
         id
     }
 
     /// 每帧结束后调用：清掉已退出的 pid，防止长时间运行后缓存膨胀。
     pub fn retain_only(&mut self, alive: &[u32]) {
+        let alive: HashSet<_> = alive.iter().copied().collect();
         self.map.retain(|pid, _| alive.contains(pid));
     }
 
@@ -203,14 +237,45 @@ mod tests {
     }
 
     #[test]
-    fn resolver_caches_by_pid() {
+    fn resolver_refreshes_reused_pid_even_if_the_process_name_is_unchanged() {
         let mut r = AppResolver::new();
-        let a = r.resolve(999_999, "verge-mihomo");
-        let b = r.resolve(999_999, "ignored");
-        assert_eq!(a, b);
+        let old = AppIdentity::new("/old/agent", "agent");
+        let new = AppIdentity::new("/new/agent", "agent");
+        assert_eq!(
+            r.resolve_identity(42, Some((1, 0)), "agent", || old.clone()),
+            old
+        );
+        assert_eq!(
+            r.resolve_identity(42, Some((1, 0)), "agent", || panic!("cached")),
+            old
+        );
+        assert_eq!(
+            r.resolve_identity(42, Some((2, 0)), "agent", || new.clone()),
+            new
+        );
         assert_eq!(r.len(), 1);
 
         r.retain_only(&[]);
         assert!(r.is_empty(), "进程退出后缓存应被清理");
+    }
+
+    #[test]
+    fn unresolved_identity_is_retried_instead_of_cached_forever() {
+        let mut r = AppResolver::new();
+        r.resolve_identity(42, None, "agent", || AppIdentity::new("agent", "agent"));
+        let resolved = AppIdentity::new("/Applications/Agent.app", "Agent");
+        assert_eq!(
+            r.resolve_identity(42, Some((1, 0)), "agent", || resolved.clone()),
+            resolved
+        );
+        assert_eq!(r.resolve(999_999, "old").key, "old");
+        assert_eq!(r.resolve(999_999, "new").key, "new");
+        r.resolve_identity(43, Some((1, 0)), "agent", || {
+            AppIdentity::new("agent", "agent")
+        });
+        assert_eq!(
+            r.resolve_identity(43, Some((1, 0)), "agent", || resolved.clone()),
+            resolved
+        );
     }
 }

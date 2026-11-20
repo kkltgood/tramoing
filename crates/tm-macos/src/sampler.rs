@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tm_core::{AppKey, ProcSample};
 use tm_sampler::{Sampler, SamplerError};
@@ -45,7 +45,7 @@ const PTY_ROWS: u16 = 60;
 const SYNTH_PID_BASE: u32 = 1_000_000;
 
 pub struct NettopSampler {
-    rx: Receiver<Vec<FlowRow>>,
+    rx: Receiver<(Instant, Vec<FlowRow>)>,
     child: Child,
     resolver: AppResolver,
     accounting: FlowAccounting,
@@ -57,6 +57,7 @@ pub struct NettopSampler {
     interval: Duration,
     frames: u64,
     reader: Option<thread::JoinHandle<()>>,
+    sampled_at: Option<Instant>,
 }
 
 impl NettopSampler {
@@ -66,14 +67,19 @@ impl NettopSampler {
 
     pub fn spawn_with_interval(interval: Duration) -> Result<Self, SamplerError> {
         let bin = std::env::var("TM_NETTOP_BIN").unwrap_or_else(|_| DEFAULT_NETTOP.to_owned());
+        Self::spawn_command(&bin, interval)
+    }
+
+    fn spawn_command(bin: &str, interval: Duration) -> Result<Self, SamplerError> {
         // nettop 只认整数秒。小于 1 秒按 1 秒算 —— 传 0 会让它退化成忙轮询。
-        let delay = interval.as_secs().max(1).to_string();
+        let interval = Duration::from_secs(interval.as_secs().max(1));
+        let delay = interval.as_secs().to_string();
 
         // -L 0：CSV + 一直采；-n：不做地址反解（稳定、快，名字里也不会冒逗号）
         // 不加 -t：回环连接是回填代理流量的依据，总量在 flows 模块里只取外网。
         let args: Vec<&str> = vec!["-x", "-n", "-L", "0", "-s", delay.as_str()];
 
-        let mut cmd = Command::new(&bin);
+        let mut cmd = Command::new(bin);
         cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::null());
 
         // 关键：stdout 必须是 pty，否则 nettop 走全缓冲，3 秒才吐一批
@@ -107,7 +113,9 @@ impl NettopSampler {
                     let Ok(line) = line else { break };
                     if let Some(rows) = parser.feed(&line) {
                         // 接收端没了（程序退出）就结束线程
-                        if tx.send(rows).is_err() {
+                        // 在读线程记录帧到达时间，数据库阻塞后消费积压帧时
+                        // 仍按原始间隔计算速率，不能按几毫秒的消费间隔计算。
+                        if tx.send((Instant::now(), rows)).is_err() {
                             break;
                         }
                     }
@@ -131,6 +139,7 @@ impl NettopSampler {
             interval,
             frames: 0,
             reader: Some(reader),
+            sampled_at: None,
         })
     }
 
@@ -143,12 +152,16 @@ impl NettopSampler {
 impl Sampler for NettopSampler {
     fn sample(&mut self) -> Result<Vec<ProcSample>, SamplerError> {
         // 正常情况下 nettop 每 interval 给一帧，给 3 倍余量后仍没有就认为卡住了
-        let wait = self.interval * 3 + Duration::from_secs(2);
-        let rows = match self.rx.recv_timeout(wait) {
-            Ok(rows) => rows,
+        let wait = self
+            .interval
+            .saturating_mul(3)
+            .saturating_add(Duration::from_secs(2));
+        let (at, rows) = match self.rx.recv_timeout(wait) {
+            Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => return Err(SamplerError::Timeout),
             Err(RecvTimeoutError::Disconnected) => return Err(SamplerError::Closed),
         };
+        self.sampled_at = Some(at);
 
         self.frames += 1;
 
@@ -213,6 +226,10 @@ impl Sampler for NettopSampler {
         self.interval
     }
 
+    fn sampled_at(&self) -> Option<Instant> {
+        self.sampled_at
+    }
+
     fn counters_start_at_zero(&self) -> bool {
         true
     }
@@ -242,15 +259,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queued_frames_use_read_time_instead_of_consumption_time() {
+        // 使用立刻退出的本地程序，随后注入帧，不运行真实 nettop 或修改环境变量。
+        let mut sampler =
+            NettopSampler::spawn_command("/usr/bin/true", Duration::from_millis(20)).unwrap();
+        assert_eq!(sampler.interval(), Duration::from_secs(1));
+        let (tx, rx) = mpsc::channel();
+        sampler.rx = rx;
+        let start = Instant::now();
+        for i in 0..3 {
+            let mut parser = FlowParser::new();
+            parser.feed("time,,interface,state,bytes_in,bytes_out,");
+            parser.feed("t,test-client.999999,,,0,0,");
+            parser.feed(&format!(
+                "t,tcp4 192.0.2.1:50000<->198.51.100.1:443,en0,Established,{},0,",
+                i * 1000
+            ));
+            tx.send((start + Duration::from_secs(i), parser.flush()))
+                .unwrap();
+        }
+        let mut calc = tm_core::RateCalculator::with_smoothing(1.0);
+        calc.set_new_counters_start_at_zero(true);
+        for i in 0..3 {
+            let samples = sampler.sample().unwrap();
+            assert_eq!(sampler.sampled_at(), Some(start + Duration::from_secs(i)));
+            calc.update(sampler.sampled_at().unwrap(), &samples);
+            if i > 0 {
+                assert_eq!(calc.total_bps(), (1000.0, 0.0));
+            }
+        }
+        assert_eq!(calc.session_total(), (2000, 0));
+    }
+
+    #[test]
     fn spawn_fails_cleanly_when_binary_missing() {
         // 指向一个不存在的可执行文件，应返回 Spawn 错误而不是 panic
-        let old = std::env::var("TM_NETTOP_BIN").ok();
-        std::env::set_var("TM_NETTOP_BIN", "/nonexistent/nettop");
-        let r = NettopSampler::spawn();
-        match old {
-            Some(v) => std::env::set_var("TM_NETTOP_BIN", v),
-            None => std::env::remove_var("TM_NETTOP_BIN"),
-        }
+        let r = NettopSampler::spawn_command("/nonexistent/nettop", Duration::from_secs(1));
         assert!(matches!(r, Err(SamplerError::Spawn(_))));
     }
 }

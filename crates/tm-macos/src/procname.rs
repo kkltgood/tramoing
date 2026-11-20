@@ -3,8 +3,8 @@
 //! nettop 会把进程名截断到约 20 字符（`Google Chrome H.`、`Codex (Aperitif`），
 //! 直接拿来展示既难读又容易重名。这里走 `libproc` 的 `proc_name(3)` 拿全名。
 //!
-//! 不引入 `libc` crate：`proc_name` 就在 libSystem 里，直接声明 FFI 即可，
-//! 少一个依赖也少一份编译时间。取不到（进程已退出、权限受限）时返回 `None`，
+//! 通过 libSystem 查询进程名称、路径和启动时间。
+//! 取不到（进程已退出、权限受限）时返回 `None`，
 //! 调用方回落到 nettop 给的名字，不影响主流程。
 
 use std::ffi::CStr;
@@ -25,6 +25,28 @@ const PATH_BUF_LEN: usize = 4096;
 
 /// `MAXCOMLEN` 的两倍够放全名，这里给足余量。
 const BUF_LEN: usize = 256;
+
+/// PID 会复用；启动时间用于判断缓存是否仍属于同一个进程。
+pub fn start_time(pid: u32) -> Option<(u64, u64)> {
+    let pid = libc::c_int::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: 缓冲区类型与 PROC_PIDTBSDINFO 匹配；仅在完整写入后读取。
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
 
 /// 取进程可执行名（不含路径）。失败返回 `None`。
 pub fn process_name(pid: u32) -> Option<String> {
@@ -128,6 +150,8 @@ mod tests {
 
     #[test]
     fn invalid_pid_returns_none() {
+        assert!(start_time(std::process::id()).is_some());
+        assert!(start_time(u32::MAX).is_none());
         assert!(process_name(0).is_none());
         // 一个几乎肯定不存在的 pid
         assert!(process_name(999_999).is_none());

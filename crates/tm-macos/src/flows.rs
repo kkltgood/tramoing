@@ -60,7 +60,17 @@ impl FlowRow {
 }
 
 fn is_loopback_ip(ip: &str) -> bool {
-    ip.is_empty() || ip == "localhost" || ip == "::1" || ip.starts_with("127.")
+    if ip == "localhost" {
+        return true;
+    }
+    // 通配地址表示未指定端点，不代表回环；UDP 在物理接口上也会显示 *:*。
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,10 +159,9 @@ fn parse_row(line: &str) -> Row {
     }
 
     // 连接行：`tcp4 127.0.0.1:8021<->*:*` / `udp4 *:67<->*:*`
-    if name.starts_with("tcp") || name.starts_with("udp") {
-        let Some((proto, rest)) = name.split_once(' ') else {
-            return Row::Junk;
-        };
+    if let Some((proto, rest)) = name.split_once(' ').filter(|(proto, rest)| {
+        matches!(*proto, "tcp4" | "tcp6" | "udp4" | "udp6") && rest.contains("<->")
+    }) {
         let Some((left, right)) = rest.split_once("<->") else {
             return Row::Junk;
         };
@@ -521,7 +530,7 @@ const MIN_TUNNEL_BYTES: u64 = 4096;
 /// 转发进程的物理流量 ≈ 隧道里所有 App 的流量之和，只会略多（加密/协议开销）。
 /// 于是挑「没有隧道侧流量、物理流量又最接近隧道总量」的那个进程。
 fn pick_tunnel_owner(acc: &HashMap<u32, PidAcc>, tunnel: Bytes) -> Option<u32> {
-    let total = tunnel.rx + tunnel.tx;
+    let total = tunnel.rx.saturating_add(tunnel.tx);
     if total < MIN_TUNNEL_BYTES {
         return None;
     }
@@ -532,7 +541,7 @@ fn pick_tunnel_owner(acc: &HashMap<u32, PidAcc>, tunnel: Bytes) -> Option<u32> {
         if !a.tun.is_zero() || a.ext.is_zero() {
             continue;
         }
-        let p = (a.ext.rx + a.ext.tx) as f64;
+        let p = a.ext.rx.saturating_add(a.ext.tx) as f64;
         let ratio = p / t;
         if !(0.7..=3.0).contains(&ratio) {
             continue;
@@ -631,6 +640,19 @@ mod tests {
     }
 
     #[test]
+    fn process_names_starting_with_protocol_prefix_keep_their_own_pid() {
+        for name in ["tcpdump", "udp-client", "tcp helper", "tcp4 helper"] {
+            let rows = parse_frame(&format!(
+                "{HEADER}\nt,previous.1,,,0,0,\nt,{name}.42,,,0,0,\n\
+                 t,tcp4 192.0.2.1:50000<->198.51.100.1:443,en0,Established,5,6,"
+            ));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].pid, 42);
+            assert_eq!(rows[0].proc_name, name);
+        }
+    }
+
+    #[test]
     fn header_splits_frames() {
         let sample = format!(
             "{HEADER}\n14:00:00.1,launchd.1,,,1,2,\n\
@@ -696,6 +718,18 @@ mod accounting_tests {
 
     fn listen(pid: u32, name: &str, port: u16) -> FlowRow {
         row(pid, name, "lo0", "Listen", "127.0.0.1", port, "", 0, 0, 0)
+    }
+
+    #[test]
+    fn wildcard_udp_on_a_physical_interface_is_not_loopback() {
+        let mut acc = FlowAccounting::new();
+        let frame = |bytes| {
+            let mut r = row(42, "udp-app", "en0", "", "", 5353, "", 0, bytes, 0);
+            r.proto = "udp4".into();
+            vec![r]
+        };
+        acc.update(&frame(100), resolve);
+        assert_eq!(of(&acc.update(&frame(600), resolve), "udp-app#42").rx, 500);
     }
 
     /// 系统代理下的一次下载：客户端回环 rx = 代理回环 tx = 代理外网 rx。

@@ -1,8 +1,8 @@
 //! 后台采样、原始字节记账、按时间推进的窗口和可重试的历史写入。
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ pub struct WindowedRates {
     pub min10_bytes: Deltas,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub rates: Vec<AppRate>,
     pub windowed: WindowedRates,
@@ -41,14 +41,24 @@ pub struct Snapshot {
 
 /// App 持有线程所有权。正常退出时通知停止、提交最后一批，再回收采集器。
 pub struct Engine {
-    rx: Receiver<Snapshot>,
+    latest: Arc<Mutex<Option<Snapshot>>>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Engine {
     pub fn try_recv(&self) -> Result<Snapshot, mpsc::TryRecvError> {
-        self.rx.try_recv()
+        self.latest.lock().unwrap().take().ok_or_else(|| {
+            if self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                mpsc::TryRecvError::Disconnected
+            } else {
+                mpsc::TryRecvError::Empty
+            }
+        })
     }
 }
 
@@ -122,31 +132,58 @@ impl Pending {
 
 fn recover_pending(store: &mut Store) -> Result<(), String> {
     let dir = recovery_dir();
+    recover_pending_from(store, &dir)
+}
+
+fn recover_pending_from(store: &mut Store, dir: &std::path::Path) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
     }
+    let mut errors = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        let recovery: Recovery = serde_json::from_reader(file).map_err(|e| e.to_string())?;
-        for RecoveryMinute { minute, apps } in recovery.minutes {
-            let deltas: Deltas = apps
-                .into_iter()
-                .map(|(app, rx, tx)| (AppKey::new(app), rx, tx))
-                .collect();
-            store
-                .add_recovered_deltas(
-                    UNIX_EPOCH + Duration::from_secs(minute),
-                    &deltas,
-                    &format!("{}:{minute}", recovery.id),
-                )
-                .map_err(|e| e.to_string())?;
+        if let Err(error) = recover_file(store, &path) {
+            // 一份损坏日志不能阻止其他日志恢复。保留原文件供排查。
+            errors.push(format!("{}：{error}", path.display()));
         }
-        std::fs::remove_file(path).map_err(|e| e.to_string())?;
     }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+fn recover_file(store: &mut Store, path: &std::path::Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let recovery: Recovery = serde_json::from_reader(file).map_err(|e| e.to_string())?;
+    // 先验证整份日志，异常时间戳不能让采样线程 panic 或写入负数分钟。
+    for minute in &recovery.minutes {
+        if minute.minute > i64::MAX as u64
+            || UNIX_EPOCH
+                .checked_add(Duration::from_secs(minute.minute))
+                .is_none()
+        {
+            return Err("恢复日志包含无效时间戳".into());
+        }
+    }
+    for RecoveryMinute { minute, apps } in recovery.minutes {
+        let deltas: Deltas = apps
+            .into_iter()
+            .map(|(app, rx, tx)| (AppKey::new(app), rx, tx))
+            .collect();
+        store
+            .add_recovered_deltas(
+                UNIX_EPOCH + Duration::from_secs(minute),
+                &deltas,
+                &format!("{}:{minute}", recovery.id),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    std::fs::remove_file(path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -182,7 +219,9 @@ pub fn spawn<F>(on_change: F, retention_days: Arc<AtomicI64>) -> Engine
 where
     F: Fn() + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
+    // UI 只需要最新快照。隐藏窗口或主线程暂时阻塞时不积压整小时的应用列表。
+    let latest = Arc::new(Mutex::new(None));
+    let output = latest.clone();
     let (stop, stop_rx) = mpsc::channel();
     let worker = thread::Builder::new()
         .name("sampler".into())
@@ -271,13 +310,14 @@ where
                         }
                     }
                     if let Some(s) = store.as_mut() {
-                        if !mock {
-                            if let Err(e) = recover_pending(s) {
-                                log_error(&format!("恢复未写入历史失败：{e}"));
-                            }
-                        }
+                        let recovery_error = if mock { None } else { recover_pending(s).err() };
                         match pending.flush(s) {
-                            Ok(()) => store_error = None,
+                            Ok(()) => match recovery_error {
+                                Some(e) => {
+                                    set_error(&mut store_error, format!("部分历史尚未恢复：{e}"))
+                                }
+                                None => store_error = None,
+                            },
                             Err(e) => {
                                 set_error(&mut store_error, format!("历史写入失败，将重试：{e}"))
                             }
@@ -321,9 +361,7 @@ where
                     mock,
                     store_error: store_error.clone(),
                 };
-                if tx.send(snapshot).is_err() {
-                    break;
-                }
+                *output.lock().unwrap() = Some(snapshot);
                 on_change();
             }
             // 正常退出先落盘，Drop 随后结束 nettop/管道。
@@ -343,7 +381,7 @@ where
         })
         .expect("无法启动采样线程");
     Engine {
-        rx,
+        latest,
         stop,
         worker: Some(worker),
     }
@@ -414,6 +452,64 @@ fn build_sampler(mock: bool) -> Result<Box<dyn Sampler>, SamplerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_ui_receives_only_the_latest_snapshot_and_observes_shutdown() {
+        let latest = Arc::new(Mutex::new(None));
+        let output = latest.clone();
+        let worker = thread::spawn(move || {
+            for value in 1..=1000 {
+                *output.lock().unwrap() = Some(Snapshot {
+                    session_rx: value,
+                    ..Snapshot::default()
+                });
+            }
+        });
+        while !worker.is_finished() {
+            thread::yield_now();
+        }
+        let (stop, _stopped) = mpsc::channel();
+        let engine = Engine {
+            latest,
+            stop,
+            worker: Some(worker),
+        };
+        assert_eq!(engine.try_recv().unwrap().session_rx, 1000);
+        assert!(matches!(
+            engine.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn damaged_recovery_does_not_block_valid_records_or_duplicate_them_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, b"not json").unwrap();
+        let invalid = dir.path().join("invalid-time.json");
+        std::fs::write(
+            &invalid,
+            format!(
+                r#"{{"id":"bad-time","minutes":[{{"minute":{},"apps":[["bad",10,0]]}}]}}"#,
+                u64::MAX
+            ),
+        )
+        .unwrap();
+        let valid = dir.path().join("valid.json");
+        let bytes = br#"{"id":"good","minutes":[{"minute":120,"apps":[["app",123,45]]}]}"#;
+        std::fs::write(&valid, bytes).unwrap();
+        let mut store = Store::open_memory().unwrap();
+        assert!(recover_pending_from(&mut store, dir.path()).is_err());
+        assert!(!valid.exists());
+        assert!(broken.exists());
+        assert!(invalid.exists());
+        assert_eq!(store.totals_between(0, 180).unwrap()[0].rx, 123);
+        std::fs::write(&valid, bytes).unwrap();
+        assert!(recover_pending_from(&mut store, dir.path()).is_err());
+        let rows = store.totals_between(0, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].rx, rows[0].tx), (123, 45));
+    }
     #[test]
     fn first_delta_survives_flush_and_keeps_original_minute() {
         let mut calc = RateCalculator::with_smoothing(1.0);

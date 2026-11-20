@@ -229,9 +229,9 @@ impl RateCalculator {
 
     /// 会话累计。
     pub fn session_total(&self) -> (u64, u64) {
-        self.session
-            .values()
-            .fold((0, 0), |acc, (rx, tx)| (acc.0 + rx, acc.1 + tx))
+        self.session.values().fold((0u64, 0u64), |acc, (rx, tx)| {
+            (acc.0.saturating_add(*rx), acc.1.saturating_add(*tx))
+        })
     }
 }
 
@@ -248,6 +248,19 @@ fn counter_delta(cur: u64, prev: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_totals_saturate_across_apps() {
+        let mut calc = RateCalculator::new();
+        let start = Instant::now();
+        calc.update(start, &[s(1, "a", 0, 0), s(2, "b", 0, 0)]);
+        calc.update(
+            start + Duration::from_secs(1),
+            &[s(1, "a", u64::MAX, u64::MAX), s(2, "b", 1, 1)],
+        );
+        assert_eq!(calc.session_total(), (u64::MAX, u64::MAX));
+        assert_eq!(calc.snapshot()[0].session_total(), u64::MAX);
+    }
 
     #[test]
     fn ledger_preserves_first_delta_and_sub_display_threshold_bytes() {

@@ -167,38 +167,26 @@ impl Updater {
         }
         self.set(Phase::Checking);
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let ev = match fetch_manifest() {
-                Ok(m) => {
-                    let newer = m
-                        .version
-                        .trim_start_matches(['v', 'V'])
-                        .parse::<semver::Version>()
-                        .ok()
-                        .is_some_and(|remote| {
-                            semver::Version::parse(CURRENT).is_ok_and(|cur| remote > cur)
-                        });
-                    if newer {
-                        let asset = m.platforms.get(PLATFORM).cloned();
-                        Event::Checked(Some(Available {
-                            version: m.version.trim_start_matches(['v', 'V']).to_owned(),
-                            notes: m.notes,
-                            pub_date: m.pub_date,
-                            asset,
-                            homepage: m.homepage,
-                        }))
-                    } else {
-                        Event::Checked(None)
-                    }
-                }
-                Err(e) => Event::Failed(e),
-            };
-            let _ = tx.send(ev);
-        });
+        if let Err(e) = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let ev = match fetch_manifest().and_then(|m| available_update(m, CURRENT, PLATFORM))
+                {
+                    Ok(available) => Event::Checked(available),
+                    Err(e) => Event::Failed(e),
+                };
+                let _ = tx.send(ev);
+            })
+        {
+            self.set(Phase::Error(format!("无法启动更新检查：{e}")));
+        }
     }
 
     /// 开始下载安装包。`asset` 为空（清单没给本平台的包）时什么也不做。
     pub fn download(&mut self, avail: &Available) {
+        if self.is_busy() {
+            return;
+        }
         let Some(asset) = avail.asset.clone() else {
             return;
         };
@@ -208,14 +196,19 @@ impl Updater {
             pct: 0.0,
         });
         let tx = self.tx.clone();
-        std::thread::spawn(move || match download_and_verify(&asset, &version, &tx) {
-            Ok(path) => {
-                let _ = tx.send(Event::Downloaded { version, path });
-            }
-            Err(e) => {
-                let _ = tx.send(Event::DownloadFailed(e));
-            }
-        });
+        if let Err(e) = std::thread::Builder::new()
+            .name("update-download".into())
+            .spawn(move || match download_and_verify(&asset, &version, &tx) {
+                Ok(path) => {
+                    let _ = tx.send(Event::Downloaded { version, path });
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::DownloadFailed(e));
+                }
+            })
+        {
+            self.set(Phase::Error(format!("无法启动下载：{e}")));
+        }
     }
 
     /// 把后台事件吸收进状态。返回 `true` 表示状态变了，界面需要重画。
@@ -261,6 +254,40 @@ impl Updater {
     }
 }
 
+fn parse_version(version: &str) -> Result<semver::Version, String> {
+    let version = version.trim();
+    let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    semver::Version::parse(version).map_err(|e| format!("版本号无效：{e}"))
+}
+
+fn available_update(
+    m: Manifest,
+    current: &str,
+    platform: &str,
+) -> Result<Option<Available>, String> {
+    let remote = parse_version(&m.version)?;
+    let current = parse_version(current)?;
+    // 构建元数据不改变 SemVer 优先级，1.0.0+build2 不是 1.0.0 的新版本。
+    if !remote.cmp_precedence(&current).is_gt() {
+        return Ok(None);
+    }
+    Ok(Some(Available {
+        version: remote.to_string(),
+        notes: m.notes,
+        pub_date: m.pub_date,
+        asset: m.platforms.get(platform).cloned(),
+        homepage: m.homepage,
+    }))
+}
+
+fn http_url(raw: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("网址无效：{e}"))?;
+    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
+        return Err("网址必须使用 http 或 https".into());
+    }
+    Ok(url)
+}
+
 fn agent(timeout: Duration) -> ureq::Agent {
     // native-tls + 系统证书库：企业环境里自签的根证书也能认，
     // 不用把根证书列表打进二进制。
@@ -276,9 +303,9 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 fn fetch_manifest() -> Result<Manifest, String> {
-    let url = manifest_url();
+    let url = http_url(&manifest_url())?;
     let text = agent(Duration::from_secs(8))
-        .get(&url)
+        .get(url.as_str())
         .call()
         .map_err(|e| format!("请求清单失败：{e}"))?
         .body_mut()
@@ -296,27 +323,37 @@ fn download_and_verify(
     version: &str,
     tx: &Sender<Event>,
 ) -> Result<PathBuf, String> {
-    if asset.sha256.trim().len() != 64 {
-        return Err("清单没有提供 sha256，已跳过下载".to_owned());
+    download_to(asset, version, tx, &tm_store::data_dir().join("update"))
+}
+
+fn download_to(
+    asset: &Asset,
+    version: &str,
+    tx: &Sender<Event>,
+    root: &Path,
+) -> Result<PathBuf, String> {
+    let hash = asset.sha256.trim();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("清单没有提供有效的 sha256，已跳过下载".to_owned());
     }
+    let version = parse_version(version)?.to_string();
+    let url = http_url(&asset.url)?;
     // 每个版本单独一个目录：既不会和上个版本的残留包撞名，
     // 清理时也可以整目录删掉，不用猜文件名规则。
-    let dir = tm_store::data_dir().join("update").join(version);
+    let dir = root.join(version);
     std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败：{e}"))?;
-    let file_name = asset
-        .url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("tramoing-setup.exe");
-    let dest = dir.join(file_name.replace(['?', '#'], "_"));
-    // 先写 .part 再改名：下载中断不会留下一个「看起来能用」的半截安装包。
-    let part = dest.with_extension("part");
+    // 文件名由本平台决定。签名网址的查询参数、重定向端点和反斜杠
+    // 不能变成本地文件名，也不能改变安装包扩展名或逃出版本目录。
+    let dest = dir.join(if cfg!(windows) {
+        "Tramoing-setup.exe"
+    } else {
+        "Tramoing.dmg"
+    });
 
-    // 大文件：只设总时限会误杀慢网，改成「总时长 + 单次读超时」双保险。
+    // 按安装包大小给慢速网络留出总下载时间，最多等待半小时。
     let timeout_secs = (asset.size / 102_400).clamp(120, 1800);
     let mut resp = agent(Duration::from_secs(timeout_secs))
-        .get(&asset.url)
+        .get(url.as_str())
         .call()
         .map_err(|e| format!("下载失败：{e}"))?;
 
@@ -330,7 +367,8 @@ fn download_and_verify(
             .unwrap_or(0)
     };
 
-    let mut file = std::fs::File::create(&part).map_err(|e| format!("写文件失败：{e}"))?;
+    // 每次下载有独立临时文件，所有错误路径由 Drop 清理；成功校验后才提交。
+    let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|e| format!("写文件失败：{e}"))?;
     let mut reader = resp.body_mut().as_reader();
     let mut buf = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
@@ -342,9 +380,12 @@ fn download_and_verify(
         if n == 0 {
             break;
         }
+        written += n as u64;
+        if total > 0 && written > total {
+            return Err(format!("下载大小超过清单声明（{written}/{total} 字节）"));
+        }
         file.write_all(&buf[..n])
             .map_err(|e| format!("写文件失败：{e}"))?;
-        written += n as u64;
         if total > 0 {
             let pct = (written as f32 / total as f32).clamp(0.0, 1.0);
             // 每 1% 发一次就够了，否则 channel 每 64KB 被塞满，界面白重画。
@@ -354,20 +395,19 @@ fn download_and_verify(
             }
         }
     }
-    drop(file);
-
     if total > 0 && written != total {
-        let _ = std::fs::remove_file(&part);
         return Err(format!("下载不完整（{written}/{total} 字节）"));
     }
 
-    let actual = sha256_file(&part).map_err(|e| format!("校验失败：{e}"))?;
-    if !actual.eq_ignore_ascii_case(asset.sha256.trim()) {
-        let _ = std::fs::remove_file(&part);
+    file.as_file()
+        .sync_all()
+        .map_err(|e| format!("保存下载失败：{e}"))?;
+    let actual = sha256_file(file.path()).map_err(|e| format!("校验失败：{e}"))?;
+    if !actual.eq_ignore_ascii_case(hash) {
         return Err(format!("sha256 不匹配（得到 {actual}）"));
     }
 
-    std::fs::rename(&part, &dest).map_err(|e| format!("落盘失败：{e}"))?;
+    file.persist(&dest).map_err(|e| format!("落盘失败：{e}"))?;
     Ok(dest)
 }
 
@@ -389,27 +429,21 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// 用系统默认浏览器打开一个地址。清单没给本平台的包时用它兜底——
 /// 至少让用户能自己下，而不是点了没反应。
 pub fn open_url(url: &str) -> Result<(), String> {
-    if url.is_empty() {
-        return Err("清单没有提供下载地址".to_owned());
-    }
+    let url = http_url(url)?;
     #[cfg(windows)]
     {
         // 不走 `cmd /c start`：那个会先弹一个控制台窗口。
         // url.dll 的 FileProtocolHandler 是资源管理器双击链接走的同一条路。
         std::process::Command::new("rundll32")
             .arg("url.dll,FileProtocolHandler")
-            .arg(url)
+            .arg(url.as_str())
             .spawn()
             .map_err(|e| format!("打开浏览器失败：{e}"))?;
         Ok(())
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| format!("打开浏览器失败：{e}"))?;
-        Ok(())
+        open_on_macos(std::ffi::OsStr::new(url.as_str()))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -429,16 +463,26 @@ pub fn run_installer(path: &Path) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(path)
-            .spawn()
-            .map_err(|e| format!("打开安装包失败：{e}"))?;
-        Ok(())
+        open_on_macos(path.as_os_str())
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         Err("当前平台不支持自动安装".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_on_macos(target: &std::ffi::OsStr) -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg("--")
+        .arg(target)
+        .status()
+        .map_err(|e| format!("打开失败：{e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("系统无法打开该地址或文件：{status}"))
     }
 }
 
@@ -465,6 +509,118 @@ pub fn log_line(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest(version: &str) -> Manifest {
+        serde_json::from_value(serde_json::json!({"version": version})).unwrap()
+    }
+
+    #[test]
+    fn invalid_versions_are_errors_and_build_metadata_is_not_an_update() {
+        assert!(available_update(manifest("broken"), "1.0.0", PLATFORM).is_err());
+        assert!(
+            available_update(manifest("1.0.0+build2"), "1.0.0", PLATFORM)
+                .unwrap()
+                .is_none()
+        );
+        let update = available_update(manifest(" v1.10.0 "), "1.9.0", PLATFORM)
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.version, "1.10.0");
+    }
+
+    #[test]
+    fn only_web_urls_can_be_opened_from_a_manifest() {
+        for input in [
+            "file:///tmp/app",
+            "javascript:alert(1)",
+            "-a Calculator",
+            "x-apple.systempreferences:foo",
+        ] {
+            assert!(http_url(input).is_err(), "{input}");
+        }
+        assert!(http_url("https://example.com/releases").is_ok());
+        assert!(http_url("http://127.0.0.1:8000/latest.json").is_ok());
+    }
+
+    #[test]
+    fn downloads_use_safe_names_and_clean_up_all_failure_paths() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad",
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\na",
+            ] {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "download did not contact local server"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 16 * 1024, "oversized request headers");
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let asset = Asset {
+            url: format!("http://{address}/download?name=setup.exe&signature=a/b#fragment"),
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size: 3,
+        };
+        let (tx, _rx) = channel();
+        let path = download_to(&asset, "1.2.3", &tx, dir.path()).unwrap();
+        assert_eq!(path.parent().unwrap(), dir.path().join("1.2.3"));
+        assert_eq!(
+            path.extension().unwrap(),
+            if cfg!(windows) { "exe" } else { "dmg" }
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        // 同一版本重试时可以提交新文件，Windows 也不应因目标已存在而失败。
+        assert_eq!(download_to(&asset, "1.2.3", &tx, dir.path()).unwrap(), path);
+        assert!(download_to(&asset, "1.2.3", &tx, dir.path())
+            .unwrap_err()
+            .contains("sha256"));
+        let unknown_size = Asset {
+            size: 0,
+            ..asset.clone()
+        };
+        assert!(download_to(&unknown_size, "1.2.3", &tx, dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert!(download_to(&asset, "../escape", &tx, dir.path()).is_err());
+        let bad_hash = Asset {
+            sha256: "z".repeat(64),
+            ..asset
+        };
+        assert!(download_to(&bad_hash, "2.0.0", &tx, dir.path()).is_err());
+        assert!(!dir.path().join("2.0.0").exists());
+        server.join().unwrap();
+    }
 
     #[test]
     fn manifest_parses_and_missing_fields_default() {

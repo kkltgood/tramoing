@@ -4,7 +4,7 @@ use std::fmt;
 
 /// 应用标识，归并键。
 ///
-/// macOS 优先用 bundle id（`com.google.Chrome`），取不到回退到可执行路径；
+/// macOS 优先用最外层 `.app` 的路径，取不到回退到可执行路径或进程名；
 /// Windows 用可执行文件的完整路径。用它归并，Chrome 的几十个 Renderer
 /// 才会在列表里合成一行，而不是刷屏。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -75,7 +75,7 @@ impl AppRate {
     }
 
     pub fn session_total(&self) -> u64 {
-        self.rx_session + self.tx_session
+        self.rx_session.saturating_add(self.tx_session)
     }
 }
 

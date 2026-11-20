@@ -1,9 +1,6 @@
 //! 用户设置：读写 `settings.conf`。
 //!
-//! 格式是 `key=value` 的纯文本，不是 JSON。理由：
-//! - 只有七个字段，为此引入 serde + serde_json 太重；
-//! - 用户可能想直接改文件，纯文本最直观；
-//! - 解析器四十行，单测能覆盖全部边界。
+//! 使用 `key=value` 纯文本，便于用户手动编辑；写入通过同目录临时文件提交。
 //!
 //! 解析永远不失败：读到不认识的行或非法值就跳过，用默认值兜底。
 //! 配置文件坏掉不能让整个程序起不来。
@@ -104,17 +101,15 @@ impl Settings {
 
     pub fn save(&self) {
         let path = Self::path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Err(e) = std::fs::write(&path, self.serialize()) {
+        if let Err(e) = tm_store::files::atomic_write(&path, self.serialize().as_bytes()) {
             eprintln!("[settings] 保存失败（{}）：{e}", path.display());
+            crate::update::log_line(&format!("保存设置失败（{}）：{e}", path.display()));
         }
     }
 
     pub fn parse(text: &str) -> Self {
         let mut s = Self::default();
-        for line in text.lines() {
+        for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -269,6 +264,14 @@ fn parse_lang(v: &str) -> Option<LangMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_bom_does_not_discard_the_first_setting() {
+        assert_eq!(
+            Settings::parse("\u{feff}tray_mode=speed\n").tray_mode,
+            TrayMode::SpeedOnly
+        );
+    }
 
     #[test]
     fn roundtrip_preserves_everything() {
