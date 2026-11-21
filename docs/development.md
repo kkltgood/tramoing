@@ -143,21 +143,21 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.1` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.2` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
 首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认 Windows 和 macOS 都能完成打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
 
-发布步骤（以当前 `0.1.1` 为例）：
+发布步骤（以当前 `0.1.2` 为例）：
 
 1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.1 -m "Release v0.1.1"
-   git push opensource v0.1.1
+   git tag -a v0.1.2 -m "Release v0.1.2"
+   git push opensource v0.1.2
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -190,19 +190,19 @@ Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
-  -BaseUrl 'https://example.com/releases/v0.1.1' -Notes '发布说明'
+  -BaseUrl 'https://example.com/releases/v0.1.2' -Notes '发布说明'
 ```
 
 脚本计算安装包的 SHA-256 和文件大小，生成 `dist/latest.json`。客户端支持的平台键为 `windows-x86_64`、`macos-aarch64`、`macos-x86_64`；脚本默认生成 Windows 条目，其他平台按同一格式添加：
 
 ```json
 {
-  "version": "0.1.1",
+  "version": "0.1.2",
   "notes": "发布说明",
   "homepage": "https://example.com/releases",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://example.com/releases/Tramoing-0.1.1-setup.exe",
+      "url": "https://example.com/releases/Tramoing-0.1.2-setup.exe",
       "sha256": "由脚本生成的64位十六进制摘要",
       "size": 123456
     }
