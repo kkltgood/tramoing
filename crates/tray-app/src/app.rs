@@ -185,14 +185,14 @@ enum TrayEvent {
     Click { fallback: Option<IconRect> },
     #[cfg(target_os = "macos")]
     PerformanceClick,
-    /// 用户点了任务栏上的网速贴片（Windows 专属）。
+    /// 用户点了任务栏上的网速或性能贴片（Windows 专属）。
     ///
     /// 和托盘点击分开记，是因为**锚点不一样**：贴片在任务栏条里，和托盘
     /// 图标之间可能隔着一整个第三方插件（TrafficMonitor 那种）。按托盘
     /// 图标摆的话，点最左边的数字、面板却从右边托盘上方冒出来，看着像点
     /// 错了东西。这里直接以被点的贴片为锚点——点哪儿弹哪儿。
     #[cfg(windows)]
-    BadgeClick { at: IconRect, performance: bool },
+    BadgeClick { at: IconRect },
     #[cfg(windows)]
     BadgeReordered { performance_first: bool },
 }
@@ -684,6 +684,10 @@ impl App {
         if self.visible {
             self.close(ctx);
         } else {
+            // 所有任务栏/菜单栏入口都从主面板展开，不沿用上次停留的设置页。
+            // 同时清掉切页动画，避免展开首帧闪出旧的设置内容。
+            self.view = View::Main;
+            self.transition = None;
             self.open(ctx, rect);
         }
     }
@@ -879,7 +883,7 @@ impl App {
                 "\nGPU driver does not report utilization",
             ));
         }
-        tooltip.push_str(self.lang.t("\n点击打开设置", "\nClick to open settings"));
+        tooltip.push_str(self.lang.t("\n点击打开面板", "\nClick to open panel"));
         if std::env::var_os("TM_FORCE_MOCK").is_some() {
             tooltip.push_str(self.lang.t("\n演示数据", "\nDemo data"));
         }
@@ -1012,9 +1016,8 @@ impl eframe::App for App {
         }
 
         if let Some(settings) = crate::instance::take_activation() {
-            if settings {
-                self.goto(View::Settings);
-            }
+            self.view = if settings { View::Settings } else { View::Main };
+            self.transition = None;
             if let Some(rect) = self.tray_icon_rect(ctx) {
                 self.open(ctx, rect);
             } else {
@@ -1106,7 +1109,6 @@ impl eframe::App for App {
                 }
                 #[cfg(target_os = "macos")]
                 TrayEvent::PerformanceClick => {
-                    self.initial_settings_scroll = Some(0.0);
                     if let Some((x, y, w, h)) = self
                         .performance_tray
                         .as_ref()
@@ -1120,29 +1122,12 @@ impl eframe::App for App {
                             w: w as f32 * ppp,
                             h: h as f32 * ppp,
                         };
-                        if self.visible && self.view != View::Settings {
-                            self.goto(View::Settings);
-                            self.open(ctx, at);
-                        } else {
-                            self.goto(View::Settings);
-                            self.toggle(ctx, at);
-                        }
+                        self.toggle(ctx, at);
                     }
                 }
                 #[cfg(windows)]
-                TrayEvent::BadgeClick { at, performance } => {
-                    if performance {
-                        self.initial_settings_scroll = Some(0.0);
-                        let switching = self.visible && self.view != View::Settings;
-                        self.goto(View::Settings);
-                        if switching {
-                            self.open(ctx, at);
-                        } else {
-                            self.toggle(ctx, at);
-                        }
-                    } else {
-                        self.toggle(ctx, at);
-                    }
+                TrayEvent::BadgeClick { at } => {
+                    self.toggle(ctx, at);
                 }
                 #[cfg(windows)]
                 TrayEvent::BadgeReordered { performance_first } => {
@@ -3745,7 +3730,7 @@ fn install_tray_handler() {
     }));
 }
 
-/// 点了任务栏上的网速贴片。
+/// 点了任务栏上的网速或性能贴片，两者都打开主面板。
 ///
 /// 和点托盘图标共用同一套开合逻辑（`toggle`），只是**锚点用贴片自己**：
 /// 贴片所在的位置和托盘图标可能差好几百像素，用托盘图标当锚点的话，
@@ -3754,7 +3739,7 @@ fn install_tray_handler() {
 /// 贴片窗口拿不到 `&mut App`，所以只往 channel 里塞一条事件，真正的开合
 /// 仍然在 `update()` 里按状态决定——两边各记一份「面板开没开」迟早对不上。
 #[cfg(windows)]
-pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>, performance: bool) {
+pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>, _performance: bool) {
     let Some(r) = at else {
         // 连自己的矩形都拿不到（窗口正在销毁）：退回按托盘图标摆
         if let Some(tx) = TRAY_TX.get() {
@@ -3772,7 +3757,7 @@ pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>, performance: b
         h: r.h as f32,
     };
     if let Some(tx) = TRAY_TX.get() {
-        let _ = tx.send(TrayEvent::BadgeClick { at, performance });
+        let _ = tx.send(TrayEvent::BadgeClick { at });
     }
     if let Some(ctx) = CTX.get() {
         ctx.request_repaint();
