@@ -92,9 +92,7 @@ mod imp {
 
     /// 从可执行文件路径反推 `.app` 包路径。
     fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
-        let s = exe.to_string_lossy();
-        let idx = s.find(".app/Contents/MacOS/")?;
-        Some(PathBuf::from(&s[..idx + 4]))
+        tm_macos::installation::app_bundle(exe)
     }
 
     /// LaunchAgent 的启动命令。

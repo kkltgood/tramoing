@@ -456,7 +456,8 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f32| v.is_finite()),
             show_on_start: std::env::var_os("TM_SHOW_ON_START").is_some(),
-            keep_open_on_blur: std::env::var_os("TM_SHOW_ON_START").is_some(),
+            keep_open_on_blur: std::env::var_os("TM_SHOW_ON_START").is_some()
+                && std::env::var_os("TM_AFTER_INSTALL").is_none(),
             // macOS 靠「前几帧再隐藏」抵消 eframe 的强制显示；Windows 改成摆到屏幕外
             #[cfg(not(windows))]
             startup_hide: 3,
@@ -657,6 +658,12 @@ impl App {
     }
 
     pub fn close(&mut self, ctx: &egui::Context) {
+        if matches!(
+            self.update.phase,
+            crate::update::Phase::Installing { .. } | crate::update::Phase::Restarting
+        ) {
+            return;
+        }
         self.park_window(ctx);
     }
 
@@ -1051,6 +1058,10 @@ impl eframe::App for App {
         if self.update.poll() {
             ctx.request_repaint();
         }
+        if self.update.phase == crate::update::Phase::Restarting {
+            crate::update::log_line("升级已准备完成，正在保存历史并退出");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.maybe_check_update() {
             ctx.request_repaint();
         }
@@ -1172,6 +1183,7 @@ impl eframe::App for App {
                 // `--show` 是给调试/截图用的：那种情况下窗口本来就不是用户点开的，
                 // 一失焦就收起会导致「刚起来就没了」，根本没法核对界面。
                 && !self.keep_open_on_blur
+                && !matches!(self.update.phase, crate::update::Phase::Installing { .. } | crate::update::Phase::Restarting)
                 && self.shown_at.elapsed() > HIDE_DEBOUNCE
             {
                 self.close(ctx);
@@ -1649,9 +1661,9 @@ impl App {
             ui.add(
                 egui::Label::new(
                     RichText::new(lang.t(
-                        "每天检查 GitHub 新版本，下载后由你确认安装。",
-                        "Checks GitHub daily. Install after confirming the download.",
-                    ))
+                            "每天检查 GitHub 新版本，确认更新后自动重启，保留设置和历史。",
+                            "Checks GitHub daily. Updating restarts the app and keeps settings and history.",
+                        ))
                     .size(10.5)
                     .color(p.subtext),
                 )
@@ -2578,21 +2590,33 @@ impl App {
                 },
                 false,
             ),
+            Phase::Ready {
+                launch_error: Some(error),
+                ..
+            } => (
+                format!("{error} · {}", lang.t("点此重试", "click to retry")),
+                true,
+            ),
             Phase::Ready { version, .. } => (
                 if zh {
-                    format!("v{} 已就绪 · 点此安装", version)
+                    format!("v{} 已就绪 · 更新并重启", version)
                 } else {
-                    format!("v{} ready · click to install", version)
+                    format!("v{} ready · update & restart", version)
                 },
                 true,
             ),
+            Phase::Installing { .. } => (
+                lang.t("正在准备更新…", "Preparing update…").to_owned(),
+                false,
+            ),
+            Phase::Restarting => (lang.t("正在重启…", "Restarting…").to_owned(), false),
             Phase::Error(e) => (e.clone(), false),
         };
         Some((text, actionable))
     }
 
     /// 点更新提示之后干什么。两个入口（页脚、设置页）共用。
-    fn update_action(&mut self) {
+    fn update_action(&mut self, ctx: &egui::Context) {
         use crate::update::Phase;
         // 先拷一份：下面要 &mut self，不能挂着对 phase 的借用
         match &self.update.phase.clone() {
@@ -2604,9 +2628,10 @@ impl App {
                 }
             }
             Phase::Available(a) => self.update.download(a),
-            Phase::Ready { path, .. } => {
-                if let Err(e) = crate::update::run_installer(path) {
-                    self.toast = Some((e, Instant::now()));
+            Phase::Ready { .. } => {
+                if self.update.install() && cfg!(windows) {
+                    crate::update::log_line("升级程序已启动，正在保存历史并退出");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
             _ => {}
@@ -2662,7 +2687,7 @@ impl App {
         ellipsis_text(ui.painter(), rect, &text, 10.0, color, Align::Center);
 
         if actionable && resp.clicked() {
-            self.update_action();
+            self.update_action(ui.ctx());
         }
         true
     }
@@ -2704,7 +2729,7 @@ impl App {
             };
             ellipsis_text(ui.painter(), rect, text, 10.0, color, Align::Min);
             if actionable && resp.clicked() {
-                self.update_action();
+                self.update_action(ui.ctx());
             }
             return;
         }

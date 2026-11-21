@@ -64,11 +64,32 @@ fn main() -> eframe::Result<()> {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    if let Some(result) = tm_macos::installation::finish_if_requested(&args) {
+        if let Err(error) = result {
+            eprintln!("{error}");
+            update::log_line(&error);
+            // Before readiness the launching app is still alive and displays the error.
+            if args
+                .get(1)
+                .is_some_and(|path| std::path::Path::new(path).join("ready").is_file())
+            {
+                tm_macos::installation::show_error(&error);
+            }
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--mock") {
         std::env::set_var("TM_FORCE_MOCK", "1");
     }
     if args.iter().any(|a| a == "--show") {
         std::env::set_var("TM_SHOW_ON_START", "1");
+    }
+    // Installed applications reveal the panel once, with normal blur behavior.
+    if args.iter().any(|a| a == "--after-install") {
+        std::env::set_var("TM_SHOW_ON_START", "1");
+        std::env::set_var("TM_AFTER_INSTALL", "1");
     }
     // 直接打开设置页，省得每次截图都要手动点一下
     if args.iter().any(|a| a == "--settings") {
@@ -110,6 +131,24 @@ fn main() -> eframe::Result<()> {
             }
         }
         return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    if !args.iter().any(|a| a == "--mock") {
+        match tm_macos::installation::offer_install() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                if !settings::Settings::path().exists() {
+                    std::env::set_var("TM_SHOW_ON_START", "1");
+                    std::env::set_var("TM_AFTER_INSTALL", "1");
+                }
+            }
+            Err(error) => {
+                update::log_line(&error);
+                tm_macos::installation::show_error(&error);
+                return Ok(());
+            }
+        }
     }
 
     let _instance = match instance::Instance::acquire() {

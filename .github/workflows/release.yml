@@ -117,6 +117,10 @@ jobs:
             choco install nsis --yes --no-progress
             if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
           }
+      - name: Verify Windows upgrade flow
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/verify-windows-upgrade.ps1
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: powershell

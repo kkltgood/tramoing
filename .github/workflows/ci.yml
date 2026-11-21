@@ -27,7 +27,9 @@ jobs:
           components: rustfmt, clippy
       - name: Check macOS packaging script syntax
         if: runner.os == 'macOS'
-        run: bash -n scripts/package-macos.sh
+        run: |
+          for script in scripts/package-macos.sh scripts/verify-macos-package.sh; do bash -n "$script"; done
+          python3 -m py_compile packaging/macos/dmg-settings.py packaging/macos/verify-dmg.py
       - name: Check update release publishing
         run: node --test packaging/update/release.test.cjs
       - name: Check PowerShell script syntax

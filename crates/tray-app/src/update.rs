@@ -97,6 +97,8 @@ pub enum Event {
         path: PathBuf,
     },
     DownloadFailed(String),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    InstallPrepared(Result<(), String>),
 }
 
 /// 界面侧的状态机。没有任何网络动作，只是把事件攒成一个可画的形状。
@@ -121,11 +123,18 @@ pub enum Phase {
         version: String,
         pct: f32,
     },
-    /// 下载并校验完了，等用户点「安装」
+    /// 下载并校验完了，等用户确认更新
     Ready {
         version: String,
         path: PathBuf,
+        launch_error: Option<String>,
     },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Installing {
+        version: String,
+        path: PathBuf,
+    },
+    Restarting,
     Error(String),
 }
 
@@ -162,7 +171,13 @@ impl Updater {
     }
 
     pub fn is_busy(&self) -> bool {
-        matches!(self.phase, Phase::Checking | Phase::Downloading { .. })
+        matches!(
+            self.phase,
+            Phase::Checking
+                | Phase::Downloading { .. }
+                | Phase::Installing { .. }
+                | Phase::Restarting
+        )
     }
 
     /// 新版本提示和已下载的安装包一直保留到用户处理，不被每日检查覆盖。
@@ -236,6 +251,56 @@ impl Updater {
         }
     }
 
+    /// 只有确认启动成功，界面才能退出。失败时保留已校验的包并允许重试。
+    pub fn install(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Phase::Ready { version, path, .. } = self.phase.clone() else {
+                return false;
+            };
+            self.set(Phase::Installing {
+                version: version.clone(),
+                path: path.clone(),
+            });
+            let tx = self.tx.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("update-install".into())
+                .spawn(move || {
+                    let result = tm_macos::installation::start_update(&path, &version);
+                    let _ = tx.send(Event::InstallPrepared(result));
+                })
+            {
+                let _ = self.tx.send(Event::InstallPrepared(Err(format!(
+                    "无法启动更新：{error}"
+                ))));
+            }
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.install_with(run_installer)
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    fn install_with(&mut self, launch: impl FnOnce(&Path) -> Result<(), String>) -> bool {
+        let Phase::Ready {
+            path, launch_error, ..
+        } = &mut self.phase
+        else {
+            return false;
+        };
+        match launch(path) {
+            Ok(()) => {
+                *launch_error = None;
+                true
+            }
+            Err(error) => {
+                log_line(&format!("启动更新失败：{error}"));
+                *launch_error = Some(error);
+                false
+            }
+        }
+    }
+
     /// 把后台事件吸收进状态。返回 `true` 表示状态变了，界面需要重画。
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
@@ -267,11 +332,30 @@ impl Updater {
                 }
                 Event::Downloaded { version, path } => {
                     log_line(&format!("已下载 {}：{}", version, path.display()));
-                    self.set(Phase::Ready { version, path });
+                    self.set(Phase::Ready {
+                        version,
+                        path,
+                        launch_error: None,
+                    });
                 }
                 Event::DownloadFailed(e) => {
                     log_line(&format!("下载失败：{e}"));
                     self.set(Phase::Error(e));
+                }
+                Event::InstallPrepared(result) => {
+                    if let Phase::Installing { version, path } = self.phase.clone() {
+                        match result {
+                            Ok(()) => self.set(Phase::Restarting),
+                            Err(error) => {
+                                log_line(&format!("准备更新失败：{error}"));
+                                self.set(Phase::Ready {
+                                    version,
+                                    path,
+                                    launch_error: Some(error),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -475,24 +559,35 @@ pub fn open_url(url: &str) -> Result<(), String> {
     }
 }
 
-/// 拉起安装包。**不**静默安装：覆盖安装要停旧进程、可能要 UAC，
-/// 静默失败就只剩一个「什么都没发生」，用户和我们都无从下手。
-pub fn run_installer(path: &Path) -> Result<(), String> {
+/// Windows 使用只有进度页的升级模式；成功启动后由调用方正常退出，
+/// 安装器等待本进程结束再覆盖文件，完成后以普通权限重新启动。
+/// UAC 取消或启动失败时返回错误，旧程序继续运行。
+#[cfg(not(target_os = "macos"))]
+fn run_installer(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        // 安装程序自己会 taskkill 旧进程（见 packaging/windows/traffic-monitor.nsi
-        // 的 CheckRunning），所以这里只负责启动，不提前退出。
-        tm_windows::launch::elevated(path)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        open_on_macos(path.as_os_str())
+        let executable = std::env::current_exe().map_err(|e| format!("读取程序路径失败：{e}"))?;
+        let parameters = windows_update_parameters(&executable, std::process::id())?;
+        tm_windows::launch::elevated(path, &parameters)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         Err("当前平台不支持自动安装".to_owned())
     }
+}
+
+#[cfg(windows)]
+fn windows_update_parameters(executable: &Path, pid: u32) -> Result<std::ffi::OsString, String> {
+    let directory = executable
+        .parent()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "无法确定当前程序的安装目录".to_owned())?;
+    // NSIS 的 /D= 必须是最后一个参数，目录即使含空格也不能加引号。
+    // 用 OsString 原样交给 ShellExecute，避免经 shell 解析或损坏非 Unicode 路径。
+    let mut parameters = std::ffi::OsString::from(format!("/UPDATE /APP_PID={pid} /D="));
+    parameters.push(directory);
+    Ok(parameters)
 }
 
 #[cfg(target_os = "macos")]
@@ -534,6 +629,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preparing_an_update_only_requests_exit_after_the_worker_is_ready() {
+        let mut updater = Updater::new();
+        let path = PathBuf::from("verified.dmg");
+        updater.set(Phase::Installing {
+            version: "1.2.3".into(),
+            path: path.clone(),
+        });
+        assert!(updater.is_busy());
+        assert!(!updater.can_auto_check());
+        updater
+            .tx
+            .send(Event::InstallPrepared(Err("copy failed".into())))
+            .unwrap();
+        updater.poll();
+        assert_eq!(
+            updater.phase,
+            Phase::Ready {
+                version: "1.2.3".into(),
+                path: path.clone(),
+                launch_error: Some("copy failed".into()),
+            }
+        );
+        updater.set(Phase::Installing {
+            version: "1.2.3".into(),
+            path,
+        });
+        updater.tx.send(Event::InstallPrepared(Ok(()))).unwrap();
+        updater.poll();
+        assert_eq!(updater.phase, Phase::Restarting);
+    }
+
+    #[test]
+    fn cancelled_or_failed_install_keeps_the_verified_package_for_retry() {
+        let path = PathBuf::from("verified-setup.exe");
+        let mut updater = Updater::new();
+        updater.set(Phase::Ready {
+            version: "1.2.3".into(),
+            path: path.clone(),
+            launch_error: None,
+        });
+        for error in ["cancelled authorization", "failed to start installer"] {
+            assert!(!updater.install_with(|_| Err(error.into())));
+            assert!(!updater.can_auto_check());
+            updater.tick();
+            assert_eq!(
+                updater.phase,
+                Phase::Ready {
+                    version: "1.2.3".into(),
+                    path: path.clone(),
+                    launch_error: Some(error.into()),
+                }
+            );
+        }
+        assert!(updater.install_with(|retry| {
+            assert_eq!(retry, path);
+            Ok(())
+        }));
+        assert!(matches!(
+            updater.phase,
+            Phase::Ready {
+                launch_error: None,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn update_targets_the_running_installation_and_waits_for_its_process() {
+        for directory in [r"C:\Program Files\Tramoing", r"D:\应用 & Tools\自定义目录"] {
+            let executable = Path::new(directory).join("tramoing.exe");
+            assert_eq!(
+                windows_update_parameters(&executable, 1234).unwrap(),
+                std::ffi::OsString::from(format!("/UPDATE /APP_PID=1234 /D={directory}"))
+            );
+        }
+        assert!(windows_update_parameters(Path::new("tramoing.exe"), 1234).is_err());
+    }
+
+    #[test]
     fn official_source_is_default_and_overrides_can_explicitly_disable_it() {
         assert_eq!(
             resolve_manifest_url(None, None).as_deref(),
@@ -572,6 +747,7 @@ mod tests {
             Phase::Ready {
                 version: "1.0.0".into(),
                 path: PathBuf::from("setup.exe"),
+                launch_error: None,
             },
             Phase::Available(Available {
                 version: "1.0.0".into(),
@@ -758,7 +934,7 @@ mod tests {
         updater.download_into(&available, root.path().to_owned());
         assert!(matches!(updater.phase, Phase::Downloading { .. }));
         wait_for_result(&mut updater);
-        let Phase::Ready { version, path } = updater.phase.clone() else {
+        let Phase::Ready { version, path, .. } = updater.phase.clone() else {
             panic!("expected verified download, got {:?}", updater.phase);
         };
         assert_eq!(version, "999.0.0");

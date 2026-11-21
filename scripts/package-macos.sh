@@ -25,6 +25,7 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 MAKE_DMG=1
+DMGBUILD_PYTHON=${DMGBUILD_PYTHON:-python3}
 
 for arg in "$@"; do
   case "$arg" in
@@ -38,6 +39,16 @@ if [[ -z "${VERSION}" ]]; then
   exit 1
 fi
 echo "==> 版本 $VERSION"
+if [[ -n "${MACOS_NOTARY_PROFILE:-}" && -z "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+  echo "公证需要同时配置 MACOS_SIGNING_IDENTITY（Developer ID Application 身份）" >&2
+  exit 1
+fi
+if [[ $MAKE_DMG -eq 1 ]] && ! "$DMGBUILD_PYTHON" -c 'import dmgbuild' 2>/dev/null; then
+  echo "==> 准备 DMG 布局工具（隔离 Python 环境）"
+  "$DMGBUILD_PYTHON" -m venv "$ROOT/target/dmgbuild-venv"
+  DMGBUILD_PYTHON="$ROOT/target/dmgbuild-venv/bin/python"
+  "$DMGBUILD_PYTHON" -m pip install --disable-pip-version-check -r packaging/macos/requirements-dmg.txt
+fi
 TARGET_DIR=$(cargo metadata --format-version=1 --no-deps --locked |
   /usr/bin/plutil -extract target_directory raw -o - -)
 
@@ -103,26 +114,41 @@ fi
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # ---------- 4. 签名 ----------
-# ad-hoc 签名：不做的话 Apple 芯片上首次运行可能直接被拦。
-echo "==> ad-hoc 签名"
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+  echo "==> Developer ID 签名"
+  codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
+else
+  echo "==> ad-hoc 签名"
+  codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
+fi
 codesign --verify --deep --strict "$APP" && echo "    签名校验通过"
+
+if [[ -n "${MACOS_NOTARY_PROFILE:-}" ]]; then
+  echo "==> 公证应用并附加公证票据"
+  NOTARY_ZIP="$DIST/Tramoing-$VERSION-notary.zip"
+  ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+  xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$MACOS_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+  rm -f "$NOTARY_ZIP"
+fi
 
 # ---------- 5. DMG ----------
 if [[ $MAKE_DMG -eq 1 ]]; then
   DMG="$DIST/Tramoing-$VERSION.dmg"
-  STAGE="$DIST/.dmg-stage"
   echo "==> 打包 $DMG"
-  rm -rf "$STAGE"
-  mkdir -p "$STAGE"
-  cp -R "$APP" "$STAGE/"
-  # 拖拽安装的惯例：旁边放一个 Applications 软链
-  ln -s /Applications "$STAGE/Applications"
-  rm -f "$DMG"
-  hdiutil create -quiet -volname "$APP_DISPLAY_NAME" -srcfolder "$STAGE" \
-    -ov -format UDZO "$DMG"
+  # dmgbuild writes a reproducible Finder layout without UI automation or a
+  # logged-in Finder session, including a Retina background and icon positions.
+  "$DMGBUILD_PYTHON" -m dmgbuild -s packaging/macos/dmg-settings.py \
+    -D "app=$APP" -D "root=$ROOT" "$APP_DISPLAY_NAME" "$DMG"
+  if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+    codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$DMG"
+  fi
+  if [[ -n "${MACOS_NOTARY_PROFILE:-}" ]]; then
+    xcrun notarytool submit "$DMG" --keychain-profile "$MACOS_NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
+  fi
+  DMGBUILD_PYTHON="$DMGBUILD_PYTHON" bash scripts/verify-macos-package.sh "$DMG" "$APP"
   (cd "$DIST" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
-  rm -rf "$STAGE"
   echo "    大小：$(du -h "$DMG" | cut -f1)"
 fi
 

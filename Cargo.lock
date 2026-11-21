@@ -2476,6 +2476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
+ "libc",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -3807,31 +3808,33 @@ dependencies = [
 
 [[package]]
 name = "tm-core"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "tm-macos"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "core-foundation-sys",
  "libc",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "semver",
+ "tempfile",
  "tm-core",
  "tm-sampler",
 ]
 
 [[package]]
 name = "tm-sampler"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "tm-core",
 ]
 
 [[package]]
 name = "tm-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3840,7 +3843,7 @@ dependencies = [
 
 [[package]]
 name = "tm-windows"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "tempfile",
  "tm-core",
@@ -3988,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "tray-app"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "eframe",
  "log",

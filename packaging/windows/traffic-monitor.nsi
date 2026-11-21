@@ -71,6 +71,9 @@ VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
 
+; System plugin calls in the upgrade callbacks must follow SetCompressor.
+!include "upgrade.nsh"
+
 ; ---------- 安装界面 ----------
 ; 图标同时管三处：安装包自身、卸载程序、以及对话框左上角那个小图标
 !define MUI_ICON "..\..\assets\tramoing.ico"
@@ -82,9 +85,13 @@ VIAddVersionKey "LegalCopyright" "MIT"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchApp
 !define MUI_FINISHPAGE_NOREBOOTSUPPORT
 
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipSetupPageOnUpgrade
 !insertmacro MUI_PAGE_DIRECTORY
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipSetupPageOnUpgrade
 !insertmacro MUI_PAGE_COMPONENTS
+!define MUI_PAGE_CUSTOMFUNCTION_SHOW ShowUpgradeProgress
 !insertmacro MUI_PAGE_INSTFILES
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipSetupPageOnUpgrade
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -96,7 +103,7 @@ VIAddVersionKey "LegalCopyright" "MIT"
 
 ; ---------- 安装 ----------
 
-; 完成页勾了「立即运行」时走这里。
+; 首次安装的完成页、升级成功后的自动重启共用。
 ;
 ; 安装程序是提权跑的，直接 `Exec` 会把托盘程序也拉成管理员 —— 它自己不需要
 ; 管理员（采集是计划任务里的助手干的，见 SEC_HELPER）。把路径交给已经在跑的
@@ -109,21 +116,28 @@ FunctionEnd
 ; 隐藏 section（名字以 - 开头）+ SectionIn RO，保证每次安装都会跑。
 Section "-升级准备：关闭旧进程" SEC_PRE
   SectionIn RO
+  Call WaitForUpdateParent
   DetailPrint "正在关闭旧的 Tramoing 进程..."
 
   ; 计划任务在登录时以最高权限拉起助手，先让它退下来，避免拷贝期间
   ; 任务调度器又把旧 exe 拉起来重新占住文件。
-  ExecWait 'schtasks /End /TN "TrafficMonitorHelper"' $0
+  nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /End /TN "TrafficMonitorHelper"'
+  Pop $0
 
-  ExecWait 'taskkill /IM "${HELPER_EXE}" /F' $0
-  ExecWait 'taskkill /IM "${APP_EXE}" /F' $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${HELPER_EXE}" /F'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${APP_EXE}" /F'
+  Pop $0
   ; 改名前的 exe 也可能还在跑，一样停掉
-  ExecWait 'taskkill /IM "traffic-monitor.exe" /F' $0
-  ExecWait 'taskkill /IM "tm-helper.exe" /F' $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "traffic-monitor.exe" /F'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "tm-helper.exe" /F'
+  Pop $0
 
   ; taskkill 返回后进程对象可能还没完全释放句柄，等一下再删
   Sleep 700
-  ExecWait 'taskkill /IM "${HELPER_EXE}" /F' $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${HELPER_EXE}" /F'
+  Pop $0
   Sleep 300
 
   !insertmacro PREPARE_OVERWRITE "$INSTDIR\${APP_EXE}" prep_main
@@ -170,10 +184,16 @@ Section "流量采集助手（按进程统计必需）" SEC_HELPER
   File "..\..\dist\windows\${HELPER_EXE}"
 
   DetailPrint "注册登录自启任务（最高权限）..."
+  StrCpy $0 -1
   ExecWait '"$INSTDIR\${HELPER_EXE}" --install' $0
   ; 助手把失败原因写进日志而不是控制台，这里只能提示去日志里看
   ${If} $0 != 0
     MessageBox MB_ICONEXCLAMATION|MB_OK "采集助手安装或启动失败（错误码 $0）。$\r$\n$\r$\n托盘程序仍可启动，但无法统计流量。请以管理员身份运行一次 tramoing-helper.exe --install 后重试。$\r$\n日志：%LOCALAPPDATA%\${DATA_DIR}\helper.log"
+    ${If} $UpgradeMode == 1
+      SetAutoClose false
+      SetErrorLevel 1
+      Abort "采集助手更新失败，请按上述提示修复后重新运行程序。"
+    ${EndIf}
   ${EndIf}
 SectionEnd
 

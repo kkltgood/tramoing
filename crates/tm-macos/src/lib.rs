@@ -12,6 +12,7 @@ pub mod appid;
 pub mod flows;
 #[cfg(target_os = "macos")]
 pub mod icon;
+pub mod installation;
 #[cfg(target_os = "macos")]
 pub mod procname;
 #[cfg(target_os = "macos")]
