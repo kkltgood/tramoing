@@ -2133,7 +2133,7 @@ impl App {
                 rect,
                 CornerRadius::same(ROW_RADIUS),
                 p.surface,
-                Stroke::new(0.5, p.border.gamma_multiply(pulse * fade)),
+                Stroke::new(0.5_f32, p.border.gamma_multiply(pulse * fade)),
                 egui::StrokeKind::Inside,
             );
             let bar = |x: f32, w: f32| {
@@ -2220,7 +2220,7 @@ impl App {
             rect,
             CornerRadius::same(ROW_RADIUS),
             mix(p.surface, p.accent, t * 0.08),
-            Stroke::new(0.7, mix(p.border, p.accent, t * 0.5)),
+            Stroke::new(0.7_f32, mix(p.border, p.accent, t * 0.5)),
             egui::StrokeKind::Inside,
         );
 
@@ -2269,7 +2269,7 @@ impl App {
                 arrow_center + egui::vec2(2.0, 0.0),
                 arrow_center + egui::vec2(-2.0, 4.0),
             ],
-            Stroke::new(1.2, p.unit),
+            Stroke::new(1.2_f32, p.unit),
         ));
         surface::focus(painter, rect, &resp, p);
         if resp.hovered() {
@@ -2300,7 +2300,7 @@ impl App {
             .frame(
                 egui::Frame::popup(ui.style())
                     .fill(p.surface)
-                    .stroke(Stroke::new(1.0, p.border))
+                    .stroke(Stroke::new(1.0_f32, p.border))
                     .corner_radius(12)
                     .inner_margin(12),
             )
@@ -2824,7 +2824,7 @@ fn settings_group(ui: &mut egui::Ui, p: &Palette, title: &str, body: impl FnOnce
     let width = ui.available_width();
     egui::Frame::NONE
         .fill(p.surface)
-        .stroke(Stroke::new(0.7, p.border))
+        .stroke(Stroke::new(0.7_f32, p.border))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
@@ -3086,12 +3086,12 @@ fn sliders_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
         let y = rect.top() + 3.0 + i as f32 * 5.0;
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            Stroke::new(1.4, color),
+            Stroke::new(1.4_f32, color),
         );
         // 滑块位置左右错开，看着像个均衡器而不是"汉堡菜单"
         let kx = rect.left() + 4.0 + ((i + 1) % 3) as f32 * 3.5;
         painter.circle_filled(egui::pos2(kx, y), 2.1, p.chip);
-        painter.circle_stroke(egui::pos2(kx, y), 2.1, Stroke::new(1.2, color));
+        painter.circle_stroke(egui::pos2(kx, y), 2.1, Stroke::new(1.2_f32, color));
     }
     surface::focus(painter, hit, &resp, p);
     resp
@@ -3216,7 +3216,7 @@ fn action_button(
 /// 也和老版本「导出」两个字的位置对得上。
 fn paint_export_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let c = rect.center();
-    let stroke = Stroke::new(1.35, color);
+    let stroke = Stroke::new(1.35_f32, color);
     let half = 5.2;
     let top = c.y + 0.9;
     let bottom = c.y + 5.7;
@@ -3248,7 +3248,7 @@ fn paint_export_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) 
 /// 退出：电源符号 —— 一圈留了缺口的圆 + 顶上那根竖线。
 fn paint_quit_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let c = rect.center();
-    let stroke = Stroke::new(1.35, color);
+    let stroke = Stroke::new(1.35_f32, color);
     let r = 5.4;
     let cy = c.y + 0.7;
     // 缺口留在正上方：从 310° 顺着扫 280°，正好绕开 270° 那一小段
@@ -3269,7 +3269,7 @@ fn paint_quit_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 /// 不用「‹」字符：不同字体的字形宽度和基线都不一样，标题栏里会显得忽高忽低。
 fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let c = rect.center();
-    let stroke = Stroke::new(1.6, color);
+    let stroke = Stroke::new(1.6_f32, color);
     painter.add(egui::Shape::line(
         vec![
             egui::pos2(c.x + 3.4, c.y - 5.0),
@@ -3446,7 +3446,10 @@ fn metric(
     painter.rect_stroke(
         rect,
         12.0,
-        Stroke::new(0.8, mix(p.border, color, if p.dark { 0.20 } else { 0.08 })),
+        Stroke::new(
+            0.8_f32,
+            mix(p.border, color, if p.dark { 0.20 } else { 0.08 }),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -3459,7 +3462,7 @@ fn metric(
     painter.circle_stroke(
         circle,
         14.0,
-        Stroke::new(0.6, mix(disc_top, disc_bottom, 0.5)),
+        Stroke::new(0.6_f32, mix(disc_top, disc_bottom, 0.5)),
     );
     surface::direction(
         painter,

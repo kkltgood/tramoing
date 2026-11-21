@@ -73,7 +73,7 @@ pub fn panel(painter: &Painter, rect: Rect, radius: u8, p: &Palette) {
     painter.rect_stroke(
         rect.shrink(0.5),
         CornerRadius::same(radius),
-        Stroke::new(1.0, if p.dark { p.border } else { Color32::WHITE }),
+        Stroke::new(1.0_f32, if p.dark { p.border } else { Color32::WHITE }),
         egui::StrokeKind::Inside,
     );
 }
@@ -89,7 +89,7 @@ pub fn pill(painter: &Painter, rect: Rect, p: &Palette) {
     painter.rect_stroke(
         rect,
         radius,
-        Stroke::new(0.7, mix(p.selection_top, Color32::WHITE, 0.25)),
+        Stroke::new(0.7_f32, mix(p.selection_top, Color32::WHITE, 0.25)),
         egui::StrokeKind::Inside,
     );
 }
@@ -99,7 +99,7 @@ pub fn focus(painter: &Painter, rect: Rect, response: &egui::Response, p: &Palet
         painter.rect_stroke(
             rect.shrink(0.5),
             7.0,
-            Stroke::new(1.5, p.accent),
+            Stroke::new(1.5_f32, p.accent),
             egui::StrokeKind::Inside,
         );
     }
@@ -181,13 +181,13 @@ pub fn sparkline(painter: &Painter, rect: Rect, values: &[f64], color: Color32, 
     );
     painter.add(egui::Shape::line(
         points,
-        Stroke::new(1.4, color.gamma_multiply(0.85)),
+        Stroke::new(1.4_f32, color.gamma_multiply(0.85)),
     ));
 }
 
 pub fn direction(painter: &Painter, center: Pos2, down: bool, size: f32, color: Color32) {
     let d = if down { 1.0 } else { -1.0 };
-    let stroke = Stroke::new(1.7, color);
+    let stroke = Stroke::new(1.7_f32, color);
     painter.line_segment(
         [
             center - egui::vec2(0.0, size * d),
