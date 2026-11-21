@@ -2628,11 +2628,9 @@ impl App {
                 }
             }
             Phase::Available(a) => self.update.download(a),
-            Phase::Ready { .. } => {
-                if self.update.install() && cfg!(windows) {
-                    crate::update::log_line("升级程序已启动，正在保存历史并退出");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            Phase::Ready { .. } if self.update.install() && cfg!(windows) => {
+                crate::update::log_line("升级程序已启动，正在保存历史并退出");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             _ => {}
         }
