@@ -9,6 +9,7 @@ use crate::screen::Rect;
 use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
 use std::sync::Once;
+use tm_core::taskbar::{TaskbarItem as Group, TaskbarOrder};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -24,7 +25,20 @@ pub struct Content {
     pub performance: Option<Performance>,
     pub light: bool,
     pub colors: tm_core::color::DisplayColors,
-    pub performance_first: bool,
+    pub order: TaskbarOrder,
+}
+
+impl Content {
+    fn visible_items(&self) -> impl Iterator<Item = Group> + '_ {
+        self.order
+            .items()
+            .iter()
+            .copied()
+            .filter(|item| match item {
+                Group::Speed => self.speed.is_some(),
+                Group::Performance => self.performance.is_some(),
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,28 +55,22 @@ pub struct Performance {
     pub colored: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Group {
-    Speed,
-    Performance,
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Drag {
     group: Group,
     start: (i32, i32),
-    original_order: bool,
-    preview_order: bool,
+    original_order: TaskbarOrder,
+    preview_order: TaskbarOrder,
     moved: bool,
 }
 
 impl Drag {
-    fn new(group: Group, x: i32, y: i32, performance_first: bool) -> Self {
+    fn new(group: Group, x: i32, y: i32, order: TaskbarOrder) -> Self {
         Self {
             group,
             start: (x, y),
-            original_order: performance_first,
-            preview_order: performance_first,
+            preview_order: order.clone(),
+            original_order: order,
             moved: false,
         }
     }
@@ -77,28 +85,27 @@ impl Drag {
     ) {
         self.moved |=
             (x - self.start.0).abs() > threshold.0 || (y - self.start.1).abs() > threshold.1;
-        self.preview_order = self.original_order;
+        self.preview_order = self.original_order.clone();
         if !self.moved || !contains(area, x, y) {
             return;
         }
-        let (Some(speed), Some(performance)) = (layout.speed, layout.performance) else {
-            return;
-        };
-        let other = if self.group == Group::Speed {
-            performance
-        } else {
-            speed
-        };
-        let before = if layout.stacked() {
-            y < (other.top + other.bottom) / 2
-        } else {
-            x < (other.left + other.right) / 2
-        };
-        self.preview_order = if self.group == Group::Performance {
-            before
-        } else {
-            !before
-        };
+        // 按原始布局中其他项目的中点确定插入位置，支持任意数量的统计项。
+        // 不使用预览布局判定，避免宽度不同的项目换位后反复跳动。
+        let target = layout
+            .groups
+            .iter()
+            .filter(|(group, _)| *group != self.group)
+            .take_while(|(_, rect)| {
+                if layout.stacked() {
+                    y >= (rect.top + rect.bottom) / 2
+                } else {
+                    x >= (rect.left + rect.right) / 2
+                }
+            })
+            .count();
+        let visible: Vec<_> = layout.groups.iter().map(|(group, _)| *group).collect();
+        self.preview_order
+            .move_visible(self.group, &visible, target);
     }
 }
 
@@ -106,16 +113,16 @@ struct WindowState {
     hwnd: Cell<HWND>,
     content: RefCell<Content>,
     click: fn(Option<Rect>, bool),
-    reordered: fn(bool),
-    drag: Cell<Option<Drag>>,
+    reordered: fn(TaskbarOrder),
+    drag: RefCell<Option<Drag>>,
     needs_paint: Cell<bool>,
 }
 
 impl WindowState {
     fn display_content(&self) -> Content {
         let mut content = self.content.borrow().clone();
-        if let Some(drag) = self.drag.get() {
-            content.performance_first = drag.preview_order;
+        if let Some(drag) = self.drag.borrow().as_ref() {
+            content.order = drag.preview_order.clone();
         }
         content
     }
@@ -127,7 +134,8 @@ impl WindowState {
     }
 
     unsafe fn cancel_drag(&self) {
-        if self.drag.take().is_some() {
+        let drag = self.drag.borrow_mut().take();
+        if drag.is_some() {
             self.needs_paint.set(true);
             if GetCapture() == self.hwnd.get() {
                 ReleaseCapture();
@@ -137,12 +145,14 @@ impl WindowState {
     }
 
     unsafe fn track_drag(&self, x: i32, y: i32) {
-        let (Some(mut drag), Some(rect)) = (self.drag.get(), client_rect(self.hwnd.get())) else {
+        let (Some(mut drag), Some(rect)) =
+            (self.drag.borrow().clone(), client_rect(self.hwnd.get()))
+        else {
             return;
         };
         let dpi = GetDpiForWindow(self.hwnd.get()).max(96);
         let layout = surface::layout(&self.content.borrow(), rect.right, rect.bottom, dpi as i32);
-        let previous = drag.preview_order;
+        let previous = drag.preview_order.clone();
         drag.track(
             x,
             y,
@@ -153,12 +163,14 @@ impl WindowState {
                 GetSystemMetricsForDpi(SM_CYDRAG, dpi).max(1),
             ),
         );
-        self.drag.set(Some(drag));
-        if previous != drag.preview_order {
+        let changed = previous != drag.preview_order;
+        let moved = drag.moved;
+        self.drag.replace(Some(drag));
+        if changed {
             self.needs_paint.set(true);
             let _ = self.repaint();
         }
-        if drag.moved && layout.speed.is_some() && layout.performance.is_some() {
+        if moved && layout.groups.len() > 1 {
             SetCursor(LoadCursorW(
                 null_mut(),
                 if layout.stacked() {
@@ -184,7 +196,7 @@ pub struct TaskbarBadge {
 }
 
 impl TaskbarBadge {
-    pub fn new(click: fn(Option<Rect>, bool), reordered: fn(bool)) -> Self {
+    pub fn new(click: fn(Option<Rect>, bool), reordered: fn(TaskbarOrder)) -> Self {
         Self {
             state: Box::new(WindowState {
                 hwnd: Cell::new(null_mut()),
@@ -193,11 +205,11 @@ impl TaskbarBadge {
                     performance: None,
                     light: false,
                     colors: Default::default(),
-                    performance_first: false,
+                    order: TaskbarOrder::default(),
                 }),
                 click,
                 reordered,
-                drag: Cell::new(None),
+                drag: RefCell::new(None),
                 needs_paint: Cell::new(true),
             }),
             shell: null_mut(),
@@ -207,15 +219,14 @@ impl TaskbarBadge {
 
     /// None 表示禁用。成功时窗口的 GetParent 必须是当前 Shell_TrayWnd。
     pub fn update(&mut self, content: Option<Content>) -> Result<(), &'static str> {
-        let Some(content) = content.filter(|c| c.speed.is_some() || c.performance.is_some()) else {
+        let Some(content) = content.filter(|c| c.visible_items().next().is_some()) else {
             self.detach();
             return Ok(());
         };
         let previous = self.state.content.borrow();
         let changed = *previous != content;
-        let layout_changed = previous.speed.is_some() != content.speed.is_some()
-            || previous.performance.is_some() != content.performance.is_some()
-            || previous.performance_first != content.performance_first;
+        let layout_changed =
+            previous.visible_items().ne(content.visible_items()) || previous.order != content.order;
         drop(previous);
         if layout_changed {
             unsafe {
@@ -298,9 +309,9 @@ impl TaskbarBadge {
         let height = if stacked {
             let content = self.state.content.borrow();
             if band.right < surface::minimum_width_dip(&content) * dpi / 96 {
-                return Err("任务栏太窄，无法放入性能区域");
+                return Err("任务栏太窄，无法放入统计项");
             }
-            36 * (i32::from(content.speed.is_some()) + i32::from(content.performance.is_some()))
+            36 * content.visible_items().count() as i32
         } else {
             36
         } * dpi
@@ -517,7 +528,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Some(group) = layout.group_at(x, y) {
                     state
                         .drag
-                        .set(Some(Drag::new(group, x, y, content.performance_first)));
+                        .replace(Some(Drag::new(group, x, y, content.order.clone())));
                     drop(content);
                     SetCapture(hwnd);
                 }
@@ -532,7 +543,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         (WM_LBUTTONUP, Some(state)) => {
             let (x, y) = mouse_point(lp);
             state.track_drag(x, y);
-            let drag = state.drag.take();
+            let drag = state.drag.borrow_mut().take();
             if GetCapture() == hwnd {
                 ReleaseCapture();
             }
@@ -540,7 +551,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Some(rect) = client_rect(hwnd).filter(|r| contains(*r, x, y)) {
                     if drag.moved {
                         if drag.preview_order != drag.original_order {
-                            state.content.borrow_mut().performance_first = drag.preview_order;
+                            state.content.borrow_mut().order = drag.preview_order.clone();
                             (state.reordered)(drag.preview_order);
                         }
                     } else {
@@ -566,7 +577,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         (WM_NCDESTROY, Some(state)) => {
-            state.drag.set(None);
+            state.drag.replace(None);
             state.hwnd.set(null_mut());
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
@@ -658,6 +669,14 @@ mod tests {
     static CLICKS: AtomicUsize = AtomicUsize::new(0);
     static REORDERS: AtomicUsize = AtomicUsize::new(0);
 
+    pub(super) fn order(performance_first: bool) -> TaskbarOrder {
+        TaskbarOrder::new([if performance_first {
+            Group::Performance
+        } else {
+            Group::Speed
+        }])
+    }
+
     fn combined_content(performance_first: bool) -> Content {
         Content {
             speed: Some(Speed {
@@ -672,7 +691,7 @@ mod tests {
             }),
             light: false,
             colors: Default::default(),
-            performance_first,
+            order: order(performance_first),
         }
     }
 
@@ -692,21 +711,21 @@ mod tests {
                     for (group, source, destination) in [
                         (
                             Group::Speed,
-                            layout.speed.unwrap(),
-                            layout.performance.unwrap(),
+                            layout.rect(Group::Speed).unwrap(),
+                            layout.rect(Group::Performance).unwrap(),
                         ),
                         (
                             Group::Performance,
-                            layout.performance.unwrap(),
-                            layout.speed.unwrap(),
+                            layout.rect(Group::Performance).unwrap(),
+                            layout.rect(Group::Speed).unwrap(),
                         ),
                     ] {
                         let start = (source.left + 3, source.top + 3);
-                        let mut drag = Drag::new(group, start.0, start.1, performance_first);
+                        let mut drag = Drag::new(group, start.0, start.1, content.order.clone());
                         let threshold = (4 * dpi / 96, 4 * dpi / 96);
                         drag.track(start.0 + 1, start.1 + 1, area, &layout, threshold);
                         assert!(!drag.moved, "minor pointer jitter must remain a click");
-                        assert_eq!(drag.preview_order, performance_first);
+                        assert_eq!(drag.preview_order, content.order);
                         // 拖到另一组远端，跨过该组中点才换序。
                         let target = if (group == Group::Performance) == performance_first {
                             (destination.right - 2, destination.bottom - 2)
@@ -715,17 +734,41 @@ mod tests {
                         };
                         drag.track(target.0, target.1, area, &layout, threshold);
                         assert!(drag.moved);
-                        assert_ne!(drag.preview_order, performance_first);
+                        assert_ne!(drag.preview_order, content.order);
                         // 预览期间采样数值可以刷新；排序判定始终使用原始布局，避免来回抖动。
                         drag.track(target.0, target.1, area, &layout, threshold);
-                        assert_ne!(drag.preview_order, performance_first);
+                        assert_ne!(drag.preview_order, content.order);
                         drag.track(start.0, start.1, area, &layout, threshold);
-                        assert_eq!(drag.preview_order, performance_first);
+                        assert_eq!(drag.preview_order, content.order);
                         assert!(drag.moved, "dragging back must not open the panel");
                         drag.track(-20, -20, area, &layout, threshold);
-                        assert_eq!(drag.preview_order, performance_first);
+                        assert_eq!(drag.preview_order, content.order);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_a_single_visible_item_preserves_the_hidden_items_position() {
+        for performance_first in [false, true] {
+            for group in [Group::Speed, Group::Performance] {
+                let mut content = combined_content(performance_first);
+                match group {
+                    Group::Speed => content.performance = None,
+                    Group::Performance => content.speed = None,
+                }
+                let area = RECT {
+                    left: 0,
+                    top: 0,
+                    right: surface::width_dip(&content),
+                    bottom: 48,
+                };
+                let layout = surface::layout(&content, area.right, area.bottom, 96);
+                let mut drag = Drag::new(group, 3, 3, content.order.clone());
+                drag.track(area.right - 2, 20, area, &layout, (4, 4));
+                assert!(drag.moved);
+                assert_eq!(drag.preview_order, content.order);
             }
         }
     }
@@ -741,8 +784,15 @@ mod tests {
                 assert!(rect.is_some());
                 CLICKS.fetch_add(if performance { 10 } else { 1 }, Ordering::Relaxed);
             },
-            |first| {
-                REORDERS.fetch_add(if first { 1 } else { 10 }, Ordering::Relaxed);
+            |order| {
+                REORDERS.fetch_add(
+                    if order.items()[0] == Group::Performance {
+                        1
+                    } else {
+                        10
+                    },
+                    Ordering::Relaxed,
+                );
             },
         );
         let content = Content {
@@ -754,7 +804,7 @@ mod tests {
             performance: None,
             light: false,
             colors: Default::default(),
-            performance_first: false,
+            order: TaskbarOrder::default(),
         };
         badge.update(Some(content.clone())).unwrap();
         unsafe {
@@ -795,7 +845,7 @@ mod tests {
             let combined_rect = client_rect(hwnd).unwrap();
             let dpi = GetDpiForWindow(hwnd).max(96) as i32;
             let perf = surface::layout(&combined, combined_rect.right, combined_rect.bottom, dpi)
-                .performance
+                .rect(Group::Performance)
                 .unwrap();
             let point = (perf.left + 3) as isize | (((perf.top + 3) as isize) << 16);
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
@@ -805,16 +855,16 @@ mod tests {
             // 从性能区域拖向左侧：原生窗口即时预览，松开只发送排序事件。
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, coord(2, 4));
-            assert!(badge.state.display_content().performance_first);
+            assert_eq!(badge.state.display_content().order, order(true));
             combined.performance.as_mut().unwrap().cpu = "3%".into();
             badge.update(Some(combined.clone())).unwrap(); // 模拟采样刷新
-            assert!(badge.state.display_content().performance_first);
+            assert_eq!(badge.state.display_content().order, order(true));
             assert_eq!(badge.state.display_content().performance.unwrap().cpu, "3%");
             SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(2, 4));
-            assert!(badge.state.content.borrow().performance_first);
+            assert_eq!(badge.state.content.borrow().order, order(true));
             assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
             assert_eq!(CLICKS.load(Ordering::Relaxed), 11);
-            combined.performance_first = true;
+            combined.order = order(true);
             badge.update(Some(combined.clone())).unwrap();
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
             SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(4, 4));
@@ -827,28 +877,28 @@ mod tests {
             let end = coord(combined_rect.right - 2, 4);
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
-            assert!(!badge.state.display_content().performance_first);
+            assert_eq!(badge.state.display_content().order, order(false));
             SendMessageW(hwnd, WM_CANCELMODE, 0, 0);
-            assert!(badge.state.display_content().performance_first);
+            assert_eq!(badge.state.display_content().order, order(true));
             SendMessageW(hwnd, WM_LBUTTONUP, 0, end);
             assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
             // 松开于窗口外亦取消。
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
             SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(-10, -10));
-            assert!(badge.state.display_content().performance_first);
+            assert_eq!(badge.state.display_content().order, order(true));
             assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
             // 捕获丢失恢复原序。
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
             ReleaseCapture();
-            assert!(badge.state.drag.get().is_none());
-            assert!(badge.state.display_content().performance_first);
+            assert!(badge.state.drag.borrow().is_none());
+            assert_eq!(badge.state.display_content().order, order(true));
             // 真正拖回右侧。
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, end);
             SendMessageW(hwnd, WM_LBUTTONUP, 0, end);
-            assert!(!badge.state.content.borrow().performance_first);
+            assert_eq!(badge.state.content.borrow().order, order(false));
             assert_eq!(REORDERS.load(Ordering::Relaxed), 11);
             assert_eq!(CLICKS.load(Ordering::Relaxed), 21);
             combined.speed = None;

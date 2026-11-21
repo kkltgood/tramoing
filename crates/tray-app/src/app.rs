@@ -35,7 +35,7 @@ pub const WINDOW_W: f32 = 408.0;
 /// 一个菜单栏弹窗本来就不该自己改尺寸 —— 固定之后，列表装不下就滚动，
 /// 设置页按可用高度滚动，切页/换数据时窗口一动不动。
 ///
-/// 两页使用相同尺寸，列表按剩余高度显示整行，设置页固定底部开关区。
+/// 两页使用相同尺寸，列表填满剩余高度并连续滚动，设置页固定底部开关区。
 pub const PANEL_H: f32 = 482.0;
 const PANEL_PADDING: i8 = 16;
 
@@ -194,7 +194,9 @@ enum TrayEvent {
     #[cfg(windows)]
     BadgeClick { at: IconRect },
     #[cfg(windows)]
-    BadgeReordered { performance_first: bool },
+    BadgeReordered {
+        order: tm_core::taskbar::TaskbarOrder,
+    },
 }
 
 // tray-icon 只允许注册一个全局回调，所以用全局 channel 把事件转回 App。
@@ -941,7 +943,7 @@ impl App {
                 colored: self.settings.tray_color,
                 performance_colored: self.settings.performance_color,
                 colors: self.settings.display_colors,
-                performance_first: self.settings.taskbar_performance_first,
+                order: self.settings.taskbar_order.clone(),
             })
         } else {
             None
@@ -1146,9 +1148,9 @@ impl eframe::App for App {
                     self.toggle(ctx, at);
                 }
                 #[cfg(windows)]
-                TrayEvent::BadgeReordered { performance_first } => {
-                    if self.settings.taskbar_performance_first != performance_first {
-                        self.settings.taskbar_performance_first = performance_first;
+                TrayEvent::BadgeReordered { order } => {
+                    if self.settings.taskbar_order != order {
+                        self.settings.taskbar_order = order;
                         self.settings.save();
                     }
                 }
@@ -1746,19 +1748,6 @@ impl App {
                     &mut self.settings.performance_enabled,
                     &[(false, lang.t("关闭", "Off")), (true, lang.t("开启", "On"))],
                 );
-                #[cfg(windows)]
-                {
-                    *changed |= option_row(
-                        ui,
-                        p,
-                        lang.t("显示顺序", "Order"),
-                        &mut self.settings.taskbar_performance_first,
-                        &[
-                            (false, lang.t("网速在前", "Network first")),
-                            (true, lang.t("性能在前", "CPU/GPU first")),
-                        ],
-                    );
-                }
                 *changed |= option_row(
                     ui,
                     p,
@@ -1853,8 +1842,8 @@ impl App {
         #[cfg(windows)]
         ui.label(
             RichText::new(lang.t(
-                "在任务栏按住网速或 CPU/GPU 拖动，可交换前后位置",
-                "Drag either taskbar group to reorder.",
+                "在任务栏按住统计项拖动，即可调整顺序并自动保存",
+                "Drag taskbar items to reorder; changes are saved automatically.",
             ))
             .size(10.5)
             .color(p.subtext),
@@ -2056,10 +2045,9 @@ impl App {
     }
 
     fn list(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, reveal: f32, has_alert: bool) {
-        // 行高、间距及页脚预留统一计算，视口高度按整行分配，滚动偏移保持连续。
+        // 列表用满页脚与提醒行之外的空间，不按整行取整，以免底部空出半行。
         let reserve = FOOTER_BAND + if has_alert { ALERT_H } else { 0.0 };
         let avail = (ui.available_height() - reserve).max(0.0);
-        let cap = (((avail + ROW_GAP) / ROW_H).floor() as usize).max(1);
         // 一次性分配整个列表区。allocate_ui_with_layout 只占用内容实际高度，
         // 空状态原来因此少占半块区域，把下面的提醒行留在面板中间。
         let (body, _) =
@@ -2096,51 +2084,45 @@ impl App {
             None
         };
 
-        // 骨架和数据行按整行分配高度；空状态在下面独立占满列表区。
-        let body_rows = if loading {
-            cap
-        } else if note.is_some() {
-            cap.min(3)
-        } else {
-            rates.len().min(cap)
-        };
-        let list_h = (body_rows as f32 * ROW_H - ROW_GAP).clamp(0.0, avail);
         if std::env::var_os("TM_TRACE_LIST").is_some() {
-            eprintln!("[list] avail={avail:.1} cap={cap} rows={body_rows} list_h={list_h:.1}");
+            eprintln!(
+                "[list] avail={avail:.1} rows={} loading={loading}",
+                rates.len()
+            );
         }
 
         if loading {
             // 采样器要两个采样点才能差分出速率，第一个可用数据大约在 1–2 秒后。
             // 这段时间画骨架而不是留白：空面板看起来像坏了。
+            let rows = ((avail + ROW_GAP) / ROW_H).ceil() as usize;
             ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), list_h),
+                Vec2::new(ui.available_width(), avail),
                 Layout::top_down(Align::Min),
-                |ui| self.skeleton(ui, p, body_rows),
+                |ui| self.skeleton(ui, p, rows),
             );
         } else if let Some(text) = note {
             empty_note(ui, text, avail, p);
         } else {
-            let out =
-                app_list_scroll_area(list_h, self.initial_list_scroll.take()).show(ui, |ui| {
-                    // 让出右侧过道：行盒的描边不能和指示条叠在一起
-                    ui.set_width(ui.available_width() - SCROLL_GUTTER);
-                    // 行距自己控制，不叠加默认 item_spacing。
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let n = rates.len();
-                    for (i, r) in rates.iter().enumerate() {
-                        // 逐行错峰浮现：每行晚 14ms 开始，100ms 淡入
-                        let t = ((reveal - i as f32 * 0.014) / 0.10).clamp(0.0, 1.0);
-                        ui.scope(|ui| {
-                            // 用 multiply 而不是 set：面板整体淡入时，
-                            // set 会把这层透明度覆盖掉，行会比面板更实
-                            ui.multiply_opacity(ease_out_cubic(t));
-                            self.row(ui, r, p);
-                        });
-                        if i + 1 < n {
-                            ui.add_space(ROW_GAP);
-                        }
+            let out = app_list_scroll_area(avail, self.initial_list_scroll.take()).show(ui, |ui| {
+                // 让出右侧过道：行盒的描边不能和指示条叠在一起
+                ui.set_width(ui.available_width() - SCROLL_GUTTER);
+                // 行距自己控制，不叠加默认 item_spacing。
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let n = rates.len();
+                for (i, r) in rates.iter().enumerate() {
+                    // 逐行错峰浮现：每行晚 14ms 开始，100ms 淡入
+                    let t = ((reveal - i as f32 * 0.014) / 0.10).clamp(0.0, 1.0);
+                    ui.scope(|ui| {
+                        // 用 multiply 而不是 set：面板整体淡入时，
+                        // set 会把这层透明度覆盖掉，行会比面板更实
+                        ui.multiply_opacity(ease_out_cubic(t));
+                        self.row(ui, r, p);
+                    });
+                    if i + 1 < n {
+                        ui.add_space(ROW_GAP);
                     }
-                });
+                }
+            });
 
             let now = out.state.offset.y;
             let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
@@ -3841,9 +3823,9 @@ pub(crate) fn badge_clicked(at: Option<tm_windows::screen::Rect>, _performance: 
 }
 
 #[cfg(windows)]
-pub(crate) fn badge_reordered(performance_first: bool) {
+pub(crate) fn badge_reordered(order: tm_core::taskbar::TaskbarOrder) {
     if let Some(tx) = TRAY_TX.get() {
-        let _ = tx.send(TrayEvent::BadgeReordered { performance_first });
+        let _ = tx.send(TrayEvent::BadgeReordered { order });
     }
     if let Some(ctx) = CTX.get() {
         ctx.request_repaint();

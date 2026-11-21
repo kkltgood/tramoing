@@ -9,7 +9,7 @@ pub struct BadgeState {
     pub colored: bool,
     pub performance_colored: bool,
     pub colors: tm_core::color::DisplayColors,
-    pub performance_first: bool,
+    pub order: tm_core::taskbar::TaskbarOrder,
 }
 
 pub struct Badge {
@@ -39,7 +39,7 @@ impl Badge {
             }),
             light: s.light,
             colors: s.colors,
-            performance_first: s.performance_first,
+            order: s.order,
         }));
         let error = result.err();
         if error != self.error {

@@ -6,6 +6,7 @@
 
 pub mod color;
 pub mod rate;
+pub mod taskbar;
 pub mod types;
 pub mod window;
 

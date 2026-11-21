@@ -82,7 +82,7 @@ TM_DATA_DIR="$PWD/target/demo-data" \
 | `TM_TRACE=1` | 输出 macOS 菜单栏诊断信息 |
 | `TM_TRAY_PNG` / `TM_PERFORMANCE_PNG` | 配合 `TM_TRACE` 保存 macOS 菜单栏离屏渲染 |
 | `TM_CAPTURE_PPM` / `TM_CAPTURE_AFTER` | debug 演示实例保存面板渲染并退出；需设置 `TM_DATA_DIR` |
-| `TM_CAPTURE_STATE=empty\|timeout\|disconnected` | 配合截图模式验证空状态和错误布局 |
+| `TM_CAPTURE_STATE=list\|empty\|timeout\|disconnected` | 配合截图模式验证无底部提示的列表、空状态和错误布局 |
 
 截图来自应用自身渲染，不代表真实桌面点击或焦点行为已通过验证。
 

@@ -14,8 +14,8 @@ const HIT_ALPHA: u32 = 1;
 // 12px 字号下保留最宽四字符（如 999M）的空间，收紧箭头列及左右留白。
 pub(super) const WIDTH_DIP: i32 = 40;
 const PERFORMANCE_WIDTH_DIP: i32 = 58;
-// 两组之间明确留白，不能把速率单位和 CPU/GPU 标签连成一个词。
-const GROUP_GAP_DIP: i32 = 4;
+// 相邻统计项统一留白，不借用百分比末尾的空位；网速在前时也要明显分组。
+const GROUP_GAP_DIP: i32 = 10;
 const ARROW_LEFT_DIP: i32 = 1;
 const ARROW_RIGHT_DIP: i32 = 8;
 const NUMBER_LEFT_DIP: i32 = 8;
@@ -24,36 +24,48 @@ const PERFORMANCE_NUMBER_LEFT_DIP: i32 = 27;
 const RIGHT_PADDING_DIP: i32 = 1;
 
 pub(super) fn width_dip(content: &Content) -> i32 {
-    i32::from(content.speed.is_some()) * WIDTH_DIP
-        + i32::from(content.performance.is_some()) * PERFORMANCE_WIDTH_DIP
-        + i32::from(content.speed.is_some() && content.performance.is_some()) * GROUP_GAP_DIP
+    let count = content.visible_items().count();
+    content.visible_items().map(group_width_dip).sum::<i32>()
+        + count.saturating_sub(1) as i32 * GROUP_GAP_DIP
 }
 
 pub(super) fn minimum_width_dip(content: &Content) -> i32 {
-    if content.performance.is_some() {
-        PERFORMANCE_WIDTH_DIP
-    } else {
-        WIDTH_DIP
+    content
+        .visible_items()
+        .map(group_width_dip)
+        .max()
+        .unwrap_or(0)
+}
+
+fn group_width_dip(group: Group) -> i32 {
+    match group {
+        Group::Speed => WIDTH_DIP,
+        Group::Performance => PERFORMANCE_WIDTH_DIP,
     }
 }
 
 pub(super) struct Layout {
-    pub speed: Option<RECT>,
-    pub performance: Option<RECT>,
+    pub groups: Vec<(Group, RECT)>,
+    stacked: bool,
 }
 
 impl Layout {
+    pub fn rect(&self, group: Group) -> Option<RECT> {
+        self.groups
+            .iter()
+            .find(|(item, _)| *item == group)
+            .map(|(_, rect)| *rect)
+    }
+
     pub fn group_at(&self, x: i32, y: i32) -> Option<Group> {
-        [
-            (Group::Speed, self.speed),
-            (Group::Performance, self.performance),
-        ]
-        .into_iter()
-        .find_map(|(group, rect)| rect.filter(|r| super::contains(*r, x, y)).map(|_| group))
+        self.groups
+            .iter()
+            .find(|(_, rect)| super::contains(*rect, x, y))
+            .map(|(group, _)| *group)
     }
 
     pub fn stacked(&self) -> bool {
-        matches!((self.speed, self.performance), (Some(s), Some(p)) if s.top != p.top)
+        self.stacked
     }
 }
 
@@ -64,52 +76,43 @@ pub(super) fn layout(content: &Content, width: i32, height: i32, dpi: i32) -> La
         right: width,
         bottom: height,
     };
-    let (speed, performance) = if content.speed.is_some() && content.performance.is_some() {
-        if width < width_dip(content) * dpi / 96 {
-            // Win10 竖向任务栏：两组上下排列，点击和绘制共用这份布局。
-            let (first, second) = (
+    let items: Vec<_> = content.visible_items().collect();
+    let count = items.len() as i32;
+    let stacked = count > 1 && width < width_dip(content) * dpi / 96;
+    // 各项宽度单独取整，剩余像素分配到间距，换序不改变文字区域宽度。
+    let item_width: i32 = items
+        .iter()
+        .map(|item| group_width_dip(*item) * dpi / 96)
+        .sum();
+    let mut offset = 0;
+    let groups = items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let index = index as i32;
+            let rect = if count == 1 {
+                full
+            } else if stacked {
+                // Win10 竖向任务栏：按同一顺序上下排列，点击和绘制共用布局。
                 RECT {
-                    bottom: height / 2,
+                    top: height * index / count,
+                    bottom: height * (index + 1) / count,
                     ..full
-                },
+                }
+            } else {
+                let left = offset + (width - item_width) * index / (count - 1);
+                let item_width = group_width_dip(item) * dpi / 96;
+                offset += item_width;
                 RECT {
-                    top: height / 2,
+                    left,
+                    right: left + item_width,
                     ..full
-                },
-            );
-            if content.performance_first {
-                (second, first)
-            } else {
-                (first, second)
-            }
-        } else {
-            let (first_width, second_width) = if content.performance_first {
-                (PERFORMANCE_WIDTH_DIP, WIDTH_DIP)
-            } else {
-                (WIDTH_DIP, PERFORMANCE_WIDTH_DIP)
+                }
             };
-            let first = RECT {
-                right: first_width * dpi / 96,
-                ..full
-            };
-            // 各组宽度按相同规则单独取整，避免换序时 125% / 175% 下少一个像素。
-            let second = RECT {
-                left: width - second_width * dpi / 96,
-                ..full
-            };
-            if content.performance_first {
-                (second, first)
-            } else {
-                (first, second)
-            }
-        }
-    } else {
-        (full, full)
-    };
-    Layout {
-        speed: content.speed.as_ref().map(|_| speed),
-        performance: content.performance.as_ref().map(|_| performance),
-    }
+            (item, rect)
+        })
+        .collect();
+    Layout { groups, stacked }
 }
 
 pub(super) unsafe fn present(hwnd: HWND, content: &Content) -> Result<(), &'static str> {
@@ -253,7 +256,7 @@ unsafe fn rasterize(
     SetTextColor(surface.dc, 0x00ff_ffff);
     let layout = layout(content, width, height, dpi);
     let mut drawn = true;
-    if let (Some(speed), Some(rect)) = (&content.speed, layout.speed) {
+    if let (Some(speed), Some(rect)) = (&content.speed, layout.rect(Group::Speed)) {
         drawn &= draw_lines(
             surface.dc,
             rect,
@@ -262,7 +265,8 @@ unsafe fn rasterize(
             false,
         );
     }
-    if let (Some(performance), Some(rect)) = (&content.performance, layout.performance) {
+    if let (Some(performance), Some(rect)) = (&content.performance, layout.rect(Group::Performance))
+    {
         drawn &= draw_lines(
             surface.dc,
             rect,
@@ -352,7 +356,8 @@ unsafe fn draw_lines(
 
 fn text_color(content: &Content, layout: &Layout, x: i32, y: i32) -> Rgb {
     let contains = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
-    if let (Some(performance), Some(rect)) = (&content.performance, layout.performance) {
+    if let (Some(performance), Some(rect)) = (&content.performance, layout.rect(Group::Performance))
+    {
         if performance.colored && contains(rect) {
             return if y < (rect.top + rect.bottom) / 2 {
                 content.colors.cpu(!content.light)
@@ -361,7 +366,7 @@ fn text_color(content: &Content, layout: &Layout, x: i32, y: i32) -> Rgb {
             };
         }
     }
-    if let (Some(speed), Some(rect)) = (&content.speed, layout.speed) {
+    if let (Some(speed), Some(rect)) = (&content.speed, layout.rect(Group::Speed)) {
         if speed.colored && contains(rect) {
             return if y < (rect.top + rect.bottom) / 2 {
                 content.colors.download(!content.light)
@@ -389,7 +394,7 @@ fn premultiply(coverage: u8, color: Rgb) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::badge::{Performance, Speed};
+    use crate::badge::{tests::order, Performance, Speed};
 
     fn content(light: bool, colored: bool) -> Content {
         Content {
@@ -405,7 +410,7 @@ mod tests {
             }),
             light,
             colors: Default::default(),
-            performance_first: false,
+            order: order(false),
         }
     }
 
@@ -517,11 +522,11 @@ mod tests {
             .flat_map(|dpi| [false, true].map(|first| (dpi, first)))
         {
             let mut content = content(false, true);
-            content.performance_first = performance_first;
+            content.order = order(performance_first);
             let width = width_dip(&content) * dpi / 96;
             let horizontal = layout(&content, width, 48 * dpi / 96, dpi);
-            let speed = horizontal.speed.unwrap();
-            let perf = horizontal.performance.unwrap();
+            let speed = horizontal.rect(Group::Speed).unwrap();
+            let perf = horizontal.rect(Group::Performance).unwrap();
             let (first, second) = if performance_first {
                 (perf, speed)
             } else {
@@ -536,8 +541,8 @@ mod tests {
             assert_eq!(horizontal.group_at(perf.left, 0), Some(Group::Performance));
             assert_eq!(horizontal.group_at(first.right, 0), None);
             let vertical = layout(&content, 80 * dpi / 96, 72 * dpi / 96, dpi);
-            let speed = vertical.speed.unwrap();
-            let perf = vertical.performance.unwrap();
+            let speed = vertical.rect(Group::Speed).unwrap();
+            let perf = vertical.rect(Group::Performance).unwrap();
             let (first, second) = if performance_first {
                 (perf, speed)
             } else {
@@ -554,8 +559,8 @@ mod tests {
                 48 * dpi / 96,
                 dpi,
             );
-            assert!(only.speed.is_none());
-            assert_eq!(only.performance.unwrap().left, 0);
+            assert!(only.rect(Group::Speed).is_none());
+            assert_eq!(only.rect(Group::Performance).unwrap().left, 0);
             content.performance = None;
             assert_eq!(width_dip(&content), 0);
         }
@@ -569,12 +574,12 @@ mod tests {
         {
             for light in [false, true] {
                 for colored in [false, true] {
-                    for (width_dip, height_dip) in [(102, 48), (80, 72)] {
-                        let (width, height) = (width_dip * dpi / 96, height_dip * dpi / 96);
-                        let mut content = content(light, colored);
-                        content.performance_first = performance_first;
+                    let mut content = content(light, colored);
+                    content.order = order(performance_first);
+                    for (dip_width, dip_height) in [(width_dip(&content), 48), (80, 72)] {
+                        let (width, height) = (dip_width * dpi / 96, dip_height * dpi / 96);
                         let layout = layout(&content, width, height, dpi);
-                        let perf = layout.performance.unwrap();
+                        let perf = layout.rect(Group::Performance).unwrap();
                         let mut labels = None;
                         for (cpu, gpu) in [("100%", " --%"), ("  0%", "  9%"), (" --%", "100%")] {
                             content.performance.as_mut().unwrap().cpu = cpu.into();
@@ -599,7 +604,7 @@ mod tests {
                                 labels = Some(label_pixels);
                             }
                             // 每个区块的上下两排都必须有完整不透明的字形，且配色不串列。
-                            for area in [layout.speed.unwrap(), perf] {
+                            for area in [layout.rect(Group::Speed).unwrap(), perf] {
                                 for (top, bottom) in [
                                     (area.top, (area.top + area.bottom) / 2),
                                     ((area.top + area.bottom) / 2, area.bottom),
@@ -628,11 +633,12 @@ mod tests {
             for performance_first in [false, true] {
                 for (case, down, up, cpu, gpu) in [
                     ("reported", "118B", "144B", "  3%", "  1%"),
+                    ("reordered", "344K", " 18K", "  2%", "  5%"),
                     ("widest", "999M", "1.5G", "100%", " 99%"),
                     ("unavailable", "  0B", "  9B", " --%", "100%"),
                 ] {
                     let mut content = content(false, true);
-                    content.performance_first = performance_first;
+                    content.order = order(performance_first);
                     content.speed = Some(Speed {
                         down: down.into(),
                         up: up.into(),
@@ -646,8 +652,8 @@ mod tests {
                     let width = width_dip(&content) * dpi / 96;
                     let height = 36 * dpi / 96;
                     let layout = layout(&content, width, height, dpi);
-                    let speed = layout.speed.unwrap();
-                    let perf = layout.performance.unwrap();
+                    let speed = layout.rect(Group::Speed).unwrap();
+                    let perf = layout.rect(Group::Performance).unwrap();
                     let mut surface = unsafe { rasterize(&content, width, height, dpi).unwrap() };
                     let pixels = surface.pixels_mut();
                     let bounds = |left, right, top, bottom| {
@@ -730,7 +736,7 @@ mod tests {
                             performance: None,
                             light,
                             colors: Default::default(),
-                            performance_first: false,
+                            order: order(false),
                         };
                         let mut surface =
                             unsafe { rasterize(&content, width, height, dpi).unwrap() };

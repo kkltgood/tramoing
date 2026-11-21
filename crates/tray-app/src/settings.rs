@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use tm_core::color::{DisplayColors, Rgb};
+use tm_core::taskbar::{TaskbarItem, TaskbarOrder};
 
 /// 状态栏显示内容。
 ///
@@ -56,8 +57,8 @@ pub struct Settings {
     pub tray_color: bool,
     /// 是否显示 Windows 原生任务栏网速区域。
     pub tray_badge: bool,
-    /// Windows 任务栏：性能在网速之前；拖动两组或设置页均可修改。
-    pub taskbar_performance_first: bool,
+    /// Windows 任务栏：直接拖拽统计项保存的顺序，不在设置页提供排序控件。
+    pub taskbar_order: TaskbarOrder,
     /// CPU / GPU 共用一个双行区块（macOS 菜单栏 / Windows 任务栏）。
     pub performance_enabled: bool,
     pub performance_color: bool,
@@ -88,7 +89,7 @@ impl Default for Settings {
             alert_mb: 0,
             tray_color: true,
             tray_badge: true,
-            taskbar_performance_first: false,
+            taskbar_order: TaskbarOrder::default(),
             performance_enabled: false,
             performance_color: true,
             performance_interval: 2,
@@ -122,6 +123,8 @@ impl Settings {
 
     pub fn parse(text: &str) -> Self {
         let mut s = Self::default();
+        let mut taskbar_order = None;
+        let mut legacy_performance_first = false;
         for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -181,7 +184,12 @@ impl Settings {
                 },
                 "taskbar_performance_first" => {
                     if let Some(value) = parse_bool(v) {
-                        s.taskbar_performance_first = value;
+                        legacy_performance_first = value;
+                    }
+                }
+                "taskbar_order" => {
+                    if let Some(order) = TaskbarOrder::parse(v) {
+                        taskbar_order = Some(order);
                     }
                 }
                 "update_check" => match v {
@@ -227,6 +235,12 @@ impl Settings {
                 _ => {} // 未知键忽略：旧版本写的字段不该让新版本报错
             }
         }
+        // 新格式优先，与两个键在文件中的先后无关；兼容升级前的顺序。
+        if let Some(order) = taskbar_order {
+            s.taskbar_order = order;
+        } else if legacy_performance_first {
+            s.taskbar_order = TaskbarOrder::new([TaskbarItem::Performance, TaskbarItem::Speed]);
+        }
         s
     }
 
@@ -256,7 +270,7 @@ impl Settings {
              alert_mb={}\n\
              tray_color={}\n\
              tray_badge={}\n\
-             taskbar_performance_first={}\n\
+             taskbar_order={}\n\
              performance_enabled={}\n\
              performance_color={}\n\
              performance_interval={}\n\
@@ -271,11 +285,7 @@ impl Settings {
             self.alert_mb,
             if self.tray_color { "on" } else { "off" },
             if self.tray_badge { "on" } else { "off" },
-            if self.taskbar_performance_first {
-                "on"
-            } else {
-                "off"
-            },
+            self.taskbar_order.serialize(),
             if self.performance_enabled {
                 "on"
             } else {
@@ -368,7 +378,7 @@ mod tests {
             alert_mb: 500,
             tray_color: false,
             tray_badge: false,
-            taskbar_performance_first: true,
+            taskbar_order: TaskbarOrder::new([TaskbarItem::Performance, TaskbarItem::Speed]),
             performance_enabled: true,
             performance_color: false,
             performance_interval: 5,
@@ -464,16 +474,51 @@ mod tests {
 
     #[test]
     fn taskbar_order_defaults_to_network_and_survives_restart() {
-        assert!(!Settings::parse("theme=dark").taskbar_performance_first);
+        assert_eq!(
+            Settings::parse("theme=dark").taskbar_order,
+            TaskbarOrder::default()
+        );
         for value in ["on", "true", "1"] {
             let settings = Settings::parse(&format!("taskbar_performance_first={value}"));
-            assert!(settings.taskbar_performance_first);
+            assert_eq!(settings.taskbar_order.items()[0], TaskbarItem::Performance);
+            assert!(!settings.serialize().contains("taskbar_performance_first="));
             assert_eq!(Settings::parse(&settings.serialize()), settings);
         }
-        assert!(!Settings::parse("taskbar_performance_first=invalid").taskbar_performance_first);
+        assert_eq!(
+            Settings::parse("taskbar_performance_first=invalid").taskbar_order,
+            TaskbarOrder::default()
+        );
         let back = Settings::parse("taskbar_performance_first=on\ntaskbar_performance_first=off");
-        assert!(!back.taskbar_performance_first);
+        assert_eq!(back.taskbar_order, TaskbarOrder::default());
         assert_eq!(Settings::parse(&back.serialize()), back);
+    }
+
+    #[test]
+    fn taskbar_item_order_takes_precedence_and_preserves_hidden_items() {
+        for text in [
+            "taskbar_order=performance,speed\ntaskbar_performance_first=off",
+            "taskbar_performance_first=off\ntaskbar_order=performance,speed",
+            "taskbar_order=performance\ntaskbar_order=unknown",
+        ] {
+            let settings = Settings::parse(text);
+            assert_eq!(
+                settings.taskbar_order.items(),
+                &[TaskbarItem::Performance, TaskbarItem::Speed]
+            );
+            assert!(!settings.performance_enabled);
+            assert_eq!(Settings::parse(&settings.serialize()), settings);
+        }
+        assert_eq!(
+            Settings::parse("taskbar_performance_first=on\ntaskbar_order=speed,performance")
+                .taskbar_order,
+            TaskbarOrder::default()
+        );
+        assert_eq!(
+            Settings::parse("taskbar_performance_first=on\ntaskbar_order=invalid")
+                .taskbar_order
+                .items()[0],
+            TaskbarItem::Performance
+        );
     }
 
     #[test]

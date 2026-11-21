@@ -25,7 +25,7 @@
 | `performance_enabled` | `on` / `off` | `off` |
 | `performance_interval` | 1 / 2 / 5 秒 | 2 |
 | `performance_color` | `on` / `off` | `on` |
-| `taskbar_performance_first` | `on` / `off`，Windows | `off` |
+| `taskbar_order` | Windows 统计项顺序，任务栏拖拽后自动保存 | `speed,performance` |
 | `cpu_color` / `gpu_color` / `download_color` / `upload_color` | `auto` / `#RRGGBB` | `auto` |
 | `max_apps` | 5 / 10 / 20 | 10 |
 | `retention_days` | 1–365 天 | 30 |
@@ -33,6 +33,8 @@
 | `update_check` | `on` / `off`，自动检查 GitHub Releases | `on`（保留旧配置中的 `off`） |
 
 CSV 导出优先保存到当前用户的 Downloads，失败时退回数据目录下的 `exports/`。演示模式不产生持久历史；命令行导出读取已有数据库。
+
+Windows 任务栏上的统计项可直接按住拖拽排序，松开后自动保存，重启后保留；设置页不提供排序选项。拖出统计区域后松开会取消换位。暂时关闭某项显示不会清除它的排序位置。旧版 `taskbar_performance_first` 会自动迁移为项目顺序。
 
 ## Windows 无流量
 

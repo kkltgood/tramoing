@@ -18,6 +18,13 @@ pub fn preview_snapshot(snapshot: crate::engine::Snapshot) -> crate::engine::Sna
         return snapshot;
     }
     let error = match std::env::var("TM_CAPTURE_STATE").as_deref() {
+        // 验证有数据、无底部提示的布局；采样和持久化仍使用隔离的演示引擎。
+        Ok("list") => {
+            return crate::engine::Snapshot {
+                mock: false,
+                ..snapshot
+            }
+        }
         Ok("empty") => None,
         Ok("timeout") => Some("采集暂时中断，正在重新连接".into()),
         Ok("disconnected") => Some(
