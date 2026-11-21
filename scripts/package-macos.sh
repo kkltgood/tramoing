@@ -7,11 +7,13 @@
 #
 # 产物：dist/Tramoing.app、dist/Tramoing-<version>.dmg
 #
-# 签名说明：用的是 ad-hoc（`codesign -s -`）。别人第一次打开会被 Gatekeeper 拦，
-# 需要右键「打开」或 `xattr -dr com.apple.quarantine`。要正式分发得买 Developer ID
-# 并走 notarytool 公证，那是另一套流程。
+# 本地构建使用 ad-hoc 签名。面向其他用户发布时需配置 Developer ID 和公证。
 
 set -euo pipefail
+if [[ $(uname -s) != Darwin ]]; then
+  echo "此脚本需要在 macOS 上运行" >&2
+  exit 1
+fi
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 
@@ -36,6 +38,8 @@ if [[ -z "${VERSION}" ]]; then
   exit 1
 fi
 echo "==> 版本 $VERSION"
+TARGET_DIR=$(cargo metadata --format-version=1 --no-deps --locked |
+  /usr/bin/plutil -extract target_directory raw -o - -)
 
 # ---------- 1. 编译 ----------
 # 两个 target 都在才做通用二进制。只有本机架构时也能出包，只是别的 CPU 跑不了。
@@ -53,7 +57,7 @@ fi
 
 for t in "${TARGETS[@]}"; do
   echo "==> 编译 $t (release)"
-  cargo build --release -p tray-app --target "$t"
+  cargo build --release --locked -p tray-app --target "$t"
 done
 
 # ---------- 2. 组装 .app ----------
@@ -63,36 +67,38 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 if [[ ${#TARGETS[@]} -ge 2 ]]; then
   lipo -create \
-    "$ROOT/target/aarch64-apple-darwin/release/$BIN" \
-    "$ROOT/target/x86_64-apple-darwin/release/$BIN" \
+    "$TARGET_DIR/aarch64-apple-darwin/release/$BIN" \
+    "$TARGET_DIR/x86_64-apple-darwin/release/$BIN" \
     -output "$APP/Contents/MacOS/$BIN"
   echo "    通用二进制（arm64 + x86_64）"
 else
-  cp "$ROOT/target/${TARGETS[0]}/release/$BIN" "$APP/Contents/MacOS/$BIN"
+  cp "$TARGET_DIR/${TARGETS[0]}/release/$BIN" "$APP/Contents/MacOS/$BIN"
   echo "    单架构（${TARGETS[0]}）"
 fi
 chmod +x "$APP/Contents/MacOS/$BIN"
 
 sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 echo -n "APPL????" > "$APP/Contents/PkgInfo"
+cp LICENSE "$APP/Contents/Resources/LICENSE"
 
 # ---------- 3. 图标 ----------
 if [[ ! -f assets/AppIcon.icns ]]; then
   echo "==> 生成 AppIcon.icns"
+  ICON_WORK=$(mktemp -d)
+  trap 'rm -rf "$ICON_WORK"' EXIT
   if [[ ! -f assets/icon-1024.png ]]; then
-    rustc -O assets/gen-icon.rs -o /tmp/tm-icon-gen
-    /tmp/tm-icon-gen
+    rustc -O assets/gen-icon.rs -o "$ICON_WORK/icon-gen"
+    "$ICON_WORK/icon-gen"
     sips -s format png assets/icon-1024.bmp --out assets/icon-1024.png >/dev/null
     rm -f assets/icon-1024.bmp
   fi
-  ICONSET=$(mktemp -d)/AppIcon.iconset
+  ICONSET="$ICON_WORK/AppIcon.iconset"
   mkdir -p "$ICONSET"
   for sz in 16 32 128 256 512; do
     sips -z $sz $sz assets/icon-1024.png --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
     sips -z $((sz * 2)) $((sz * 2)) assets/icon-1024.png --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
   done
   iconutil -c icns "$ICONSET" -o assets/AppIcon.icns
-  rm -rf "$(dirname "$ICONSET")"
 fi
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
@@ -115,6 +121,7 @@ if [[ $MAKE_DMG -eq 1 ]]; then
   rm -f "$DMG"
   hdiutil create -quiet -volname "$APP_DISPLAY_NAME" -srcfolder "$STAGE" \
     -ov -format UDZO "$DMG"
+  (cd "$DIST" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
   rm -rf "$STAGE"
   echo "    大小：$(du -h "$DMG" | cut -f1)"
 fi

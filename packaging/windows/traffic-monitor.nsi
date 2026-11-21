@@ -10,11 +10,8 @@
 ; 关键点：助手不是 Windows 服务，而是登录时以最高权限启动的计划任务
 ; （由 `tramoing-helper.exe --install` 注册，卸载时用 --uninstall 摘掉）。
 ;
-; 命名约定（2026-11-18 产品改名 Tramoing）：
-;   对外可见的名字（安装目录、快捷方式、控制面板条目、安装包文件名）用 APP_NAME=Tramoing；
-;   **内部标识一律不动**：exe 名、数据目录 %LOCALAPPDATA%\TrafficMonitor、
-;   HKCU Run 值、计划任务名、ETW 会话名 —— 改了会让旧版的历史数据和已注册的
-;   计划任务变成孤儿，测试时就分不清「程序有问题」还是「迁移没做」。
+; 产品显示名称使用 Tramoing。数据目录、计划任务和 ETW 标识保留兼容性；
+; 升级时清理旧版的快捷方式和注册表项。
 
 Unicode true
 
@@ -138,6 +135,7 @@ Section "托盘程序（必需）" SEC_MAIN
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "..\..\dist\windows\${APP_EXE}"
+  File "..\..\LICENSE"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
@@ -202,6 +200,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\${HELPER_EXE}"
+  Delete "$INSTDIR\LICENSE"
   ; 覆盖安装过旧版的目录里可能还留着老名字的 exe
   Delete "$INSTDIR\traffic-monitor.exe"
   Delete "$INSTDIR\tm-helper.exe"

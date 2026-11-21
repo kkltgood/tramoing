@@ -3,6 +3,8 @@ name = "tm-macos"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 tm-core = { path = "../tm-core" }

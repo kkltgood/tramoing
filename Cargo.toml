@@ -6,7 +6,6 @@ members = [
     "crates/tm-macos",
     "crates/tm-store",
     "crates/tm-windows",
-    "crates/tm-spike-mac",
     "crates/tray-app",
 ]
 
@@ -15,6 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["guolongkang"]
+repository = "https://github.com/glkabc/traffic-monitoring"
 
 [profile.release]
 lto = true

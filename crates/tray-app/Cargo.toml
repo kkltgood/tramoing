@@ -3,6 +3,8 @@ name = "tray-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 # 把图标 + VERSIONINFO 写进 exe（Windows）。macOS 的图标在 .app 包里，用不到。
 build = "build.rs"
 

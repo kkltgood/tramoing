@@ -506,7 +506,7 @@ impl App {
         }
         let due = if self.force_update_check {
             true
-        } else if !self.settings.update_check {
+        } else if !self.settings.update_check || crate::update::manifest_url().is_none() {
             false
         } else {
             self.started_at.elapsed() >= UPDATE_FIRST_DELAY

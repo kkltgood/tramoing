@@ -3,6 +3,8 @@ name = "tm-windows"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 # 给 tramoing-helper.exe 塞图标（见 build.rs）
 build = "build.rs"
 

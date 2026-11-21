@@ -26,11 +26,13 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
 
-if (-not $Version) {
-    $line = Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"' | Select-Object -First 1
-    if (-not $line) { throw "读不到 Cargo.toml 里的 version" }
-    $Version = $line.Matches[0].Groups[1].Value
+$line = Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"' | Select-Object -First 1
+if (-not $line) { throw "读不到 Cargo.toml 里的 version" }
+$cargoVersion = $line.Matches[0].Groups[1].Value
+if ($Version -and $Version -ne $cargoVersion) {
+    throw "请先修改 Cargo.toml 版本，安装包版本必须与程序一致（当前 $cargoVersion）"
 }
+$Version = $cargoVersion
 Write-Host "==> 版本 $Version"
 
 Write-Host "==> 编译 release"
@@ -91,5 +93,14 @@ Write-Host "==> 生成安装包"
 & $makensis "/DAPP_VERSION=$Version" "packaging\windows\traffic-monitor.nsi"
 if ($LASTEXITCODE -ne 0) { throw "makensis 失败" }
 
+$installerPath = Join-Path $root "dist\Tramoing-$Version-setup.exe"
+$checksum = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash.ToLowerInvariant()
+[IO.File]::WriteAllText(
+    "$installerPath.sha256",
+    "$checksum  $([IO.Path]::GetFileName($installerPath))`n",
+    [Text.Encoding]::ASCII
+)
+
 Write-Host ""
 Write-Host "完成：dist\Tramoing-$Version-setup.exe"
+Write-Host "校验：dist\Tramoing-$Version-setup.exe.sha256"

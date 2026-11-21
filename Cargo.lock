@@ -3830,15 +3830,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tm-spike-mac"
-version = "0.1.0"
-dependencies = [
- "tm-core",
- "tm-macos",
- "tm-sampler",
-]
-
-[[package]]
 name = "tm-store"
 version = "0.1.0"
 dependencies = [

@@ -8,9 +8,8 @@
 //! 所有网络操作都在后台线程里：`update()` 每帧都会被调用，一次 DNS 卡顿
 //! 就能让整个面板僵住。界面只通过 channel 收事件，和采样线程是同一套模式。
 //!
-//! 版本清单是一个静态 JSON（见 README 的发布章节）。**不要**把地址指向
-//! `raw.githubusercontent.com`：国内直连基本不通，客户端会永远「检查失败」，
-//! 而失败是静默的，线上根本看不出来。
+//! 版本清单是静态 JSON，配置方式见 docs/development.md。
+//! 未配置更新源时不发起网络请求。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,14 +18,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-/// 版本清单地址。发布时改这一个常量，或者用环境变量 `TRAMOING_UPDATE_URL`
-/// 临时覆盖（联调时指向 `python -m http.server` 就行，不必真发一版）。
-pub const DEFAULT_MANIFEST_URL: &str = "https://tramoing.oss-cn-hangzhou.aliyuncs.com/latest.json";
-
-/// 本次实际要请求的地址。**运行时**读环境变量而不是编译期常量：
-/// 打包后想换域名、内网部署指向内部镜像，都不需要重新编译。
-pub fn manifest_url() -> String {
-    std::env::var("TRAMOING_UPDATE_URL").unwrap_or_else(|_| DEFAULT_MANIFEST_URL.to_owned())
+/// 运行时环境变量优先于构建时配置；空值表示禁用此构建的更新源。
+pub fn manifest_url() -> Option<String> {
+    std::env::var("TRAMOING_UPDATE_URL")
+        .ok()
+        .or_else(|| option_env!("TRAMOING_UPDATE_URL").map(str::to_owned))
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
 }
 
 /// 当前版本。和安装包版本、`Cargo.toml` 的 workspace version 是同一个来源。
@@ -162,15 +160,26 @@ impl Updater {
 
     /// 起一个线程去拉清单。重复调用是安全的：正在查/正在下时直接忽略。
     pub fn check(&mut self) {
+        self.check_source(manifest_url());
+    }
+
+    fn check_source(&mut self, source: Option<String>) {
         if self.is_busy() {
             return;
         }
+        let Some(url) = source else {
+            self.set(Phase::Error(
+                "未配置更新源 / Update source not configured".into(),
+            ));
+            return;
+        };
         self.set(Phase::Checking);
         let tx = self.tx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("update-check".into())
             .spawn(move || {
-                let ev = match fetch_manifest().and_then(|m| available_update(m, CURRENT, PLATFORM))
+                let ev = match fetch_manifest(&url)
+                    .and_then(|m| available_update(m, CURRENT, PLATFORM))
                 {
                     Ok(available) => Event::Checked(available),
                     Err(e) => Event::Failed(e),
@@ -302,8 +311,8 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
-fn fetch_manifest() -> Result<Manifest, String> {
-    let url = http_url(&manifest_url())?;
+fn fetch_manifest(source: &str) -> Result<Manifest, String> {
+    let url = http_url(source)?;
     let text = agent(Duration::from_secs(8))
         .get(url.as_str())
         .call()
@@ -509,6 +518,64 @@ pub fn log_line(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_checks_require_a_configured_source_and_accept_a_local_manifest() {
+        let mut updater = Updater::new();
+        updater.check_source(None);
+        assert!(matches!(updater.phase, Phase::Error(_)));
+        assert!(!updater.is_busy());
+        assert!(!updater.poll());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "update did not request the configured source"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() <= 8192, "request headers too large");
+            }
+            assert!(request.starts_with(b"GET /latest.json HTTP/1.1\r\n"));
+            let body = format!("\u{feff}{{\"version\":\"{CURRENT}\"}}");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        updater.check_source(Some(format!("http://{address}/latest.json")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updater.is_busy() {
+            updater.poll();
+            assert!(Instant::now() < deadline, "update check timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.join().unwrap();
+        assert_eq!(updater.phase, Phase::Latest);
+    }
 
     fn manifest(version: &str) -> Manifest {
         serde_json::from_value(serde_json::json!({"version": version})).unwrap()

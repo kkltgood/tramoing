@@ -2,3 +2,22 @@
 /dist
 .workbuddy
 .DS_Store
+
+# Local editor files and credentials
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data and diagnostics
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.ppm
+__pycache__/

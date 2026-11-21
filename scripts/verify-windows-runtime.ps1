@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][string]$Executable,
     [string]$Screenshot
 )
@@ -6,9 +6,9 @@ $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $testRoot = Join-Path $env:TEMP ('tramoing-runtime-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
-$oldLocalAppData = $env:LOCALAPPDATA
+$oldDataDir = $env:TM_DATA_DIR
 $oldDbPath = $env:TM_DB_PATH
-$env:LOCALAPPDATA = $testRoot
+$env:TM_DATA_DIR = $testRoot
 $env:TM_DB_PATH = Join-Path $testRoot 'history.db'
 
 Add-Type -TypeDefinition @'
@@ -112,6 +112,6 @@ try {
         [pscustomobject]@{CleanExit=$exited;ChildRemoved=(-not [TramoingRuntimeProbe]::IsWindow($badge))} | ConvertTo-Json
     }
     [TramoingRuntimeProbe]::SetThreadDpiAwarenessContext($previousDpi) | Out-Null
-    $env:LOCALAPPDATA = $oldLocalAppData
+    $env:TM_DATA_DIR = $oldDataDir
     $env:TM_DB_PATH = $oldDbPath
 }

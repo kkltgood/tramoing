@@ -67,10 +67,8 @@ pub struct Settings {
     pub display_colors: DisplayColors,
     /// 启动后自动检查新版本。
     ///
-    /// **默认关闭**（2026-11-19 决定先不上线）：清单地址还没定，
-    /// 开着只会让每台机器往一个占位地址发请求、再静默 404。
-    /// 想启用：用户自己在 `settings.conf` 写 `update_check=on`，
-    /// 或者在设置页点标题栏的版本号手动查一次（不改这个开关）。
+    /// 默认关闭；配置 TRAMOING_UPDATE_URL 后可设置 update_check=on。
+    /// 设置页版本号和 --check-update 提供手动检查入口。
     pub update_check: bool,
     /// 上次检查更新的时刻（Unix 秒）。0 表示从没查过。
     ///
@@ -437,8 +435,7 @@ mod tests {
 
     #[test]
     fn update_check_is_off_by_default() {
-        // 2026-11-19 决定先不上线：新装用户不该有任何出网请求，
-        // 而不能指望「反正地址是占位的」——占位地址也是请求。
+        // 新安装默认不主动发起更新请求。
         assert!(!Settings::default().update_check);
     }
 
