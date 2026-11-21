@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["guolongkang"]
-repository = "https://github.com/glkabc/traffic-monitoring"
+repository = "https://github.com/kkltgood/tramoing"
 
 [profile.release]
 lto = true

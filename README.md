@@ -36,8 +36,8 @@ CPU / GPU 显示不依赖 Windows 网络采集助手。GPU 使用率需要驱动
 准备 Rust stable 工具链。Windows 还需要 Visual Studio Build Tools 的“使用 C++ 的桌面开发”和 Windows SDK；macOS 需要 Xcode Command Line Tools。
 
 ```sh
-git clone https://github.com/glkabc/traffic-monitoring.git
-cd traffic-monitoring
+git clone https://github.com/kkltgood/tramoing.git
+cd tramoing
 cargo run -p tray-app --locked -- --mock --show
 ```
 
