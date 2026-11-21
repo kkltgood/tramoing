@@ -13,7 +13,8 @@ window_rect = ((160, 120), (700, 460))
 icon_locations = {"Tramoing.app": (190, 224), "Applications": (510, 224)}
 icon_size = 88
 text_size = 13
-hide_extensions = ["Tramoing.app"]
+# SetFile would add FinderInfo to the already signed bundle and invalidate it.
+hide_extensions = []
 default_view = "icon-view"
 show_toolbar = False
 show_status_bar = False
