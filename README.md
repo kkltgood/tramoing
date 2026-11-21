@@ -4,7 +4,7 @@
 
 查看哪些应用正在使用网络、各自的上传和下载速率，以及可选的 CPU / GPU 使用率。数据保存在本机，运行时无需 Electron、Python 或其他外部运行环境。
 
-[开发与打包](docs/development.md) · [配置与故障排查](docs/troubleshooting.md) · [MIT 许可证](LICENSE)
+[下载 Releases](https://github.com/kkltgood/tramoing/releases) · [开发与打包](docs/development.md) · [配置与故障排查](docs/troubleshooting.md) · [MIT 许可证](LICENSE)
 
 ## 界面
 
@@ -32,6 +32,8 @@
 CPU / GPU 显示不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
 
 ## 从源码运行
+
+已发布的 Windows 安装包和 macOS 通用 DMG 可在 [Releases](https://github.com/kkltgood/tramoing/releases) 下载；维护者推送版本标签后由 GitHub Actions 自动构建和发布，见[自动发布指南](docs/development.md#自动发布到-github-releases)。
 
 准备 Rust stable 工具链。Windows 还需要 Visual Studio Build Tools 的“使用 C++ 的桌面开发”和 Windows SDK；macOS 需要 Xcode Command Line Tools。
 

@@ -101,9 +101,9 @@ unsafe fn decode(info: &ICONINFO) -> Option<IconBitmap> {
     let mut pixels = read_32bpp(info.hbmColor, width, height)?;
 
     // 现代图标（Vista 之后）自带 alpha；老 DDB 图标 alpha 全 0，要用 AND mask 补
-    let has_alpha = pixels.chunks_exact(4).any(|p| p[3] != 0);
+    let has_alpha = pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
     if has_alpha {
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             px.swap(0, 2); // BGRA → RGBA
             let a = px[3] as u32;
             // Windows 的 32bpp 图标是预乘 alpha，egui 要非预乘
@@ -116,7 +116,7 @@ unsafe fn decode(info: &ICONINFO) -> Option<IconBitmap> {
     } else {
         // AND mask：bit=1 表示「透出背景」，即透明
         let mask = read_mask(info.hbmMask, width, height)?;
-        for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+        for (i, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px.swap(0, 2);
             px[3] = if mask[i] { 0 } else { 255 };
         }
@@ -253,7 +253,7 @@ mod tests {
         assert!(bmp.width >= 16 && bmp.height >= 16, "尺寸异常：{bmp:?}");
         assert_eq!(bmp.rgba.len(), (bmp.width * bmp.height * 4) as usize);
         assert!(
-            bmp.rgba.chunks_exact(4).any(|p| p[3] > 0),
+            bmp.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
             "整张图全透明，说明 alpha 没解出来"
         );
     }

@@ -28,7 +28,7 @@ pub struct IconBitmap {
 impl IconBitmap {
     /// 整张图是否全透明。有些系统进程会拿到空白图标，这种和「取不到」等价。
     pub fn is_blank(&self) -> bool {
-        self.rgba.chunks_exact(4).all(|p| p[3] == 0)
+        self.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0)
     }
 }
 
@@ -150,7 +150,7 @@ fn load_icon(bundle_path: &str) -> Option<IconBitmap> {
         }
 
         if std::env::var_os("TM_DEBUG_ICON").is_some() {
-            let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+            let opaque = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
             eprintln!("[icon] {bundle_path}: {w}x{h} bpr={bpr} spp={spp} 非透明像素={opaque}");
         }
 

@@ -131,9 +131,48 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ./scripts/package-macos.sh
 ```
 
-两个目标都安装时生成通用二进制；只安装一个时生成对应架构的包，支持 `CARGO_TARGET_DIR`。产物为 `dist/Tramoing.app`、`dist/Tramoing-<version>.dmg` 和对应的 `.sha256`。本地构建采用 ad-hoc 签名；正式分发的 Developer ID 签名、公证及 GitHub Release 由维护者完成。
+两个目标都安装时生成通用二进制；只安装一个时生成对应架构的包，支持 `CARGO_TARGET_DIR`。产物为 `dist/Tramoing.app`、`dist/Tramoing-<version>.dmg` 和对应的 `.sha256`。本地和 CI 构建采用 ad-hoc 签名；Developer ID 签名及公证需要维护者另行配置。
 
 图标修改后保留源文件和生成产物：`assets/gen-icon.rs` 生成源图，macOS 脚本可生成 `AppIcon.icns`，`python assets/gen-ico.py` 生成 Windows `.ico`。普通构建直接使用仓库中的图标。
+
+## 自动发布到 GitHub Releases
+
+[Release packages](../.github/workflows/release.yml) 仅在 `kkltgood/tramoing` 运行。日常 `git push` 仍推送原仓库 `origin`；只有明确推送到 `opensource` 的版本标签才会自动发布。
+
+| 操作 | 结果 |
+| --- | --- |
+| 推送分支代码 | 执行 CI 检查，不创建 Release |
+| 向 `opensource` 推送 `v0.1.0` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release |
+| Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
+| Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
+
+首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认 Windows 和 macOS 都能完成打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
+
+发布步骤（以当前 `0.1.0` 为例）：
+
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。
+2. 提交要发布的代码并推送分支和标签：
+
+   ```sh
+   git push opensource main
+   git tag -a v0.1.0 -m "Release v0.1.0"
+   git push opensource v0.1.0
+   ```
+
+3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
+
+不要对 `opensource` 使用 `git push -u`，以免改变日常开发的上游。标签必须与 Cargo 版本完全一致，格式为 `v主版本.次版本.补丁版本`；当前 Windows 安装器要求三个版本分量均为不超过 65535 的非负整数，因此此流程暂不发布预览版本标签。
+
+每次 Release 包含以下四个文件：
+
+- `Tramoing-<version>-setup.exe`：Windows 10/11 x64，包含主程序和采集助手。
+- `Tramoing-<version>-setup.exe.sha256`：Windows 安装包校验值。
+- `Tramoing-<version>.dmg`：macOS 11+ 通用包，同一包内包含 Apple Silicon 和 Intel 可执行代码。
+- `Tramoing-<version>.dmg.sha256`：macOS DMG 校验值。
+
+所有平台的格式、测试、Clippy 和打包都通过后，发布任务再次核对文件及 SHA-256，再创建草稿、上传附件并公开 Release。打包失败不会发布；上传失败会保留草稿供重试。已经公开的同版本 Release 不会被覆盖，需要修复时发布新版本。当前项目不支持 Linux，因此不生成 Linux 安装包。
+
+Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 Developer ID 签名和公证，系统仍可能显示来源或安全提示。自动发布安装包也不会自动配置应用内更新源，更新功能见下节。
 
 ## 更新源
 
