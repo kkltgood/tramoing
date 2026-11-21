@@ -4,6 +4,23 @@ use crate::proto::Frame;
 use std::time::{Duration, Instant};
 use tm_core::{AppKey, ProcSample};
 use tm_sampler::{Sampler, SamplerError};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+
+fn source_error(error: PipeError) -> SamplerError {
+    let hint = match error {
+        PipeError::Connect(ERROR_FILE_NOT_FOUND) => {
+            "未连接到采集助手，请重新运行安装程序以修复采集助手"
+        }
+        PipeError::Connect(ERROR_ACCESS_DENIED) => {
+            "无法访问采集助手，请在当前 Windows 账户下重新安装采集助手"
+        }
+        PipeError::Connect(ERROR_PIPE_BUSY) => {
+            "采集连接被占用，请退出其他账户或旧版本中的 Tramoing"
+        }
+        _ => "采集连接中断，正在重试",
+    };
+    SamplerError::Source(format!("{hint}；{error}"))
+}
 
 pub struct WindowsSampler {
     client: Option<PipeClient>,
@@ -74,10 +91,7 @@ impl Sampler for WindowsSampler {
                     self.client = Some(client);
                     self.reset_connection();
                 }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(500));
-                    return Err(SamplerError::Timeout);
-                }
+                Err(error) => return Err(source_error(error)),
             }
         }
         let deadline = Instant::now() + Duration::from_millis(500);
@@ -93,9 +107,9 @@ impl Sampler for WindowsSampler {
                     }
                 }
                 Err(PipeError::Timeout) => return Err(SamplerError::Timeout),
-                Err(_) => {
+                Err(error) => {
                     self.client = None;
-                    return Err(SamplerError::Closed);
+                    return Err(source_error(error));
                 }
             }
         }
@@ -118,6 +132,24 @@ mod tests {
     use super::*;
     use crate::proto::ProcEntry;
     use tm_core::RateCalculator;
+
+    #[test]
+    fn pipe_failures_keep_their_cause_instead_of_becoming_timeouts() {
+        for (error, expected) in [
+            (PipeError::Connect(ERROR_FILE_NOT_FOUND), "未连接到采集助手"),
+            (PipeError::Connect(ERROR_ACCESS_DENIED), "无法访问采集助手"),
+            (PipeError::Connect(ERROR_PIPE_BUSY), "采集连接被占用"),
+            (PipeError::Io(109), "109"),
+            (PipeError::FrameTooLarge(5_000_000), "5000000"),
+        ] {
+            let detail = error.to_string();
+            let error = source_error(error);
+            assert!(matches!(error, SamplerError::Source(_)));
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains(&detail), "{message}");
+        }
+    }
 
     fn frame(seq: u64, at_us: Option<u64>, rx: u64) -> Frame {
         let mut frame = Frame::new(

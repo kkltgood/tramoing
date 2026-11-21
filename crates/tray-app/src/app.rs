@@ -694,7 +694,11 @@ impl App {
 
     fn drain_engine(&mut self) {
         match self.rx.try_recv() {
-            Ok(snap) => self.latest = Some(snap),
+            Ok(snap) => {
+                #[cfg(debug_assertions)]
+                let snap = crate::ui_capture::preview_snapshot(snap);
+                self.latest = Some(snap);
+            }
             Err(mpsc::TryRecvError::Disconnected) => {
                 let snapshot = self.latest.get_or_insert_with(Snapshot::default);
                 snapshot.total_rx = 0.0;
@@ -1338,6 +1342,8 @@ impl App {
     fn main_body(&mut self, ui: &mut egui::Ui, palette: &Palette, lang: Lang) {
         let p = palette;
         let reveal = self.reveal_secs();
+        // egui 的 max_rect 会随子控件扩张；页脚必须使用排版前的可见边界。
+        let bounds = ui.max_rect();
 
         self.header(ui, p, lang);
         ui.add_space(12.0);
@@ -1360,7 +1366,7 @@ impl App {
         // 页脚自己按面板底边定位（含分隔线），这里不再补空隙：
         // 以前是 add_space + hairline + add_space 拼出来的，加上 item_spacing
         // 实际比 FOOTER_BAND 高出十来点，页脚就这样被顶出了面板底边
-        self.footer(ui, p, lang);
+        self.footer(ui, p, lang, bounds);
     }
 
     /// 设置页。
@@ -1990,8 +1996,15 @@ impl App {
     fn list(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, reveal: f32, has_alert: bool) {
         // 行高、间距及页脚预留统一计算，视口高度按整行分配，滚动偏移保持连续。
         let reserve = FOOTER_BAND + if has_alert { ALERT_H } else { 0.0 };
-        let avail = (ui.available_height() - reserve).max(ROW_H);
+        let avail = (ui.available_height() - reserve).max(0.0);
         let cap = (((avail + ROW_GAP) / ROW_H).floor() as usize).max(1);
+        // 一次性分配整个列表区。allocate_ui_with_layout 只占用内容实际高度，
+        // 空状态原来因此少占半块区域，把下面的提醒行留在面板中间。
+        let (body, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), avail), egui::Sense::hover());
+        let mut content = ui.new_child(egui::UiBuilder::new().max_rect(body));
+        content.set_clip_rect(body.intersect(ui.clip_rect()));
+        let ui = &mut content;
 
         // 先把这一帧的内容定下来（都要 owned，下面要 &mut self 取图标）
         let mut rates: Vec<AppRate> = match (self.latest.as_ref(), self.window) {
@@ -2002,13 +2015,10 @@ impl App {
             (Some(s), Window::Hour1) => s.windowed.hour1.clone(),
         };
         let loading = self.latest.is_none();
-        let note: Option<&'static str> = if loading {
+        let note = if loading {
             None
-        } else if self.latest.as_ref().is_some_and(|s| s.error.is_some()) {
-            Some(lang.t(
-                "采集暂时中断，正在重新连接",
-                "Sampling interrupted; reconnecting",
-            ))
+        } else if let Some(error) = self.latest.as_ref().and_then(|s| s.error.as_deref()) {
+            Some(error)
         } else if rates.is_empty() {
             // 实时没有，其它窗口必然也没有；区分文案只是为了让人知道
             // 「不是采集中断了，是这段时间确实没流量」
@@ -2024,7 +2034,7 @@ impl App {
             None
         };
 
-        // 空状态不给一整屏的空盒子，三行的高度足够放一句说明
+        // 骨架和数据行按整行分配高度；空状态在下面独立占满列表区。
         let body_rows = if loading {
             cap
         } else if note.is_some() {
@@ -2032,7 +2042,7 @@ impl App {
         } else {
             rates.len().min(cap)
         };
-        let list_h = body_rows as f32 * ROW_H - ROW_GAP;
+        let list_h = (body_rows as f32 * ROW_H - ROW_GAP).clamp(0.0, avail);
         if std::env::var_os("TM_TRACE_LIST").is_some() {
             eprintln!("[list] avail={avail:.1} cap={cap} rows={body_rows} list_h={list_h:.1}");
         }
@@ -2046,11 +2056,7 @@ impl App {
                 |ui| self.skeleton(ui, p, body_rows),
             );
         } else if let Some(text) = note {
-            ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), list_h),
-                Layout::top_down(Align::Min),
-                |ui| empty_note(ui, text, list_h, p),
-            );
+            empty_note(ui, text, avail, p);
         } else {
             let out =
                 app_list_scroll_area(list_h, self.initial_list_scroll.take()).show(ui, |ui| {
@@ -2097,12 +2103,6 @@ impl App {
                     color,
                 );
             }
-        }
-
-        // 行数不满一屏时把余量吃掉，页脚才会留在面板底边
-        let rest = avail - list_h;
-        if rest > 0.0 {
-            ui.add_space(rest);
         }
     }
 
@@ -2366,9 +2366,7 @@ impl App {
             return Some(error.into());
         }
         if let Some(s) = &self.latest {
-            if let Some(e) = &s.error {
-                return Some(e.clone());
-            }
+            // 采集异常已经在列表区显示，底部只承载其他独立提醒。
             if let Some(e) = &s.store_error {
                 return Some(e.clone());
             }
@@ -2412,7 +2410,7 @@ impl App {
     /// 都会再插一次 `item_spacing`，加上按钮高度跟着字形走（中文 10.5pt 与英文
     /// 字高不同），页脚实际高度比 [`FOOTER_BAND`] 多出十几点，把内容顶出了
     /// 面板底边；换语言、换字号时还会变一次。现在高度恒等于 [`FOOTER_BAND`]。
-    fn footer(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
+    fn footer(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, full: egui::Rect) {
         let zh = matches!(lang, Lang::Zh);
         if self
             .toast
@@ -2425,7 +2423,6 @@ impl App {
         let toast = self.toast.as_ref().map(|(msg, _)| msg.clone());
 
         // 顶在面板底边：不跟游标走，列表怎么滚都不影响这条带子的位置
-        let full = ui.max_rect();
         let band = egui::Rect::from_min_max(
             egui::pos2(full.left(), full.bottom() - FOOTER_BAND),
             full.max,
@@ -3313,11 +3310,24 @@ fn settings_scroll_area(height: f32, initial_offset: Option<f32>) -> egui::Scrol
 ///
 /// 面板高度是固定的，这句话要是贴着列表顶部，下面一大片空白会像界面没加载完。
 fn empty_note(ui: &mut egui::Ui, text: &str, area_h: f32, p: &Palette) {
-    // 0.42 而不是 0.5：文字自身的行高没算进来，靠上一点点看着才是正中
-    ui.add_space(((area_h - 22.0) * 0.42).max(0.0));
-    ui.vertical_centered(|ui| {
-        ui.label(RichText::new(text).size(12.0).color(p.subtext));
-    });
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), area_h),
+        egui::Sense::hover(),
+    );
+    response.on_hover_text(text);
+    let galley = ui.painter().layout(
+        text.to_owned(),
+        egui::FontId::proportional(12.0),
+        p.subtext,
+        (rect.width() - 24.0).max(1.0),
+    );
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.top() + ((rect.height() - galley.size().y) * 0.42).max(0.0),
+    );
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .galley(pos, galley, p.subtext);
 }
 
 /// 拿不到真实图标时的字母块。
@@ -4007,6 +4017,48 @@ mod tests {
             }
             if frame >= 62 {
                 assert_eq!((offset, max), (0.0, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_error_states_reserve_their_full_height_at_windows_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            theme::install_cjk(&ctx);
+            ctx.set_pixels_per_point(scale);
+            for message in [
+                "当前没有流量",
+                "采集暂时中断，正在重新连接",
+                "未连接到采集助手，请重新运行安装程序以修复采集助手；连接命名管道失败（Win32 错误 2）",
+                "Collector disconnected. Reinstall the collector and retry. Windows error 5: Access denied.",
+            ] {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(WINDOW_W, PANEL_H),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.inner_margin(PANEL_PADDING))
+                        .show(ctx, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let bounds = ui.max_rect();
+                            ui.add_space(246.0);
+                            let expected_alert_top = bounds.bottom() - FOOTER_BAND - ALERT_H;
+                            let height = expected_alert_top - ui.cursor().top();
+                            empty_note(ui, message, height, &theme::palette(false));
+                            assert!((ui.cursor().top() - expected_alert_top).abs() < 1.1);
+                            let (alert, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ALERT_H),
+                                egui::Sense::hover(),
+                            );
+                            assert!(alert.bottom() <= bounds.bottom() - FOOTER_BAND + 1.1);
+                            assert!(ui.min_rect().bottom() <= bounds.bottom());
+                        });
+                });
             }
         }
     }

@@ -117,7 +117,11 @@ pub struct PipeServer {
 
 impl PipeServer {
     pub fn create() -> Result<Self, PipeError> {
-        let name = wide(crate::PIPE_NAME);
+        Self::create_named(crate::PIPE_NAME)
+    }
+
+    fn create_named(name: &str) -> Result<Self, PipeError> {
+        let name = wide(name);
         // 出方向即可：我们只写不读
         // SAFETY: 名字是有效的以 NUL 结尾的宽字符串
         let handle = unsafe {
@@ -187,7 +191,11 @@ unsafe impl Send for PipeClient {}
 impl PipeClient {
     /// 带超时地连接。助手还没起来时返回错误，调用方负责重试。
     pub fn connect(timeout_ms: u32) -> Result<Self, PipeError> {
-        let name = wide(crate::PIPE_NAME);
+        Self::connect_named(crate::PIPE_NAME, timeout_ms)
+    }
+
+    fn connect_named(name: &str, timeout_ms: u32) -> Result<Self, PipeError> {
+        let name = wide(name);
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
@@ -288,5 +296,77 @@ impl Drop for PipeClient {
         unsafe {
             CloseHandle(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+
+    fn test_pipe() -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        format!(
+            r"\\.\pipe\tramoing-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn missing_collector_preserves_the_windows_error_code() {
+        assert!(matches!(
+            PipeClient::connect_named(&test_pipe(), 0),
+            Err(PipeError::Connect(
+                windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND
+            ))
+        ));
+    }
+
+    #[test]
+    fn native_pipe_recovers_from_partial_frame_timeout_and_reports_busy_and_disconnect() {
+        let name = test_pipe();
+        let server_name = name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (step_tx, step_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let server = PipeServer::create_named(&server_name).unwrap();
+            ready_tx.send(()).unwrap();
+            server.accept().unwrap();
+            let frame = Frame::new(42, Vec::new());
+            let mut payload = Vec::new();
+            frame.encode_into(&mut payload).unwrap();
+            let header = (payload.len() as u32).to_le_bytes();
+            write_all(server.handle, &header[..2]).unwrap();
+            ready_tx.send(()).unwrap();
+            step_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_all(server.handle, &header[2..]).unwrap();
+            write_all(server.handle, &payload).unwrap();
+            // 等客户端读完，再关闭；DisconnectNamedPipe 会丢弃未读缓冲。
+            step_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut client = PipeClient::connect_named(&name, 0).unwrap();
+        assert!(matches!(
+            PipeClient::connect_named(&name, 0),
+            Err(PipeError::Connect(ERROR_PIPE_BUSY))
+        ));
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            client.poll_frame(Duration::from_millis(30)),
+            Err(PipeError::Timeout)
+        ));
+        step_tx.send(()).unwrap();
+        assert_eq!(client.poll_frame(Duration::from_secs(2)).unwrap().seq, 42);
+        step_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            client.poll_frame(Duration::from_millis(30)),
+            Err(PipeError::Io(_)) | Err(PipeError::Closed)
+        ));
     }
 }

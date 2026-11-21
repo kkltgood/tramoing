@@ -19,6 +19,8 @@ pub enum SamplerError {
     Closed,
     /// 等不到下一帧（系统卡住或采样器挂了）
     Timeout,
+    /// 采样源连接或协议错误，保留平台提供的原因，不能混同于短暂等待。
+    Source(String),
     /// 当前平台没有实现
     Unsupported(&'static str),
 }
@@ -29,6 +31,7 @@ impl std::fmt::Display for SamplerError {
             Self::Spawn(e) => write!(f, "采样器启动失败：{e}"),
             Self::Closed => write!(f, "采样管道已关闭"),
             Self::Timeout => write!(f, "等待采样数据超时"),
+            Self::Source(message) => f.write_str(message),
             Self::Unsupported(what) => write!(f, "{what} 在当前平台尚不支持"),
         }
     }

@@ -34,8 +34,8 @@ mod win {
     use tm_windows::etw::{self, EtwSession};
     use tm_windows::pipe::PipeServer;
     use tm_windows::proc::PathCache;
+    use tm_windows::scheduled_task::{self, TASK_NAME};
 
-    pub const TASK_NAME: &str = "TrafficMonitorHelper";
     pub const LOG_HINT: &str = r"%LOCALAPPDATA%\TrafficMonitor\helper.log";
 
     pub fn main() {
@@ -161,38 +161,16 @@ mod win {
             }
         };
 
-        // 先清掉可能存在的旧任务，避免 /Create 撞名
-        let _ = std::process::Command::new("schtasks")
-            .args(["/Delete", "/TN", TASK_NAME, "/F"])
-            .output();
-
-        let tr = format!("\"{}\"", exe.display());
-        let out = std::process::Command::new("schtasks")
-            .args([
-                "/Create", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
-            ])
-            .output();
-
-        match out {
-            Ok(o) if o.status.success() => {
-                log("已注册登录自启任务");
+        match scheduled_task::install(&exe) {
+            Ok(()) => {
+                log("已注册登录自启任务（允许电池供电，无运行时限）");
                 log(&format!("日志：{LOG_HINT}"));
-                let _ = std::process::Command::new("schtasks")
-                    .args(["/Run", "/TN", TASK_NAME])
-                    .output();
-                log("已启动助手");
+                log("任务调度器已接受助手启动请求；采集就绪以 ETW 和管道日志为准");
                 0
             }
-            Ok(o) => {
-                log(&format!(
-                    "注册失败（多半是没有管理员权限）：{}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ));
+            Err(error) => {
+                log(&error);
                 log("请右键「以管理员身份运行」后重试");
-                1
-            }
-            Err(e) => {
-                log(&format!("调用 schtasks 失败：{e}"));
                 1
             }
         }

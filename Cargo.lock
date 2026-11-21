@@ -3851,6 +3851,7 @@ dependencies = [
 name = "tm-windows"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "tm-core",
  "tm-sampler",
  "windows-sys 0.59.0",

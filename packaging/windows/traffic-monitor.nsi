@@ -167,6 +167,7 @@ Section "托盘程序（必需）" SEC_MAIN
 SectionEnd
 
 Section "流量采集助手（按进程统计必需）" SEC_HELPER
+  SectionIn RO
   SetOutPath "$INSTDIR"
   File "..\..\dist\windows\${HELPER_EXE}"
 
@@ -174,7 +175,7 @@ Section "流量采集助手（按进程统计必需）" SEC_HELPER
   ExecWait '"$INSTDIR\${HELPER_EXE}" --install' $0
   ; 助手把失败原因写进日志而不是控制台，这里只能提示去日志里看
   ${If} $0 != 0
-    MessageBox MB_ICONEXCLAMATION|MB_OK "采集助手注册失败（错误码 $0）。$\r$\n$\r$\n托盘程序仍可启动，但拿不到采样数据，面板会停在加载状态。请以管理员身份运行一次 tramoing-helper.exe --install 后重试。$\r$\n日志：%LOCALAPPDATA%\${DATA_DIR}\helper.log"
+    MessageBox MB_ICONEXCLAMATION|MB_OK "采集助手安装或启动失败（错误码 $0）。$\r$\n$\r$\n托盘程序仍可启动，但无法统计流量。请以管理员身份运行一次 tramoing-helper.exe --install 后重试。$\r$\n日志：%LOCALAPPDATA%\${DATA_DIR}\helper.log"
   ${EndIf}
 SectionEnd
 

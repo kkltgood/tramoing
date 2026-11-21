@@ -6,8 +6,35 @@ use std::time::Instant;
 
 use eframe::egui;
 
+fn enabled() -> bool {
+    std::env::var_os("TM_FORCE_MOCK").is_some()
+        && std::env::var_os("TM_DATA_DIR").is_some()
+        && std::env::var_os("TM_CAPTURE_PPM").is_some()
+}
+
+/// 只给隔离的渲染验证注入状态；不会断开或启动系统的真实采集助手。
+pub fn preview_snapshot(snapshot: crate::engine::Snapshot) -> crate::engine::Snapshot {
+    if !enabled() {
+        return snapshot;
+    }
+    let error = match std::env::var("TM_CAPTURE_STATE").as_deref() {
+        Ok("empty") => None,
+        Ok("timeout") => Some("采集暂时中断，正在重新连接".into()),
+        Ok("disconnected") => Some(
+            "未连接到采集助手，请重新运行安装程序以修复采集助手；连接命名管道失败（Win32 错误 2）"
+                .into(),
+        ),
+        _ => return snapshot,
+    };
+    crate::engine::Snapshot {
+        error,
+        mock: true,
+        ..Default::default()
+    }
+}
+
 pub fn capture(ctx: &egui::Context, started_at: Instant) {
-    if std::env::var_os("TM_FORCE_MOCK").is_none() || std::env::var_os("TM_DATA_DIR").is_none() {
+    if !enabled() {
         return;
     }
     let Ok(path) = std::env::var("TM_CAPTURE_PPM") else {

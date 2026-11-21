@@ -39,6 +39,8 @@ pub mod registry_run;
 #[cfg(windows)]
 pub mod sampler;
 #[cfg(windows)]
+pub mod scheduled_task;
+#[cfg(windows)]
 pub mod screen;
 #[cfg(windows)]
 pub mod theme;
