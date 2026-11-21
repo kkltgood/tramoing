@@ -8,8 +8,8 @@
 //! 所有网络操作都在后台线程里：`update()` 每帧都会被调用，一次 DNS 卡顿
 //! 就能让整个面板僵住。界面只通过 channel 收事件，和采样线程是同一套模式。
 //!
-//! 版本清单是静态 JSON，配置方式见 docs/development.md。
-//! 未配置更新源时不发起网络请求。
+//! 默认读取官方 GitHub Release 的 latest.json 附件，不依赖 GitHub API 配额。
+//! 可通过 TRAMOING_UPDATE_URL 覆盖地址或用空值禁用，见 docs/development.md。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,13 +18,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-/// 运行时环境变量优先于构建时配置；空值表示禁用此构建的更新源。
+pub const DEFAULT_MANIFEST_URL: &str =
+    "https://github.com/kkltgood/tramoing/releases/latest/download/latest.json";
+
+/// 运行时环境变量 > 构建时配置 > 官方 GitHub Releases；空值显式禁用。
 pub fn manifest_url() -> Option<String> {
-    std::env::var("TRAMOING_UPDATE_URL")
-        .ok()
-        .or_else(|| option_env!("TRAMOING_UPDATE_URL").map(str::to_owned))
-        .map(|url| url.trim().to_owned())
-        .filter(|url| !url.is_empty())
+    resolve_manifest_url(
+        std::env::var("TRAMOING_UPDATE_URL").ok().as_deref(),
+        option_env!("TRAMOING_UPDATE_URL"),
+    )
+}
+
+fn resolve_manifest_url(runtime: Option<&str>, build: Option<&str>) -> Option<String> {
+    let url = runtime.or(build).unwrap_or(DEFAULT_MANIFEST_URL).trim();
+    (!url.is_empty()).then(|| url.to_owned())
 }
 
 /// 当前版本。和安装包版本、`Cargo.toml` 的 workspace version 是同一个来源。
@@ -158,6 +165,11 @@ impl Updater {
         matches!(self.phase, Phase::Checking | Phase::Downloading { .. })
     }
 
+    /// 新版本提示和已下载的安装包一直保留到用户处理，不被每日检查覆盖。
+    pub fn can_auto_check(&self) -> bool {
+        matches!(self.phase, Phase::Idle | Phase::Latest | Phase::Error(_))
+    }
+
     /// 起一个线程去拉清单。重复调用是安全的：正在查/正在下时直接忽略。
     pub fn check(&mut self) {
         self.check_source(manifest_url());
@@ -193,6 +205,10 @@ impl Updater {
 
     /// 开始下载安装包。`asset` 为空（清单没给本平台的包）时什么也不做。
     pub fn download(&mut self, avail: &Available) {
+        self.download_into(avail, tm_store::data_dir().join("update"));
+    }
+
+    fn download_into(&mut self, avail: &Available, root: PathBuf) {
         if self.is_busy() {
             return;
         }
@@ -207,7 +223,7 @@ impl Updater {
         let tx = self.tx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("update-download".into())
-            .spawn(move || match download_and_verify(&asset, &version, &tx) {
+            .spawn(move || match download_to(&asset, &version, &tx, &root) {
                 Ok(path) => {
                     let _ = tx.send(Event::Downloaded { version, path });
                 }
@@ -306,6 +322,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .build();
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
+        .user_agent(concat!("Tramoing/", env!("CARGO_PKG_VERSION")))
         .tls_config(tls)
         .build()
         .into()
@@ -316,7 +333,12 @@ fn fetch_manifest(source: &str) -> Result<Manifest, String> {
     let text = agent(Duration::from_secs(8))
         .get(url.as_str())
         .call()
-        .map_err(|e| format!("请求清单失败：{e}"))?
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(404) => {
+                "更新清单尚未发布，请稍后重试 / Update manifest not published yet".to_owned()
+            }
+            _ => format!("请求清单失败：{e}"),
+        })?
         .body_mut()
         .read_to_string()
         .map_err(|e| format!("读取清单失败：{e}"))?;
@@ -325,14 +347,6 @@ fn fetch_manifest(source: &str) -> Result<Manifest, String> {
     // 而且这个错误发生在用户机器上，很难查。这里顺手剥掉。
     let text = text.trim_start_matches('\u{feff}');
     serde_json::from_str(text).map_err(|e| format!("清单格式不对：{e}"))
-}
-
-fn download_and_verify(
-    asset: &Asset,
-    version: &str,
-    tx: &Sender<Event>,
-) -> Result<PathBuf, String> {
-    download_to(asset, version, tx, &tm_store::data_dir().join("update"))
 }
 
 fn download_to(
@@ -520,6 +534,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn official_source_is_default_and_overrides_can_explicitly_disable_it() {
+        assert_eq!(
+            resolve_manifest_url(None, None).as_deref(),
+            Some(DEFAULT_MANIFEST_URL)
+        );
+        assert_eq!(
+            resolve_manifest_url(None, Some(" https://example.com/build.json ")).as_deref(),
+            Some("https://example.com/build.json")
+        );
+        assert_eq!(
+            resolve_manifest_url(
+                Some("http://localhost/runtime.json"),
+                Some("https://example.com/build.json")
+            )
+            .as_deref(),
+            Some("http://localhost/runtime.json")
+        );
+        assert_eq!(resolve_manifest_url(Some("  "), None), None);
+        assert_eq!(resolve_manifest_url(None, Some("")), None);
+        assert_eq!(
+            resolve_manifest_url(Some(""), Some(DEFAULT_MANIFEST_URL)),
+            None
+        );
+    }
+
+    #[test]
+    fn daily_checks_do_not_discard_a_pending_update_or_download() {
+        let mut updater = Updater::new();
+        assert!(updater.can_auto_check());
+        for phase in [
+            Phase::Checking,
+            Phase::Downloading {
+                version: "1.0.0".into(),
+                pct: 0.5,
+            },
+            Phase::Ready {
+                version: "1.0.0".into(),
+                path: PathBuf::from("setup.exe"),
+            },
+            Phase::Available(Available {
+                version: "1.0.0".into(),
+                notes: String::new(),
+                pub_date: String::new(),
+                asset: None,
+                homepage: String::new(),
+            }),
+        ] {
+            updater.set(phase);
+            assert!(!updater.can_auto_check());
+        }
+        for phase in [Phase::Latest, Phase::Error("offline".into()), Phase::Idle] {
+            updater.set(phase);
+            assert!(updater.can_auto_check());
+        }
+    }
+
+    #[test]
+    fn github_manifest_selects_the_matching_installer_or_release_page() {
+        let parse = || {
+            serde_json::from_value::<Manifest>(serde_json::json!({
+            "version": "1.2.0", "notes": "发布说明", "pub_date": "2026-11-21T12:00:00Z",
+            "homepage": "https://github.com/kkltgood/tramoing/releases/tag/v1.2.0",
+            "platforms": {
+                "windows-x86_64": { "url": "https://example.com/setup.exe", "sha256": "a".repeat(64), "size": 12 },
+                "macos-aarch64": { "url": "https://example.com/app.dmg", "sha256": "b".repeat(64), "size": 34 },
+                "macos-x86_64": { "url": "https://example.com/app.dmg", "sha256": "b".repeat(64), "size": 34 }
+            }
+        })).unwrap()
+        };
+        for platform in [
+            "windows-x86_64",
+            "macos-aarch64",
+            "macos-x86_64",
+            "unsupported",
+        ] {
+            let available = available_update(parse(), "1.1.0", platform)
+                .unwrap()
+                .unwrap();
+            assert_eq!(available.version, "1.2.0");
+            assert_eq!(available.notes, "发布说明");
+            assert!(available.homepage.ends_with("/releases/tag/v1.2.0"));
+            match platform {
+                "windows-x86_64" => assert_eq!(available.asset.unwrap().size, 12),
+                "unsupported" => assert!(available.asset.is_none()),
+                _ => assert_eq!(available.asset.unwrap().size, 34),
+            }
+        }
+        assert!(available_update(parse(), "1.2.0", PLATFORM)
+            .unwrap()
+            .is_none());
+        assert!(available_update(parse(), "2.0.0", PLATFORM)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn update_checks_require_a_configured_source_and_accept_a_local_manifest() {
         let mut updater = Updater::new();
         updater.check_source(None);
@@ -575,6 +685,97 @@ mod tests {
         }
         server.join().unwrap();
         assert_eq!(updater.phase, Phase::Latest);
+    }
+
+    #[test]
+    fn background_check_and_download_reach_ready_only_after_verification() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let manifest = serde_json::json!({
+            "version": "999.0.0",
+            "platforms": { PLATFORM: {
+                "url": format!("http://{address}/setup.exe"),
+                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "size": 3
+            }}
+        })
+        .to_string();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for (target, body) in [
+                ("/latest.json", manifest.as_str()),
+                ("/setup.exe", "abc"),
+                ("/setup.exe", "bad"),
+            ] {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "update request timed out");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 8192);
+                }
+                assert!(request.starts_with(format!("GET {target} HTTP/1.1\r\n").as_bytes()));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let wait_for_result = |updater: &mut Updater| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while updater.is_busy() {
+                updater.poll();
+                assert!(Instant::now() < deadline, "background update timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut updater = Updater::new();
+        updater.check_source(Some(format!("http://{address}/latest.json")));
+        assert_eq!(updater.phase, Phase::Checking);
+        wait_for_result(&mut updater);
+        let Phase::Available(available) = updater.phase.clone() else {
+            panic!("expected update, got {:?}", updater.phase);
+        };
+        assert!(!updater.can_auto_check());
+        updater.download_into(&available, root.path().to_owned());
+        assert!(matches!(updater.phase, Phase::Downloading { .. }));
+        wait_for_result(&mut updater);
+        let Phase::Ready { version, path } = updater.phase.clone() else {
+            panic!("expected verified download, got {:?}", updater.phase);
+        };
+        assert_eq!(version, "999.0.0");
+        assert_eq!(path.parent().unwrap(), root.path().join("999.0.0"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert!(!updater.can_auto_check());
+
+        // A corrupt retry must never offer installation or replace the verified file.
+        updater.download_into(&available, root.path().to_owned());
+        wait_for_result(&mut updater);
+        assert!(matches!(&updater.phase, Phase::Error(error) if error.contains("sha256")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        server.join().unwrap();
     }
 
     fn manifest(version: &str) -> Manifest {

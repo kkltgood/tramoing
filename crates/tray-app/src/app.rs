@@ -33,7 +33,7 @@ pub const WINDOW_W: f32 = 408.0;
 ///
 /// 以前高度是逐帧量内容算出来的，结果：切到设置页会缩一截、应用数一变窗口就抽动。
 /// 一个菜单栏弹窗本来就不该自己改尺寸 —— 固定之后，列表装不下就滚动，
-/// 设置页底部留白，切页/换数据时窗口一动不动。
+/// 设置页按可用高度滚动，切页/换数据时窗口一动不动。
 ///
 /// 两页使用相同尺寸，列表按剩余高度显示整行，设置页固定底部开关区。
 pub const PANEL_H: f32 = 482.0;
@@ -506,21 +506,33 @@ impl App {
         }
         let due = if self.force_update_check {
             true
-        } else if !self.settings.update_check || crate::update::manifest_url().is_none() {
+        } else if !self.settings.update_check
+            || !self.update.can_auto_check()
+            || crate::update::manifest_url().is_none()
+        {
             false
         } else {
             self.started_at.elapsed() >= UPDATE_FIRST_DELAY
-                && unix_now() - self.settings.last_check >= UPDATE_INTERVAL_SECS
+                && (unix_now() < self.settings.last_check
+                    || unix_now() - self.settings.last_check >= UPDATE_INTERVAL_SECS)
         };
         if !due {
             return false;
         }
         self.force_update_check = false;
+        self.check_update();
+        true
+    }
+
+    /// 手动与自动检查共享时间戳，手动检查后不再紧接着重复发起每日检查。
+    fn check_update(&mut self) {
+        if self.update.is_busy() {
+            return;
+        }
         // 先落盘再发请求：查的过程中进程被关掉，下次启动不该立刻再来一次。
         self.settings.last_check = unix_now();
         self.settings.save();
         self.update.check();
-        true
     }
 
     /// 延迟创建状态栏图标，失败则过几秒重试。
@@ -1414,12 +1426,20 @@ impl App {
             if version.hovered() { p.accent } else { p.unit },
         );
         if version.clicked() {
-            self.update.check();
+            self.check_update();
         }
         ui.add_space(12.0);
 
         // 中间选项独立滚动，标题、返回和开机自启始终留在原位。
-        let options_height = (bounds.bottom() - 42.0 - TOAST_H - 15.0 - ui.cursor().top()).max(1.0);
+        // 提示区只在有内容时占位，平时滚动区一直延伸到页脚分隔线附近。
+        let has_status = self.update_text(lang).is_some()
+            || self
+                .toast
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < TOAST_TTL);
+        let line_y = bounds.bottom() - 42.0;
+        let status_height = if has_status { TOAST_H + 7.0 } else { 0.0 };
+        let options_height = (line_y - status_height - 8.0 - ui.cursor().top()).max(1.0);
         let bar_dark = self.bar_is_dark();
         ui.spacing_mut().scroll.floating_width = 3.0;
         settings_scroll_area(options_height, self.initial_settings_scroll.take()).show(ui, |ui| {
@@ -1593,20 +1613,62 @@ impl App {
                     changed = true;
                 }
             });
+            ui.add_space(12.0);
+            settings_group(ui, p, lang.t("软件更新", "Software updates"), |ui| {
+                changed |= option_row(
+                    ui,
+                    p,
+                    lang.t("自动检查", "Auto check"),
+                    &mut self.settings.update_check,
+                    &[(false, lang.t("关闭", "Off")), (true, lang.t("开启", "On"))],
+                );
+                if ui
+                    .add_enabled(
+                        !self.update.is_busy(),
+                        egui::Button::new((
+                            egui::Atom::grow(),
+                            RichText::new(lang.t("检查更新", "Check for updates"))
+                                .size(12.0)
+                                .color(p.accent),
+                            egui::Atom::grow(),
+                        ))
+                        .min_size(Vec2::new(ui.available_width(), 30.0))
+                        .fill(p.chip)
+                        .stroke(Stroke::new(0.7_f32, p.border))
+                        .corner_radius(15),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.check_update();
+                }
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(lang.t(
+                        "每天检查 GitHub 新版本，下载后由你确认安装。",
+                        "Checks GitHub daily. Install after confirming the download.",
+                    ))
+                    .size(10.5)
+                    .color(p.subtext),
+                )
+                .wrap(),
+            );
         });
 
-        // 提示与开关区分别固定在底部，设置行不会因状态文案出现而移动。
-        let line_y = bounds.bottom() - 42.0;
-        let toast_rect = egui::Rect::from_min_size(
-            egui::pos2(bounds.left() + 2.0, line_y - TOAST_H - 7.0),
-            Vec2::new(bounds.width() - 4.0, TOAST_H),
-        );
-        let mut status = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("settings-status")
-                .max_rect(toast_rect),
-        );
-        self.toast_line(&mut status, p, lang);
+        if has_status {
+            let toast_rect = egui::Rect::from_min_size(
+                egui::pos2(bounds.left() + 2.0, line_y - TOAST_H - 7.0),
+                Vec2::new(bounds.width() - 4.0, TOAST_H),
+            );
+            let mut status = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("settings-status")
+                    .max_rect(toast_rect),
+            );
+            self.toast_line(&mut status, p, lang);
+        }
         ui.painter().rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(bounds.left(), line_y),
@@ -2602,7 +2664,7 @@ impl App {
         } else {
             egui::Sense::hover()
         };
-        let mut resp = ui.allocate_rect(rect, sense);
+        let mut resp = ui.allocate_rect(rect, sense).on_hover_text(&text);
         if actionable {
             resp = resp.on_hover_text(lang.t("点击继续", "Click to continue"));
         }
@@ -2650,6 +2712,7 @@ impl App {
         }
 
         if let Some((text, _)) = &update {
+            resp = resp.on_hover_text(text);
             let color = if matches!(&self.update.phase, crate::update::Phase::Error(_)) {
                 p.warn
             } else if actionable && resp.hovered() {

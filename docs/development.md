@@ -11,9 +11,10 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release --locked -p tray-app -p tm-windows --bins
+node --test packaging/update/release.test.cjs
 ```
 
-CI 在 Windows 和 macOS 执行这些检查，并在 macOS 检查 Apple Silicon / Intel 两个目标。纯逻辑测试跨平台运行；真实桌面、性能计数器、网络采集等验收默认忽略，需要在对应系统上单独执行。
+CI 在 Windows 和 macOS 执行这些检查，并在 macOS 检查 Apple Silicon / Intel 两个目标。发布脚本的测试需要 Node.js 20+，验证清单、草稿重试和上传失败处理，不会访问 GitHub。纯逻辑测试跨平台运行；真实桌面、性能计数器、网络采集等验收默认忽略，需要在对应系统上单独执行。
 
 `Cargo.lock` 随仓库提交。常规构建使用 `--locked`，依赖升级时单独评估并提交锁文件变化。各 crate 是应用内部模块，设置了 `publish = false`。
 
@@ -142,61 +143,66 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.0` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release |
+| 向 `opensource` 推送 `v0.1.1` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
 首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认 Windows 和 macOS 都能完成打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
 
-发布步骤（以当前 `0.1.0` 为例）：
+发布步骤（以当前 `0.1.1` 为例）：
 
 1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push opensource v0.1.0
+   git tag -a v0.1.1 -m "Release v0.1.1"
+   git push opensource v0.1.1
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
 
 不要对 `opensource` 使用 `git push -u`，以免改变日常开发的上游。标签必须与 Cargo 版本完全一致，格式为 `v主版本.次版本.补丁版本`；当前 Windows 安装器要求三个版本分量均为不超过 65535 的非负整数，因此此流程暂不发布预览版本标签。
 
-每次 Release 包含以下四个文件：
+每次 Release 包含以下五个文件：
 
 - `Tramoing-<version>-setup.exe`：Windows 10/11 x64，包含主程序和采集助手。
 - `Tramoing-<version>-setup.exe.sha256`：Windows 安装包校验值。
 - `Tramoing-<version>.dmg`：macOS 11+ 通用包，同一包内包含 Apple Silicon 和 Intel 可执行代码。
 - `Tramoing-<version>.dmg.sha256`：macOS DMG 校验值。
+- `latest.json`：应用内更新清单，包含版本、发布说明、日期和三个平台的下载地址、SHA-256、文件大小；两个 macOS 架构共用通用 DMG。
 
-所有平台的格式、测试、Clippy 和打包都通过后，发布任务再次核对文件及 SHA-256，再创建草稿、上传附件并公开 Release。打包失败不会发布；上传失败会保留草稿供重试。已经公开的同版本 Release 不会被覆盖，需要修复时发布新版本。当前项目不支持 Linux，因此不生成 Linux 安装包。
+所有平台的格式、测试、Clippy 和打包都通过后，发布任务再次核对文件及 SHA-256，再创建草稿、生成清单、上传全部五个附件并公开 Release。清单中的安装包地址固定到本次版本标签，避免下一次发布时下载到不同文件。打包失败不会发布；上传失败会保留草稿供重试。已经公开的同版本 Release 不会被覆盖，需要修复时发布新版本。当前项目不支持 Linux，因此不生成 Linux 安装包。
 
-Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 Developer ID 签名和公证，系统仍可能显示来源或安全提示。自动发布安装包也不会自动配置应用内更新源，更新功能见下节。
+Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 Developer ID 签名和公证，系统仍可能显示来源或安全提示。
 
 ## 更新源
 
-源码构建不预设更新服务，自动检查默认关闭。发布者可在**构建前**设置 `TRAMOING_UPDATE_URL`，将静态 JSON 地址写入程序；运行时同名环境变量优先，空值可禁用内置地址。未配置时手动检查会显示“未配置更新源”，不发起网络请求。
+默认更新源为 `https://github.com/kkltgood/tramoing/releases/latest/download/latest.json`，源码构建和官方安装包均可直接使用，不需要 GitHub 令牌，也不占用 GitHub API 的匿名请求配额。上面的发布流程自动提供该附件。首次发布带清单的版本前，检查会提示“更新清单尚未发布”，不会误报已是最新版。
 
-配置好更新源后，`settings.conf` 中的 `update_check=on` 启用自动检查，手动检查使用 `--check-update` 或设置页版本号。自动检查有启动延迟和 24 小时间隔；macOS 收起后不驱动界面帧，检查可能延迟至面板展开。
+新安装默认 `update_check=on`；旧配置已有的 `update_check=off` 会保留，可在设置 → 软件更新中开启。自动检查有 10 秒启动延迟和 24 小时间隔；macOS 收起后不驱动界面帧，检查可能延迟至面板展开。手动检查使用软件更新里的按钮、设置页版本号或 `--check-update`，不受自动检查开关和间隔限制。`--mock` 不自动联网，但仍可显式手动检查。
 
-Windows 清单生成示例（替换为维护者自己的 HTTPS 下载地址）：
+发现新版本后，点击提示下载本平台安装包。下载在后台进行，核对文件大小及 SHA-256 后才显示安装入口；检查间隔到期也不会清除待下载提示或已就绪的安装包。Windows 由用户确认后启动安装器覆盖安装，macOS 打开 DMG 后由用户安装。
+
+如需自建更新服务，可在**构建前**设置 `TRAMOING_UPDATE_URL`，将静态 JSON 地址写入程序；运行时同名环境变量优先于构建配置，构建配置优先于默认 GitHub 地址。显式空值禁用更新源，手动检查会显示“未配置更新源”。
+
+自建服务的 Windows 清单生成示例（替换为维护者自己的 HTTPS 下载地址）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
-  -BaseUrl 'https://example.com/releases/v0.1.0' -Notes '发布说明'
+  -BaseUrl 'https://example.com/releases/v0.1.1' -Notes '发布说明'
 ```
 
 脚本计算安装包的 SHA-256 和文件大小，生成 `dist/latest.json`。客户端支持的平台键为 `windows-x86_64`、`macos-aarch64`、`macos-x86_64`；脚本默认生成 Windows 条目，其他平台按同一格式添加：
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "notes": "发布说明",
   "homepage": "https://example.com/releases",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://example.com/releases/Tramoing-0.1.0-setup.exe",
+      "url": "https://example.com/releases/Tramoing-0.1.1-setup.exe",
       "sha256": "由脚本生成的64位十六进制摘要",
       "size": 123456
     }

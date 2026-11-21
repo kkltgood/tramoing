@@ -67,8 +67,8 @@ pub struct Settings {
     pub display_colors: DisplayColors,
     /// 启动后自动检查新版本。
     ///
-    /// 默认关闭；配置 TRAMOING_UPDATE_URL 后可设置 update_check=on。
-    /// 设置页版本号和 --check-update 提供手动检查入口。
+    /// 新安装默认开启，读取官方 GitHub Releases；已有的关闭选择保持不变。
+    /// 设置页提供开关，版本号和 --check-update 提供手动检查入口。
     pub update_check: bool,
     /// 上次检查更新的时刻（Unix 秒）。0 表示从没查过。
     ///
@@ -93,7 +93,7 @@ impl Default for Settings {
             performance_color: true,
             performance_interval: 2,
             display_colors: DisplayColors::default(),
-            update_check: false,
+            update_check: true,
             last_check: 0,
         }
     }
@@ -434,9 +434,14 @@ mod tests {
     }
 
     #[test]
-    fn update_check_is_off_by_default() {
-        // 新安装默认不主动发起更新请求。
-        assert!(!Settings::default().update_check);
+    fn update_check_defaults_on_and_preserves_an_explicit_opt_out() {
+        assert!(Settings::default().update_check);
+        assert!(Settings::parse("theme=dark").update_check);
+        for value in ["off", "false", "0"] {
+            let settings = Settings::parse(&format!("update_check={value}"));
+            assert!(!settings.update_check);
+            assert_eq!(Settings::parse(&settings.serialize()), settings);
+        }
     }
 
     #[test]
