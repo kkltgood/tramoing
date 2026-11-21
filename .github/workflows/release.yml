@@ -182,6 +182,11 @@ jobs:
               release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
             } catch (error) {
               if (error.status !== 404) throw error;
+              // GitHub's tag lookup omits drafts; find one left by an interrupted upload.
+              const releases = await github.paginate(github.rest.repos.listReleases, {
+                owner, repo, per_page: 100
+              });
+              release = releases.find(item => item.tag_name === tag);
             }
             if (release && !release.draft) {
               throw new Error(`${tag} is already published. Use a new version instead of replacing its files.`);
