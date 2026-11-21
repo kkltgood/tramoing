@@ -125,7 +125,7 @@ jobs:
         shell: bash
         run: |
           bash scripts/package-macos.sh
-          lipo -verify_arch arm64 x86_64 dist/Tramoing.app/Contents/MacOS/tramoing
+          lipo dist/Tramoing.app/Contents/MacOS/tramoing -verify_arch arm64 x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
