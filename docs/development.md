@@ -157,21 +157,32 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.3` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.4` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
 首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认 Windows 和 macOS 都能完成打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
 
-发布步骤（以当前 `0.1.3` 为例）：
+换电脑后，发布流程仍由 GitHub Actions 执行，发起发布的电脑可以是 Windows 或 macOS，本机不需要构建 Windows 安装包。Git 的远端配置不会随代码迁移；若缺少正式发布远端，执行 `git remote add opensource https://github.com/kkltgood/tramoing.git`，保留 `origin` 作为日常开发仓库。
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。
+推送账号需要对 `kkltgood/tramoing` 有写权限。macOS 钥匙串中的开发仓库账号不一定有正式仓库权限；可安装 GitHub CLI（`brew install gh`），运行 `gh auth login --hostname github.com --git-protocol https --web`，在浏览器中登录有发布权限的账号。随后用 `gh api repos/kkltgood/tramoing --jq '.permissions.push'` 确认结果为 `true`。使用不同账号时，登录过程中若询问是否配置 Git 凭证助手，选择 No，再将凭证助手仅配置给正式仓库：
+
+```sh
+git config --local credential.https://github.com/kkltgood/tramoing.git.helper ''
+git config --local --add credential.https://github.com/kkltgood/tramoing.git.helper '!gh auth git-credential'
+```
+
+macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
+
+发布步骤（以当前 `0.1.4` 为例）：
+
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.4.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.3 -m "Release v0.1.3"
-   git push opensource v0.1.3
+   git tag -a v0.1.4 -m "Release v0.1.4"
+   git push opensource v0.1.4
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。

@@ -9,6 +9,7 @@ module.exports = async function publishRelease({
   directory = 'release-files',
   version = process.env.RELEASE_VERSION,
   tag = process.env.RELEASE_TAG,
+  notesFile = path.join('docs', 'releases', `${tag}.md`),
 }) {
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || tag !== `v${version}`) {
     throw new Error('Release tag must match the stable package version.');
@@ -30,6 +31,7 @@ module.exports = async function publishRelease({
     if (checksum !== `${digest}  ${name}`) throw new Error(`Checksum mismatch: ${name}`);
     return { url: `${baseUrl}/${name}`, sha256: digest, size: file.length };
   });
+  const releaseNotes = fs.existsSync(notesFile) ? fs.readFileSync(notesFile, 'utf8').trim() : '';
 
   let release;
   try {
@@ -48,8 +50,8 @@ module.exports = async function publishRelease({
   if (!release) {
     release = (await github.rest.repos.createRelease({
       owner, repo, tag_name: tag, name: `Tramoing ${tag}`, draft: true,
-      generate_release_notes: true,
-      body: '安装包：Windows 10/11 x64 使用 `-setup.exe`；macOS 11+（Apple Silicon / Intel）使用通用 `.dmg`。\n\n每个安装包均附带 SHA-256 校验文件，`latest.json` 用于应用内更新。Windows 安装包尚未做代码签名；macOS 使用 ad-hoc 签名，尚未进行 Developer ID 签名及公证。',
+      generate_release_notes: !releaseNotes,
+      body: releaseNotes || '安装包：Windows 10/11 x64 使用 `-setup.exe`；macOS 11+（Apple Silicon / Intel）使用通用 `.dmg`。\n\n每个安装包均附带 SHA-256 校验文件，`latest.json` 用于应用内更新。Windows 安装包尚未做代码签名；macOS 使用 ad-hoc 签名，尚未进行 Developer ID 签名及公证。',
     })).data;
   }
 

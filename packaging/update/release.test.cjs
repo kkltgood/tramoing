@@ -6,15 +6,19 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const publishRelease = require('./release.cjs');
 
-function fixture(t, { existing, failUpload } = {}) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tramoing-release-'));
+function fixture(t, { existing, failUpload, notes } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tramoing-release-'));
   t.after(() => {
-    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
-    assert.ok(path.basename(directory).startsWith('tramoing-release-'));
-    fs.rmSync(directory, { recursive: true, force: true });
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(root).startsWith('tramoing-release-'));
+    fs.rmSync(root, { recursive: true, force: true });
   });
+  const directory = path.join(root, 'release-files');
+  fs.mkdirSync(directory);
   const version = '0.1.1';
   const tag = `v${version}`;
+  const notesFile = path.join(root, 'notes.md');
+  if (notes !== undefined) fs.writeFileSync(notesFile, notes);
   const packages = [`Tramoing-${version}-setup.exe`, `Tramoing-${version}.dmg`];
   for (const name of packages) {
     const bytes = Buffer.from(`test package: ${name}`);
@@ -23,6 +27,7 @@ function fixture(t, { existing, failUpload } = {}) {
     fs.writeFileSync(path.join(directory, `${name}.sha256`), `${hash}  ${name}\n`);
   }
   const events = [];
+  const created = [];
   const uploaded = new Map();
   const release = {
     id: 42, tag_name: tag, draft: true, body: '测试发布说明', assets: [],
@@ -39,6 +44,8 @@ function fixture(t, { existing, failUpload } = {}) {
       async listReleases() {},
       async createRelease(input) {
         assert.equal(input.draft, true);
+        created.push(input);
+        release.body = input.generate_release_notes ? release.body : input.body;
         events.push('create');
         return { data: release };
       },
@@ -58,9 +65,9 @@ function fixture(t, { existing, failUpload } = {}) {
   };
   const core = { notice() {}, summary: { addLink() { return { async write() {} }; } } };
   return {
-    directory, packages, uploaded, events,
+    directory, packages, uploaded, events, created,
     run: () => publishRelease({
-      github, core, context: { repo: { owner: 'kkltgood', repo: 'tramoing' } }, directory, version, tag,
+      github, core, context: { repo: { owner: 'kkltgood', repo: 'tramoing' } }, directory, version, tag, notesFile,
     }),
   };
 }
@@ -83,6 +90,27 @@ test('publishes a manifest for Windows and both Mac architectures with verified 
     assert.equal(asset.url, `https://github.com/kkltgood/tramoing/releases/download/v0.1.1/${name}`);
     assert.equal(asset.sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
     assert.equal(asset.size, bytes.length);
+  }
+});
+
+test('uses the version notes in both the release body and update manifest', async t => {
+  const notes = '本次更新修复 macOS 高能耗，并增加应用置顶。\n\n- 重启后保留置顶顺序。';
+  const f = fixture(t, { notes: `\n${notes}\n` });
+  await f.run();
+  assert.equal(f.created[0].generate_release_notes, false);
+  assert.equal(f.created[0].body, notes);
+  const manifest = JSON.parse(f.uploaded.get('latest.json'));
+  assert.equal(manifest.notes, notes);
+  assert.equal(f.events.at(-1), 'publish');
+});
+
+test('missing or empty version notes retain generated release notes', async t => {
+  for (const notes of [undefined, ' \n\t']) {
+    const f = fixture(t, { notes });
+    await f.run();
+    assert.equal(f.created[0].generate_release_notes, true);
+    assert.match(f.created[0].body, /安装包/);
+    assert.equal(JSON.parse(f.uploaded.get('latest.json')).notes, '测试发布说明');
   }
 });
 
