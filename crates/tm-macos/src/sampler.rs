@@ -80,7 +80,10 @@ impl NettopSampler {
         let args: Vec<&str> = vec!["-x", "-n", "-L", "0", "-s", delay.as_str()];
 
         let mut cmd = Command::new(bin);
-        cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::null());
+        // nettop 即使在日志模式也监听 stdin。/dev/null 会持续报告 EOF，
+        // 在部分 macOS 版本上触发 dispatch 忙循环，占满一个 CPU 核心。
+        // 用管道并由 Child 持有写端：不发送输入，也不提前关闭它。
+        cmd.args(&args).stdin(Stdio::piped()).stderr(Stdio::null());
 
         // 关键：stdout 必须是 pty，否则 nettop 走全缓冲，3 秒才吐一批
         let (mut child, source): (Child, Box<dyn Read + Send>) = match pty::open(PTY_COLS, PTY_ROWS)
@@ -257,6 +260,40 @@ impl NettopSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_input_remains_open_and_can_receive_commands() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("collector");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf 'time,,interface,state,bytes_in,bytes_out,\ntime,,interface,state,bytes_in,bytes_out,\n'
+if ! IFS= read -r name; then name=stdin-eof; fi
+printf 't,%s.999999,,,0,0,\n' "$name"
+printf 't,tcp4 192.0.2.1:50000<->198.51.100.1:443,en0,Established,100,0,\ntime,,interface,state,bytes_in,bytes_out,\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut sampler =
+            NettopSampler::spawn_command(bin.to_str().unwrap(), Duration::from_secs(1)).unwrap();
+        sampler.sample().expect("collector ready");
+        sampler
+            .child
+            .stdin
+            .as_mut()
+            .expect("keep the input pipe open")
+            .write_all(b"test-client\n")
+            .unwrap();
+        sampler.sample().expect("collector received input");
+        assert_eq!(sampler.total_bytes("test-client").rx, 100);
+        assert_eq!(sampler.total_bytes("stdin-eof").rx, 0);
+    }
 
     #[test]
     fn queued_frames_use_read_time_instead_of_consumption_time() {

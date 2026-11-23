@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Stroke, Vec2};
-use tm_core::{format_bytes, format_speed, pretty_name, AppRate};
+use tm_core::{format_bytes, format_speed, pretty_name, AppKey, AppRate};
 // Windows 仍然用 tray-icon；macOS 换成原生 NSStatusItem（见 tm_macos::StatusItem 的注释）
 #[cfg(not(target_os = "macos"))]
 use tray_icon::{Icon, TrayIconBuilder};
@@ -94,6 +94,9 @@ const NUM_W_TX: f32 = 76.0;
 const NUM_UNIT_W: f32 = 25.0;
 /// 两个数字列之间的空隙
 const NUM_GAP: f32 = 6.0;
+/// 行末图钉的独立点击区域，与速率列之间留一点空隙。
+const PIN_SIZE: f32 = 26.0;
+const PIN_GAP: f32 = 4.0;
 /// 右侧给滚动指示条留的过道。行盒不占这一条，指示条才不会压在描边上。
 const SCROLL_GUTTER: f32 = 9.0;
 /// 指示条宽度（自绘，不用 egui 自带的浮动把手）
@@ -268,8 +271,10 @@ pub struct App {
     started_at: Instant,
     /// `--check-update`：跳过「启动延迟 + 24 小时」两个门槛，立刻查一次。
     force_update_check: bool,
-    /// 调试用初始滚动位置，只设置一次；后续由 ScrollArea 保留连续滚动状态。
-    initial_list_scroll: Option<f32>,
+    /// 一次性列表滚动位置：调试初始位置，或置顶后回到顶部。
+    /// 消费后继续由 ScrollArea 保留连续滚动状态。
+    next_list_scroll: Option<f32>,
+    /// 调试用设置页初始滚动位置。
     initial_settings_scroll: Option<f32>,
     /// 调试用：启动后立刻把面板摆出来（`--show` / `TM_SHOW_ON_START`）
     show_on_start: bool,
@@ -447,7 +452,7 @@ impl App {
             started_at: Instant::now(),
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
-            initial_list_scroll: std::env::var("TM_SCROLL")
+            next_list_scroll: std::env::var("TM_SCROLL")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f32| v.is_finite()),
@@ -1362,7 +1367,7 @@ impl App {
 
     /// 主面板。
     ///
-    /// 标题、两张速率卡片、应用列表（含时间窗口和列标题）、固定页脚。
+    /// 标题、两张速率卡片、应用列表（含时间窗口）、固定页脚。
     ///
     /// 高度是固定的（[`PANEL_H`]），所以列表吃掉「剩下多少」，页脚靠底。
     fn main_body(&mut self, ui: &mut egui::Ui, palette: &Palette, lang: Lang) {
@@ -1379,8 +1384,6 @@ impl App {
         // 时间窗口紧贴列表：它只决定列表按哪段时间排序，控件离内容越近越好。
         self.list_header(ui, p, lang);
         ui.add_space(10.0);
-        self.list_columns(ui, p, lang);
-        ui.add_space(6.0);
         // 提醒行有没有内容要在排版前就知道：它占一行高度，列表得先让出来。
         // 以前是无条件预留 22pt，结果没提醒时列表底下永远空一截。
         let alert = self.alert_text(lang);
@@ -1585,7 +1588,7 @@ impl App {
             settings_group(ui, p, lang.t("统计", "Statistics"), |ui| {
                 // ---- 列表条数 ----
                 // 面板高度固定，所以这一项不再管「窗口多高」，而是「最多列几个应用」：
-                // 超出的部分不展示，多到装不下可视行数时靠滚动查看。
+                // 置顶项优先保留，超过上限仍可滚动查看。
                 if option_row(
                     ui,
                     p,
@@ -2000,15 +2003,8 @@ impl App {
 
     /// 列表上方的一行：左边「应用 · N」，右边时间窗口分段控件。
     fn list_header(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
-        let count = match (&self.latest, self.window) {
-            (Some(s), Window::Live) => s.rates.len(),
-            (Some(s), Window::Min1) => s.windowed.min1.len(),
-            (Some(s), Window::Min5) => s.windowed.min5.len(),
-            (Some(s), Window::Hour1) => s.windowed.hour1.len(),
-            (None, _) => 0,
-        };
-        // 只列前 N 个，标题里的计数也要跟着截断，否则会出现「应用 · 9」却只有 5 行
-        let count = count.min(self.settings.max_apps.max(1));
+        // 和列表共用筛选逻辑，计数包含没有流量的置顶项。
+        let count = app_list_rates(self.latest.as_ref(), self.window, &self.settings).len();
 
         ui.horizontal(|ui| {
             ui.label(
@@ -2024,38 +2020,6 @@ impl App {
         });
     }
 
-    fn list_columns(&self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
-        let tx_right = rect.right() - SCROLL_GUTTER - ROW_PAD_X - 18.0;
-        let rx_right = tx_right - NUM_W_TX - NUM_GAP;
-        for (x, label, align) in [
-            (
-                rect.left() + ROW_PAD_X,
-                lang.t("应用名称", "Application"),
-                egui::Align2::LEFT_CENTER,
-            ),
-            (
-                rx_right,
-                lang.t("↓ 下载", "↓ Down"),
-                egui::Align2::RIGHT_CENTER,
-            ),
-            (
-                tx_right,
-                lang.t("↑ 上传", "↑ Up"),
-                egui::Align2::RIGHT_CENTER,
-            ),
-        ] {
-            ui.painter().text(
-                egui::pos2(x, rect.center().y),
-                align,
-                label,
-                egui::FontId::proportional(11.5),
-                p.unit,
-            );
-        }
-    }
-
     fn list(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, reveal: f32, has_alert: bool) {
         // 列表用满页脚与提醒行之外的空间，不按整行取整，以免底部空出半行。
         let reserve = FOOTER_BAND + if has_alert { ALERT_H } else { 0.0 };
@@ -2068,31 +2032,22 @@ impl App {
         content.set_clip_rect(body.intersect(ui.clip_rect()));
         let ui = &mut content;
 
-        // 先把这一帧的内容定下来（都要 owned，下面要 &mut self 取图标）
-        let mut rates: Vec<AppRate> = match (self.latest.as_ref(), self.window) {
-            (None, _) => Vec::new(),
-            (Some(s), Window::Live) => s.rates.clone(),
-            (Some(s), Window::Min1) => s.windowed.min1.clone(),
-            (Some(s), Window::Min5) => s.windowed.min5.clone(),
-            (Some(s), Window::Hour1) => s.windowed.hour1.clone(),
-        };
+        // 先定下本帧列表：置顶项按固定顺序保留，剩余名额按采样器的流量排名填充。
+        // 使用 owned 数据，下面才能 &mut self 取图标和切换置顶。
+        let rates = app_list_rates(self.latest.as_ref(), self.window, &self.settings);
         let loading = self.latest.is_none();
         let note = if loading {
             None
         } else if let Some(error) = self.latest.as_ref().and_then(|s| s.error.as_deref()) {
             Some(error)
         } else if rates.is_empty() {
-            // 实时没有，其它窗口必然也没有；区分文案只是为了让人知道
-            // 「不是采集中断了，是这段时间确实没流量」
+            // 没有置顶项且所选窗口没有流量时才显示空状态。
             Some(if self.window == Window::Live {
                 lang.t("当前没有流量", "No traffic right now")
             } else {
                 lang.t("这段时间没有流量", "No traffic in this window")
             })
         } else {
-            // 只列前 N 个：几十个后台进程全列出来没人看，按流量降序截断，
-            // 超出的部分靠滚动查看。N 来自设置里的「最多展示」。
-            rates.truncate(self.settings.max_apps.max(1));
             None
         };
 
@@ -2115,7 +2070,7 @@ impl App {
         } else if let Some(text) = note {
             empty_note(ui, text, avail, p);
         } else {
-            let out = app_list_scroll_area(avail, self.initial_list_scroll.take()).show(ui, |ui| {
+            let out = app_list_scroll_area(avail, self.next_list_scroll.take()).show(ui, |ui| {
                 // 让出右侧过道：行盒的描边不能和指示条叠在一起
                 ui.set_width(ui.available_width() - SCROLL_GUTTER);
                 // 行距自己控制，不叠加默认 item_spacing。
@@ -2207,8 +2162,8 @@ impl App {
                 CornerRadius::same(6),
                 color,
             );
-            let right = rect.right() - ROW_PAD_X;
-            let tx_x = right - 18.0 - NUM_W_TX;
+            let right = pin_button_rect(rect).left() - PIN_GAP;
+            let tx_x = right - NUM_W_TX;
             let rx_x = tx_x - NUM_GAP - NUM_W_RX;
             // 名字长度按行号错开（走一个固定序列，不是随机），
             // 否则每帧变一次，骨架会自己抖
@@ -2230,6 +2185,7 @@ impl App {
                 CornerRadius::same(3),
                 color,
             );
+            painter.rect_filled(pin_button_rect(rect).shrink(7.0), 3.0, color);
             if i + 1 < rows {
                 ui.add_space(ROW_GAP);
             }
@@ -2238,7 +2194,7 @@ impl App {
         ui.ctx().request_repaint();
     }
 
-    /// 一行：图标 + 名字 + 下行速率 + 上行速率。
+    /// 一行：图标 + 名字 + 下行速率 + 上行速率 + 置顶按钮。
     ///
     /// 速率固定列并右对齐；应用名使用剩余宽度按真实字体省略。
     fn row(&mut self, ui: &mut egui::Ui, r: &AppRate, p: &Palette) {
@@ -2255,12 +2211,15 @@ impl App {
 
         let width = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_BOX_H), egui::Sense::hover());
-        // 排名会变化，点击状态与应用键绑定，不能用行号作 ID。
-        let resp = ui.interact(
-            rect,
-            ui.id().with(("app-details", r.app.as_str())),
-            egui::Sense::click(),
-        );
+        let (resp, pin_resp) = app_row_actions(ui, rect, r.app.as_str(), &mut self.settings);
+        let pinned = self.settings.is_pinned(r.app.as_str());
+        if pin_resp.changed() {
+            self.settings.save();
+            if pinned {
+                self.next_list_scroll = Some(0.0);
+            }
+            ui.ctx().request_repaint();
+        }
 
         // 悬停：底色抬一档 + 描边转向强调色，120ms 过渡。
         //
@@ -2268,7 +2227,7 @@ impl App {
         // 视线就知道「操作的是这个」。渐变是为了不闪。
         let t = ui.ctx().animate_bool_with_time(
             ui.id().with(("row-hover", r.app.as_str())),
-            resp.hovered(),
+            resp.hovered() || pin_resp.hovered(),
             0.12,
         );
         let painter = ui.painter();
@@ -2280,8 +2239,8 @@ impl App {
             egui::StrokeKind::Inside,
         );
 
-        // 数字不贴到描边上
-        let right = rect.right() - ROW_PAD_X;
+        // 数字与行末图钉分开，各自保留稳定的列宽。
+        let right = pin_resp.rect.left() - PIN_GAP;
 
         // 图标：真实图标直接贴；系统服务发齿轮；其余拿不到就用低饱和的字母块
         let icon = egui::Rect::from_min_size(
@@ -2309,7 +2268,7 @@ impl App {
         }
 
         // 两列速率的右边界：先定数字，名字再去吃剩下的宽度
-        let tx_right = right - 18.0;
+        let tx_right = right;
         let rx_right = tx_right - NUM_W_TX - NUM_GAP;
         let name_left = icon.right() + 9.0;
 
@@ -2318,16 +2277,7 @@ impl App {
             egui::pos2(rx_right - NUM_W_RX - 5.0, rect.bottom()),
         );
         ellipsis_text(painter, name_rect, &name, 13.0, p.text, Align::Min);
-        let arrow_center = egui::pos2(right - 3.0, rect.center().y);
-        painter.add(egui::Shape::line(
-            vec![
-                arrow_center + egui::vec2(-2.0, -4.0),
-                arrow_center + egui::vec2(2.0, 0.0),
-                arrow_center + egui::vec2(-2.0, 4.0),
-            ],
-            Stroke::new(1.2_f32, p.unit),
-        ));
-        surface::focus(painter, rect, &resp, p);
+        surface::focus(painter, resp.rect, &resp, p);
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -2350,6 +2300,24 @@ impl App {
             p.upload,
             p.unit,
         );
+        paint_pin_button(ui, &pin_resp, pinned, p);
+        let pin_label = format!("{} · {name}", self.lang.t("置顶", "Pin"));
+        pin_resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                pinned,
+                &pin_label,
+            )
+        });
+        pin_resp.on_hover_text(format!(
+            "{} · {name}",
+            if pinned {
+                self.lang.t("取消置顶", "Unpin")
+            } else {
+                self.lang.t("置顶", "Pin")
+            }
+        ));
         let resp = resp.on_hover_text(format!("{}\n{}", name, tildify(r.app.as_str())));
         egui::Popup::from_toggle_button_response(&resp)
             .width(280.0)
@@ -3278,6 +3246,43 @@ fn action_button(
     resp
 }
 
+fn paint_pin_button(ui: &egui::Ui, response: &egui::Response, pinned: bool, p: &Palette) {
+    let rect = response.rect;
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect.shrink(2.0), 6.0, p.accent.gamma_multiply(0.07));
+    }
+    let color = if pinned || response.hovered() {
+        p.accent
+    } else {
+        p.subtext.gamma_multiply(0.65)
+    };
+    let c = rect.center();
+    // 原轮廓倾斜 45°，回转 30° 后只保留 15° 的轻微倾斜。
+    // 只缩小可见图形，点击区域仍保持易于操作的尺寸。
+    let rotation = egui::emath::Rot2::from_angle(-30.0_f32.to_radians());
+    let at = |x, y| c + rotation * egui::vec2(x, y) * 0.50;
+    let stroke = Stroke::new(if pinned { 1.2_f32 } else { 1.0_f32 }, color);
+    painter.add(egui::Shape::closed_line(
+        vec![
+            at(4.0, -9.0),
+            at(9.0, -4.0),
+            at(5.0, -3.0),
+            at(2.0, 0.0),
+            at(1.0, 4.0),
+            at(-4.0, -1.0),
+            at(0.0, -2.0),
+            at(3.0, -5.0),
+        ],
+        stroke,
+    ));
+    painter.line_segment([at(-1.5, 1.5), at(-8.0, 8.0)], stroke);
+    surface::focus(painter, rect, response, p);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
+
 /// 导出：一个开口朝上的托盘，中间是往上走的箭头。
 ///
 /// 不用「下载」那个向下箭头：导出是把数据**交出去**，箭头朝上更贴近语义，
@@ -3346,6 +3351,85 @@ fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
         ],
         stroke,
     ));
+}
+
+/// 展示层合并置顶项，不改动采样快照和历史统计。
+fn app_list_rates(
+    snapshot: Option<&Snapshot>,
+    window: Window,
+    settings: &Settings,
+) -> Vec<AppRate> {
+    // 加载或采集失败时保持原来的骨架/错误提示，不能把未知数据伪装成零流量。
+    let Some(snapshot) = snapshot.filter(|s| s.error.is_none()) else {
+        return Vec::new();
+    };
+    let rates = match window {
+        Window::Live => &snapshot.rates,
+        Window::Min1 => &snapshot.windowed.min1,
+        Window::Min5 => &snapshot.windowed.min5,
+        Window::Hour1 => &snapshot.windowed.hour1,
+    };
+    let mut listed: Vec<AppRate> = settings
+        .pinned_apps
+        .iter()
+        .map(|key| {
+            rates
+                .iter()
+                .find(|rate| rate.app.as_str() == key)
+                .cloned()
+                .unwrap_or_else(|| AppRate {
+                    app: AppKey::new(key.clone()),
+                    rx_bps: 0.0,
+                    tx_bps: 0.0,
+                    rx_session: 0,
+                    tx_session: 0,
+                })
+        })
+        .collect();
+    // 置顶项占用展示名额，但无论上限如何调整，都不能把它们截掉。
+    let remaining = settings.max_apps.max(1).saturating_sub(listed.len());
+    listed.extend(
+        rates
+            .iter()
+            .filter(|rate| !settings.is_pinned(rate.app.as_str()))
+            .take(remaining)
+            .cloned(),
+    );
+    listed
+}
+
+fn pin_button_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(row.right() - ROW_PAD_X - PIN_SIZE / 2.0, row.center().y),
+        Vec2::splat(PIN_SIZE),
+    )
+}
+
+/// 详情与置顶使用独立点击区域，状态都绑定完整应用键，排序改变后焦点仍跟着应用。
+fn app_row_actions(
+    ui: &mut egui::Ui,
+    row: egui::Rect,
+    app: &str,
+    settings: &mut Settings,
+) -> (egui::Response, egui::Response) {
+    let pin_rect = pin_button_rect(row);
+    let details_rect =
+        egui::Rect::from_min_max(row.min, egui::pos2(pin_rect.left() - PIN_GAP, row.bottom()));
+    let details = ui.interact(
+        details_rect,
+        ui.id().with(("app-details", app)),
+        egui::Sense::click(),
+    );
+    let mut pin = ui.interact(
+        pin_rect,
+        ui.id().with(("app-pin", app)),
+        egui::Sense::click(),
+    );
+    if pin.clicked() {
+        settings.toggle_pin(app);
+        pin.mark_changed();
+    }
+    (details, pin)
 }
 
 /// 不按帧吸附或覆盖偏移：macOS 触控板的小幅事件之间也会有空闲重绘帧。
@@ -3998,6 +4082,250 @@ mod tests {
                 bps,
                 menu_speed(bps)
             );
+        }
+    }
+
+    fn sample_rate(key: &str, bps: f64) -> AppRate {
+        AppRate {
+            app: AppKey::from(key),
+            rx_bps: bps,
+            tx_bps: bps / 10.0,
+            rx_session: 1024,
+            tx_session: 128,
+        }
+    }
+
+    fn listed_keys(rates: &[AppRate]) -> Vec<&str> {
+        rates.iter().map(|rate| rate.app.as_str()).collect()
+    }
+
+    #[test]
+    fn pinned_apps_keep_their_order_and_actual_rates_when_rankings_change() {
+        let mut settings = Settings::default();
+        settings.toggle_pin("b");
+        settings.toggle_pin("c");
+        let mut snapshot = Snapshot {
+            rates: vec![
+                sample_rate("a", 100.0),
+                sample_rate("b", 30.0),
+                sample_rate("c", 20.0),
+                sample_rate("d", 10.0),
+            ],
+            ..Default::default()
+        };
+        let listed = app_list_rates(Some(&snapshot), Window::Live, &settings);
+        assert_eq!(listed_keys(&listed), ["b", "c", "a", "d"]);
+        assert_eq!(listed[0], snapshot.rates[1]);
+        assert_eq!(listed[1], snapshot.rates[2]);
+
+        snapshot.rates = vec![
+            sample_rate("d", 200.0),
+            sample_rate("a", 100.0),
+            sample_rate("c", 25.0),
+            sample_rate("b", 1.0),
+        ];
+        let listed = app_list_rates(Some(&snapshot), Window::Live, &settings);
+        assert_eq!(listed_keys(&listed), ["b", "c", "d", "a"]);
+        assert_eq!(listed[0], snapshot.rates[3]);
+        assert_eq!(listed[1], snapshot.rates[2]);
+    }
+
+    #[test]
+    fn pins_take_priority_over_the_limit_and_unpinning_restores_traffic_order() {
+        let snapshot = Snapshot {
+            rates: (0..8)
+                .map(|i| sample_rate(&format!("app{i}"), (8 - i) as f64))
+                .collect(),
+            ..Default::default()
+        };
+        let mut settings = Settings {
+            max_apps: 5,
+            ..Default::default()
+        };
+        settings.toggle_pin("app7");
+        settings.toggle_pin("idle");
+        let listed = app_list_rates(Some(&snapshot), Window::Live, &settings);
+        assert_eq!(
+            listed_keys(&listed),
+            ["app7", "idle", "app0", "app1", "app2"]
+        );
+        assert_eq!(listed.len(), 5, "计数包含置顶项，不重复列出活跃的置顶应用");
+        assert_eq!(listed[0], snapshot.rates[7]);
+
+        settings.toggle_pin("app7");
+        settings.toggle_pin("idle");
+        let listed = app_list_rates(Some(&snapshot), Window::Live, &settings);
+        assert_eq!(
+            listed_keys(&listed),
+            ["app0", "app1", "app2", "app3", "app4"]
+        );
+
+        for i in (1..8).rev() {
+            settings.toggle_pin(&format!("app{i}"));
+        }
+        let listed = app_list_rates(Some(&snapshot), Window::Live, &settings);
+        assert_eq!(listed.len(), 7, "减少展示上限不能隐藏任何置顶项");
+        assert_eq!(
+            listed_keys(&listed),
+            ["app7", "app6", "app5", "app4", "app3", "app2", "app1"]
+        );
+    }
+
+    #[test]
+    fn idle_pins_stay_visible_in_every_window_and_use_its_actual_rates() {
+        let mut settings = Settings::default();
+        settings.toggle_pin("idle");
+        settings.toggle_pin("watched");
+        let snapshot = Snapshot {
+            rates: vec![sample_rate("watched", 11.0)],
+            windowed: engine::WindowedRates {
+                min1: vec![sample_rate("watched", 22.0)],
+                min5: vec![sample_rate("watched", 33.0)],
+                hour1: vec![sample_rate("watched", 44.0)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let idle = AppRate {
+            app: AppKey::from("idle"),
+            rx_bps: 0.0,
+            tx_bps: 0.0,
+            rx_session: 0,
+            tx_session: 0,
+        };
+        for (window, expected) in [
+            (Window::Live, &snapshot.rates[0]),
+            (Window::Min1, &snapshot.windowed.min1[0]),
+            (Window::Min5, &snapshot.windowed.min5[0]),
+            (Window::Hour1, &snapshot.windowed.hour1[0]),
+        ] {
+            let listed = app_list_rates(Some(&snapshot), window, &settings);
+            assert_eq!(listed_keys(&listed), ["idle", "watched"]);
+            assert_eq!(listed[0], idle);
+            assert_eq!(&listed[1], expected);
+        }
+        let empty = Snapshot::default();
+        for window in Window::all() {
+            let listed = app_list_rates(Some(&empty), window, &settings);
+            assert_eq!(listed_keys(&listed), ["idle", "watched"]);
+            assert!(listed.iter().all(|rate| rate.total_bps() == 0.0));
+        }
+        assert!(empty.rates.is_empty(), "置顶只改变展示，不改动采样快照");
+        settings.toggle_pin("idle");
+        settings.toggle_pin("watched");
+        assert!(app_list_rates(Some(&empty), Window::Live, &settings).is_empty());
+    }
+
+    #[test]
+    fn loading_and_errors_do_not_show_pins_as_zero_traffic() {
+        let mut settings = Settings::default();
+        settings.toggle_pin("watched");
+        settings.toggle_pin("idle");
+        let error = Snapshot {
+            rates: vec![sample_rate("watched", 100.0)],
+            error: Some("采集暂时中断，正在重新连接".into()),
+            ..Default::default()
+        };
+        for window in Window::all() {
+            assert!(app_list_rates(None, window, &settings).is_empty());
+            assert!(app_list_rates(Some(&error), window, &settings).is_empty());
+        }
+        assert_eq!(settings.pinned_apps, ["watched", "idle"]);
+    }
+
+    #[test]
+    fn pin_actions_accept_pointer_and_keyboard_without_opening_details() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            let palette = theme::palette(dark);
+            let snapshot = Snapshot {
+                rates: vec![sample_rate("fast", 100.0), sample_rate("watched", 1.0)],
+                ..Default::default()
+            };
+            let mut settings = Settings::default();
+            let mut pin_at = egui::Pos2::ZERO;
+            let mut details_at = egui::Pos2::ZERO;
+            let mut pin_id = None;
+            for frame in 0..8 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(WINDOW_W, PANEL_H),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                };
+                if matches!(frame, 1 | 2 | 6 | 7) {
+                    let pos = if frame < 3 { pin_at } else { details_at };
+                    input.events.push(egui::Event::PointerMoved(pos));
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: matches!(frame, 1 | 6),
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                if frame == 3 || frame == 4 {
+                    ctx.memory_mut(|m| m.request_focus(pin_id.unwrap()));
+                    input.events.push(egui::Event::Key {
+                        key: if frame == 3 {
+                            egui::Key::Space
+                        } else {
+                            egui::Key::Enter
+                        },
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.inner_margin(PANEL_PADDING))
+                        .show(ctx, |ui| {
+                            let rates = app_list_rates(Some(&snapshot), Window::Live, &settings);
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for rate in rates {
+                                ui.scope(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width() - SCROLL_GUTTER, ROW_BOX_H),
+                                        egui::Sense::hover(),
+                                    );
+                                    let (details, pin) =
+                                        app_row_actions(ui, rect, rate.app.as_str(), &mut settings);
+                                    assert!(!details.rect.intersects(pin.rect));
+                                    paint_pin_button(
+                                        ui,
+                                        &pin,
+                                        settings.is_pinned(rate.app.as_str()),
+                                        &palette,
+                                    );
+                                    if rate.app.as_str() == "watched" {
+                                        pin_at = pin.rect.center();
+                                        details_at = details.rect.center();
+                                        assert_eq!(*pin_id.get_or_insert(pin.id), pin.id);
+                                    }
+                                    egui::Popup::from_toggle_button_response(&details).show(|ui| {
+                                        ui.label("App details");
+                                    });
+                                });
+                                ui.add_space(ROW_GAP);
+                            }
+                        });
+                });
+                if frame < 7 {
+                    assert!(!egui::Popup::is_any_open(&ctx), "置顶不能打开详情弹窗");
+                } else {
+                    assert!(egui::Popup::is_any_open(&ctx), "点击行主体仍可查看详情");
+                }
+                assert_eq!(settings.is_pinned("watched"), matches!(frame, 2 | 4..=7));
+                assert!(!settings.is_pinned("fast"));
+            }
         }
     }
 

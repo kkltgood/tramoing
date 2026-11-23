@@ -46,9 +46,11 @@ pub struct Settings {
     pub tray_mode: TrayMode,
     pub theme: ThemeMode,
     pub lang: LangMode,
-    /// 列表最多列出几个应用。超出这个数量的应用不参与展示（按流量从高到低截断），
-    /// 超过可视行数的那部分靠滚动查看。
+    /// 列表通常最多列出几个应用。置顶项优先保留，剩余名额按流量从高到低填充；
+    /// 置顶项超过上限时全部展示，超过可视行数的部分靠滚动查看。
     pub max_apps: usize,
+    /// 按置顶顺序保存的完整应用键。名称相同但路径不同的应用不能互相影响。
+    pub pinned_apps: Vec<String>,
     /// 历史保留天数
     pub retention_days: i64,
     /// 近 10 分钟单应用超过这个 MB 数就在面板里提醒；0 表示关闭
@@ -85,6 +87,7 @@ impl Default for Settings {
             theme: ThemeMode::System,
             lang: LangMode::Auto,
             max_apps: 10,
+            pinned_apps: Vec::new(),
             retention_days: 30,
             alert_mb: 0,
             tray_color: true,
@@ -121,6 +124,23 @@ impl Settings {
         }
     }
 
+    pub fn is_pinned(&self, app: &str) -> bool {
+        self.pinned_apps.iter().any(|key| key == app)
+    }
+
+    /// 切换置顶，返回切换后的状态。已有置顶项的相对顺序保持不变。
+    pub fn toggle_pin(&mut self, app: &str) -> bool {
+        if self.is_pinned(app) {
+            self.pinned_apps.retain(|key| key != app);
+            false
+        } else if !app.trim().is_empty() {
+            self.pinned_apps.push(app.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn parse(text: &str) -> Self {
         let mut s = Self::default();
         let mut taskbar_order = None;
@@ -153,6 +173,15 @@ impl Settings {
                 "max_apps" => {
                     if let Ok(n) = v.parse::<usize>() {
                         s.max_apps = snap_options(n);
+                    }
+                }
+                "pinned_apps" => {
+                    if let Ok(apps) = serde_json::from_str::<Vec<String>>(v) {
+                        let mut seen = std::collections::HashSet::new();
+                        s.pinned_apps = apps
+                            .into_iter()
+                            .filter(|app| !app.trim().is_empty() && seen.insert(app.clone()))
+                            .collect();
                     }
                 }
                 // 旧版本这个键叫 row_limit，语义是「可视行数」。
@@ -266,6 +295,7 @@ impl Settings {
              theme={theme}\n\
              lang={lang}\n\
              max_apps={}\n\
+             pinned_apps={}\n\
              retention_days={}\n\
              alert_mb={}\n\
              tray_color={}\n\
@@ -281,6 +311,7 @@ impl Settings {
              update_check={}\n\
              last_check={}\n",
             self.max_apps,
+            serde_json::to_string(&self.pinned_apps).expect("application keys are strings"),
             self.retention_days,
             self.alert_mb,
             if self.tray_color { "on" } else { "off" },
@@ -374,6 +405,10 @@ mod tests {
             theme: ThemeMode::Dark,
             lang: LangMode::En,
             max_apps: 20,
+            pinned_apps: vec![
+                "/Applications/WeChat.app".into(),
+                "C:\\Apps\\Chrome.exe".into(),
+            ],
             retention_days: 90,
             alert_mb: 500,
             tray_color: false,
@@ -441,6 +476,64 @@ mod tests {
     #[test]
     fn empty_file_is_default() {
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn pins_preserve_full_keys_order_and_special_characters_across_restart() {
+        let mut settings = Settings::parse("theme=dark\nmax_apps=5");
+        assert!(settings.pinned_apps.is_empty(), "旧配置默认不置顶任何应用");
+        let keys = [
+            "/Applications/微信.app",
+            "C:\\Program Files\\Chrome\\chrome.exe",
+            "/Users/example/Apps/Editor = \"preview\"\n.app",
+            "/Applications/Editor.app",
+            "/Users/example/Applications/Editor.app",
+        ];
+        for key in keys {
+            assert!(settings.toggle_pin(key));
+        }
+        let serialized = settings.serialize();
+        assert_eq!(serialized.matches("pinned_apps=").count(), 1);
+        let pin_line = serialized
+            .lines()
+            .find(|line| line.starts_with("pinned_apps="))
+            .unwrap();
+        assert!(
+            pin_line.contains("\\n"),
+            "路径内的换行必须转义在同一配置行内"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.conf");
+        tm_store::files::atomic_write(&path, serialized.as_bytes()).unwrap();
+        let mut reloaded = Settings::parse(&std::fs::read_to_string(path).unwrap());
+        assert_eq!(reloaded, settings);
+        assert_eq!(reloaded.pinned_apps, keys);
+        assert!(!reloaded.toggle_pin(keys[3]));
+        assert!(reloaded.is_pinned(keys[4]), "同名应用使用完整路径区分");
+        assert_eq!(reloaded.pinned_apps, [keys[0], keys[1], keys[2], keys[4]]);
+        assert!(reloaded.toggle_pin(keys[3]));
+        assert_eq!(reloaded.pinned_apps.last().unwrap(), keys[3]);
+        assert_eq!(Settings::parse(&reloaded.serialize()), reloaded);
+    }
+
+    #[test]
+    fn invalid_pins_are_ignored_and_duplicate_keys_keep_the_first_position() {
+        let settings = Settings::parse(
+            "pinned_apps=[\"b\",\"\",\"a\",\"b\",\"   \",\"a\",\"c\"]\ntheme=light",
+        );
+        assert_eq!(settings.pinned_apps, ["b", "a", "c"]);
+        assert_eq!(settings.theme, ThemeMode::Light);
+        for invalid in ["broken", "null", "{}", "[1]", "[\"a\",null]", "[\"a\""] {
+            let settings = Settings::parse(&format!(
+                "pinned_apps=[\"saved\"]\npinned_apps={invalid}\nlang=en"
+            ));
+            assert_eq!(settings.pinned_apps, ["saved"]);
+            assert_eq!(settings.lang, LangMode::En);
+        }
+        let mut settings = settings;
+        assert!(!settings.toggle_pin(" \t"));
+        assert_eq!(settings.pinned_apps, ["b", "a", "c"]);
+        assert!(Settings::parse("pinned_apps=[]").pinned_apps.is_empty());
     }
 
     #[test]

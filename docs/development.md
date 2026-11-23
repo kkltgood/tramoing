@@ -108,13 +108,16 @@ powershell -ExecutionPolicy Bypass -File scripts\verify-windows-upgrade.ps1
 macOS：
 
 ```sh
+cargo test -p tm-macos --test native_runtime live_nettop_waits_between_samples_without_spinning_on_stdin --locked -- --ignored --nocapture --test-threads=1
 cargo test -p tm-macos --test native_runtime live_loopback --locked -- --ignored --nocapture --test-threads=1
 cargo test -p tray-app live_macos_engine_recovers --locked -- --ignored --nocapture --test-threads=1
 ```
 
+`live_nettop_waits_between_samples_without_spinning_on_stdin` 检查真实采集进程在每秒采样之间等待，并在回收子进程后核对 CPU 时间，捕获 stdin EOF 引起的忙循环。子进程 CPU 记账是进程级的，需单独运行并使用 `--test-threads=1`；允许 25% 单核占用以容纳连接数量和调度差异。
+
 代理归属测试需要另行设置 `TM_TEST_PROXY`，会从 `speed.cloudflare.com` 下载 4 MiB 公共测试数据；它是诊断用例，已知部分代理环境达不到其客户端归属阈值，见[统计限制](troubleshooting.md#统计限制)。不要把全部 `--ignored` 测试作为通用 CI 门槛。
 
-手动回归应覆盖：网速与 CPU/GPU 点击打开主展示页、设置后收起并重新打开、失焦收起、拖动排序、深浅主题、触控板滚动、高 DPI、多显示器和正常退出。
+手动回归应覆盖：网速与 CPU/GPU 点击打开主展示页、设置后收起并重新打开、失焦收起、任务栏拖动排序、应用置顶/取消置顶及重启保留、空闲置顶项与时间窗口切换、图钉点击和行详情互不干扰、深浅主题、触控板滚动、高 DPI、多显示器和正常退出。
 
 ## 打包
 

@@ -13,6 +13,44 @@ use std::time::{Duration, Instant};
 use tm_macos::NettopSampler;
 use tm_sampler::Sampler;
 
+fn child_cpu_seconds() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage fills this correctly sized buffer on success.
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: getrusage succeeded and initialized the buffer above.
+    let usage = unsafe { usage.assume_init() };
+    let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+#[test]
+#[ignore = "requires live nettop; run with --test-threads=1 for child CPU accounting"]
+fn live_nettop_waits_between_samples_without_spinning_on_stdin() {
+    // No input is sent to the collector. It must wait between its 1 Hz samples,
+    // rather than continuously dispatching readability notifications for EOF.
+    let before = child_cpu_seconds();
+    let started = Instant::now();
+    let mut sampler = NettopSampler::spawn().expect("start nettop");
+    for _ in 0..6 {
+        sampler.sample().expect("live sample");
+    }
+    // RUSAGE_CHILDREN includes this collector only after it has been reaped.
+    drop(sampler);
+    let elapsed = started.elapsed().as_secs_f64();
+    let cpu = child_cpu_seconds() - before;
+    let percent = cpu / elapsed * 100.0;
+    eprintln!("nettop: {cpu:.3}s CPU over {elapsed:.3}s, {percent:.2}% of one core");
+    // Allow substantial connection/scheduling overhead while catching the
+    // approximately 100% CPU EOF loop seen on macOS.
+    assert!(
+        percent < 25.0,
+        "nettop used {percent:.2}% CPU without input"
+    );
+}
+
 #[test]
 #[ignore = "requires live nettop and local socket access"]
 fn live_loopback_is_excluded_and_nettop_is_reaped() {
