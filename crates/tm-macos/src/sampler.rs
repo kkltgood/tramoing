@@ -119,9 +119,14 @@ impl NettopSampler {
                         // 在读线程记录帧到达时间，数据库阻塞后消费积压帧时
                         // 仍按原始间隔计算速率，不能按几毫秒的消费间隔计算。
                         if tx.send((Instant::now(), rows)).is_err() {
-                            break;
+                            return;
                         }
                     }
+                }
+                // 进程退出后没有下一次表头来切帧，已读到的连接仍应交付。
+                let rows = parser.flush();
+                if !rows.is_empty() {
+                    let _ = tx.send((Instant::now(), rows));
                 }
             })
             .map_err(|e| {
@@ -260,6 +265,34 @@ impl NettopSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_exit_preserves_the_last_frame_without_a_following_header() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("collector");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf 'time,,interface,state,bytes_in,bytes_out,\ntime,,interface,state,bytes_in,bytes_out,\n'
+printf 't,test-client.999999,,,0,0,\n'
+printf 't,tcp4 192.0.2.1:50000<->198.51.100.1:443,en0,Established,100,25,\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut sampler =
+            NettopSampler::spawn_command(bin.to_str().unwrap(), Duration::from_secs(1)).unwrap();
+        sampler.sample().expect("initial baseline");
+        sampler.sample().expect("final frame before collector exit");
+        assert_eq!(
+            sampler.total_bytes("test-client"),
+            Bytes { rx: 100, tx: 25 }
+        );
+        assert!(matches!(sampler.sample(), Err(SamplerError::Closed)));
+    }
 
     #[test]
     fn collector_input_remains_open_and_can_receive_commands() {

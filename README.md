@@ -95,7 +95,7 @@ open dist/Tramoing.app
 | `--mock` | 使用演示流量和性能数据 |
 | `--show` | 启动后展开面板，适合界面调试 |
 | `--settings` | 直接打开设置 |
-| `--export` | 导出已有历史为 CSV 后退出 |
+| `--export` | 导出已有历史为 CSV 后退出；失败返回非零退出码 |
 | `--autostart on\|off\|status` | 设置或查询界面程序登录自启 |
 | `--check-update` | 立即检查 GitHub Releases 中的新版本 |
 

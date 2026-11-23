@@ -43,6 +43,14 @@ pub struct FlowRow {
 }
 
 impl FlowRow {
+    fn transport(&self) -> &str {
+        match self.proto.as_str() {
+            "tcp4" | "tcp6" => "tcp",
+            "udp4" | "udp6" => "udp",
+            proto => proto,
+        }
+    }
+
     fn is_listen(&self) -> bool {
         self.state == "Listen"
     }
@@ -326,20 +334,20 @@ impl FlowAccounting {
     {
         self.frame += 1;
 
-        // 本帧的监听端口：判断一条回环连接是服务端还是客户端侧
-        let listeners: HashSet<(u32, u16)> = rows
+        // TCP/UDP 可独立绑定同一个端口；双栈 TCP 监听仍可接受 IPv4 连接。
+        let listeners: HashSet<(&str, u32, u16)> = rows
             .iter()
             .filter(|r| r.is_listen() && r.local_port != 0)
-            .map(|r| (r.pid, r.local_port))
+            .map(|r| (r.transport(), r.pid, r.local_port))
             .collect();
 
         // 本机端点 -> pid，用来找回环另一端的属主
-        let mut owner: HashMap<(&str, u16), u32> = HashMap::new();
+        let mut owner: HashMap<(&str, &str, u16), u32> = HashMap::new();
         let mut names: HashMap<u32, &str> = HashMap::new();
         for r in rows {
             names.entry(r.pid).or_insert(r.proc_name.as_str());
             if r.local_port != 0 {
-                owner.insert((r.local_ip.as_str(), r.local_port), r.pid);
+                owner.insert((r.transport(), r.local_ip.as_str(), r.local_port), r.pid);
             }
         }
 
@@ -385,15 +393,15 @@ impl FlowAccounting {
             }
 
             if r.is_loopback() {
-                let is_server = listeners.contains(&(r.pid, r.local_port));
+                let is_server = listeners.contains(&(r.transport(), r.pid, r.local_port));
                 if is_server {
                     // 服务端侧，和客户端侧是同一份数据，先记下来用于抵扣
                     acc.entry(r.pid).or_default().srv.add(d);
                 } else {
                     let server = owner
-                        .get(&(r.remote_ip.as_str(), r.remote_port))
+                        .get(&(r.transport(), r.remote_ip.as_str(), r.remote_port))
                         .copied()
-                        .filter(|p| listeners.contains(&(*p, r.remote_port)));
+                        .filter(|p| listeners.contains(&(r.transport(), *p, r.remote_port)));
                     client_side.push((r.pid, server, d));
                     cli_sum.entry(r.pid).or_default().add(d);
                 }
@@ -413,9 +421,11 @@ impl FlowAccounting {
             .collect();
         let mut upstream = HashMap::new();
         for r in rows.iter().filter(|r| r.is_loopback() && !r.is_listen()) {
-            if !listeners.contains(&(r.pid, r.local_port)) {
-                if let Some(server) = owner.get(&(r.remote_ip.as_str(), r.remote_port)) {
-                    if listeners.contains(&(*server, r.remote_port)) {
+            if !listeners.contains(&(r.transport(), r.pid, r.local_port)) {
+                if let Some(server) =
+                    owner.get(&(r.transport(), r.remote_ip.as_str(), r.remote_port))
+                {
+                    if listeners.contains(&(r.transport(), *server, r.remote_port)) {
                         upstream.insert(r.pid, *server);
                     }
                 }
@@ -433,7 +443,7 @@ impl FlowAccounting {
         };
         let mut relays: HashSet<u32> = listeners
             .iter()
-            .map(|(pid, _)| *pid)
+            .map(|(_, pid, _)| *pid)
             .filter(|pid| root_of(*pid).is_some())
             .collect();
 
@@ -784,6 +794,85 @@ mod accounting_tests {
 
         assert_eq!(of(&out, "Chrome#100").rx, 1_000_000);
         assert_eq!(of(&out, "verge-mihomo#9"), Bytes::default());
+    }
+
+    #[test]
+    fn udp_endpoint_does_not_replace_a_tcp_proxy_owner() {
+        for (udp_first, listener_proto) in [
+            (false, "tcp4"),
+            (true, "tcp4"),
+            (false, "tcp6"),
+            (true, "tcp6"),
+        ] {
+            let mut acc = FlowAccounting::new();
+            let frame = |n| {
+                let mut listener = listen(9, "proxy", 7890);
+                listener.proto = listener_proto.into();
+                if listener_proto == "tcp6" {
+                    listener.local_ip = "::".into();
+                }
+                let mut rows = vec![
+                    listener,
+                    row(
+                        100,
+                        "browser",
+                        "lo0",
+                        "Established",
+                        "127.0.0.1",
+                        52344,
+                        "127.0.0.1",
+                        7890,
+                        n,
+                        0,
+                    ),
+                    row(
+                        9,
+                        "proxy",
+                        "lo0",
+                        "Established",
+                        "127.0.0.1",
+                        7890,
+                        "127.0.0.1",
+                        52344,
+                        0,
+                        n,
+                    ),
+                    row(
+                        9,
+                        "proxy",
+                        "en0",
+                        "Established",
+                        "192.0.2.1",
+                        40000,
+                        "198.51.100.1",
+                        443,
+                        n,
+                        0,
+                    ),
+                ];
+                // TCP and UDP may bind the same address and port independently.
+                let mut udp = row(
+                    200,
+                    "udp-service",
+                    "lo0",
+                    "",
+                    "127.0.0.1",
+                    7890,
+                    "",
+                    0,
+                    0,
+                    0,
+                );
+                udp.proto = "udp4".into();
+                rows.insert(if udp_first { 0 } else { rows.len() }, udp);
+                rows
+            };
+            acc.update(&frame(0), resolve);
+            let out = acc.update(&frame(1000), resolve);
+            assert_eq!(of(&out, "browser#100").rx, 1000);
+            assert_eq!(of(&out, "proxy#9"), Bytes::default());
+            assert_eq!(of(&out, "udp-service#200"), Bytes::default());
+        }
     }
 
     #[test]

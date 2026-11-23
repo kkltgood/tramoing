@@ -9,12 +9,13 @@
 //! # 为什么只存增量
 //!
 //! 每 5 秒把这段时间内每个应用的字节增量累加进对应分钟的行。
-//! 存增量而不是累计值，查询时直接 `SUM` 就行，不用处理「进程重启导致累计归零」。
+//! 存增量而不是累计值，查询时直接求和，不用处理「进程重启导致累计归零」。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::functions::{Aggregate, Context, FunctionFlags};
 use rusqlite::{params, Connection, OpenFlags};
 use tm_core::AppKey;
 
@@ -78,17 +79,45 @@ pub struct Store {
     conn: Connection,
 }
 
+/// SQLite 的 SUM 在整数溢出时会中止整个查询；统计值沿用存储层的饱和规则。
+struct SaturatingSum;
+
+impl Aggregate<i64, i64> for SaturatingSum {
+    fn init(&self, _: &mut Context<'_>) -> rusqlite::Result<i64> {
+        Ok(0)
+    }
+
+    fn step(&self, ctx: &mut Context<'_>, sum: &mut i64) -> rusqlite::Result<()> {
+        *sum = sum.saturating_add(ctx.get::<i64>(0)?.max(0));
+        Ok(())
+    }
+
+    fn finalize(&self, _: &mut Context<'_>, sum: Option<i64>) -> rusqlite::Result<i64> {
+        Ok(sum.unwrap_or_default())
+    }
+}
+
 impl Store {
+    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+        conn.create_aggregate_function(
+            "tm_sum",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            SaturatingSum,
+        )?;
+        Ok(Self { conn })
+    }
+
     /// 查询/导出已有历史；不建目录、不迁移，也不申请写锁。
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Ok(Self { conn })
+        Self::from_connection(conn)
     }
 
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(files::parent_dir(path))?;
         let conn = Connection::open(path)?;
-        let store = Self { conn };
+        let store = Self::from_connection(conn)?;
         store.migrate()?;
         // WAL 让「后台写入」和「界面查询」不会互相卡住
         let _ = store.conn.pragma_update(None, "journal_mode", "WAL");
@@ -98,9 +127,7 @@ impl Store {
 
     /// 只用于测试。
     pub fn open_memory() -> Result<Self, StoreError> {
-        let store = Self {
-            conn: Connection::open_in_memory()?,
-        };
+        let store = Self::from_connection(Connection::open_in_memory()?)?;
         store.migrate()?;
         Ok(store)
     }
@@ -185,8 +212,8 @@ impl Store {
             let mut stmt = txn.prepare_cached(
                 r#"INSERT INTO samples (minute, app, rx, tx) VALUES (?1, ?2, ?3, ?4)
                    ON CONFLICT(minute, app) DO UPDATE SET
-                       rx = rx + excluded.rx,
-                       tx = tx + excluded.tx"#,
+                       rx = MIN(MAX(CAST(rx AS INTEGER), 0), 9223372036854775807 - excluded.rx) + excluded.rx,
+                       tx = MIN(MAX(CAST(tx AS INTEGER), 0), 9223372036854775807 - excluded.tx) + excluded.tx"#,
             )?;
             for ((app, minute), (rx, tx_bytes)) in merged {
                 stmt.execute(params![minute, app, clamp(rx), clamp(tx_bytes)])?;
@@ -198,12 +225,14 @@ impl Store {
     }
 
     /// 一段时间内按应用汇总，按总量降序。
+    /// 单方向累计超过 SQLite INTEGER 上限时饱和为 i64::MAX。
     pub fn totals_between(&self, from: i64, to: i64) -> Result<Vec<AppTotal>, StoreError> {
         let mut stmt = self.conn.prepare_cached(
-            r#"SELECT app, SUM(rx), SUM(tx) FROM samples
+            r#"SELECT app, tm_sum(CAST(rx AS INTEGER)) AS total_rx,
+                          tm_sum(CAST(tx AS INTEGER)) AS total_tx FROM samples
                WHERE minute >= ?1 AND minute < ?2
                GROUP BY app
-               ORDER BY SUM(rx) + SUM(tx) DESC"#,
+               ORDER BY total_rx + total_tx DESC"#,
         )?;
         let rows = stmt.query_map(params![from, to], |r| {
             Ok(AppTotal {
@@ -228,7 +257,8 @@ impl Store {
     ) -> Result<Vec<Bucket>, StoreError> {
         let bucket = bucket_secs.max(1);
         let mut stmt = self.conn.prepare_cached(
-            r#"SELECT (minute / ?3) * ?3 AS b, SUM(rx), SUM(tx) FROM samples
+            r#"SELECT (minute / ?3) * ?3 AS b,
+                      tm_sum(CAST(rx AS INTEGER)), tm_sum(CAST(tx AS INTEGER)) FROM samples
                WHERE minute >= ?1 AND minute < ?2
                GROUP BY b
                ORDER BY b"#,
@@ -294,7 +324,8 @@ impl Store {
         writeln!(file, "时间,应用,标识,下载字节,上传字节")?;
 
         let mut stmt = self.conn.prepare_cached(
-            r#"SELECT datetime(minute, 'unixepoch', 'localtime') AS t, app, rx, tx
+            r#"SELECT datetime(minute, 'unixepoch', 'localtime') AS t, app,
+                      CAST(rx AS INTEGER), CAST(tx AS INTEGER)
                FROM samples
                WHERE minute >= ?1 AND minute < ?2
                ORDER BY minute, rx + tx DESC"#,
@@ -328,8 +359,17 @@ impl Store {
     }
 }
 
-/// CSV 字段转义：含逗号、引号、换行时用双引号包起来，内部引号翻倍。
+/// CSV 字段转义，并阻止应用名被电子表格软件解释成公式。
+/// 双引号只保护 CSV 结构，不会关闭 Excel 的公式解析，因此先加文本前缀。
 fn csv_field(s: &str) -> String {
+    let text;
+    let s = if s.trim_start().starts_with(['=', '+', '-', '@']) || s.starts_with(['\t', '\n', '\r'])
+    {
+        text = format!("'{s}");
+        text.as_str()
+    } else {
+        s
+    };
     if s.contains(['"', ',', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
@@ -573,6 +613,85 @@ mod tests {
     }
 
     #[test]
+    fn repeated_large_deltas_and_aggregates_saturate_without_breaking_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("history.db");
+        let mut s = Store::open(&database).unwrap();
+        let limit = i64::MAX as u64;
+        s.add_deltas(at(60), &[(app("x"), limit - 1, limit - 1)])
+            .unwrap();
+        s.add_deltas(at(61), &[(app("x"), 10, 10)]).unwrap();
+        s.add_deltas(at(120), &[(app("x"), 10, 10)]).unwrap();
+        s.add_deltas(at(60), &[(app("y"), 10, 10)]).unwrap();
+        let types: (String, String) = s
+            .conn
+            .query_row(
+                "SELECT typeof(rx), typeof(tx) FROM samples WHERE minute = 60 AND app = 'x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(types, ("integer".into(), "integer".into()));
+        drop(s);
+
+        // 只读连接也必须支持相同的汇总，不能仅在写入连接注册聚合函数。
+        let s = Store::open_read_only(&database).unwrap();
+        assert_eq!(
+            s.totals_between(0, 180).unwrap()[0],
+            AppTotal {
+                app: "x".into(),
+                rx: limit,
+                tx: limit,
+            }
+        );
+        assert_eq!(
+            s.timeline(0, 180, 3600).unwrap(),
+            [Bucket {
+                ts: 0,
+                rx: limit,
+                tx: limit,
+            }]
+        );
+        let export = dir.path().join("history.csv");
+        assert_eq!(s.export_csv(0, 180, &export).unwrap(), 3);
+        assert!(std::fs::read_to_string(export)
+            .unwrap()
+            .contains(&format!(",{limit},{limit}")));
+    }
+
+    #[test]
+    fn aggregation_preserves_integer_precision_above_f64_exact_range() {
+        let mut s = Store::open_memory().unwrap();
+        let large = (1u64 << 53) + 1;
+        s.add_deltas(at(60), &[(app("x"), large, 0)]).unwrap();
+        s.add_deltas(at(120), &[(app("x"), 2, 0)]).unwrap();
+        assert_eq!(s.totals_between(0, 180).unwrap()[0].rx, large + 2);
+        assert_eq!(s.timeline(0, 180, 3600).unwrap()[0].rx, large + 2);
+    }
+
+    #[test]
+    fn legacy_overflowed_rows_remain_readable_and_can_be_updated() {
+        let mut s = Store::open_memory().unwrap();
+        // 旧版 upsert 在整数溢出后会将 SQLite 列变成 REAL。
+        s.conn
+            .execute(
+                "INSERT INTO samples VALUES (60, 'x', 9223372036854775807 + 1, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.totals_between(0, 120).unwrap()[0].rx, i64::MAX as u64);
+        assert_eq!(s.timeline(0, 120, 60).unwrap()[0].rx, i64::MAX as u64);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            s.export_csv(0, 120, &dir.path().join("history.csv"))
+                .unwrap(),
+            1
+        );
+        s.add_deltas(at(61), &[(app("x"), 1, 0)]).unwrap();
+        assert_eq!(s.totals_between(0, 120).unwrap()[0].rx, i64::MAX as u64);
+    }
+
+    #[test]
     fn empty_range_returns_nothing() {
         let s = Store::open_memory().unwrap();
         assert!(s.totals_between(0, 100).unwrap().is_empty());
@@ -613,5 +732,26 @@ mod tests {
         assert_eq!(csv_field("chrome"), "chrome");
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn csv_export_keeps_formula_like_application_names_as_text() {
+        for name in ["=1+1", "+1+1", "-1+1", "@SUM(1)", "  =1+1", "\t=1+1"] {
+            assert_eq!(csv_field(name), format!("'{name}"));
+        }
+        assert_eq!(csv_field("\r=1+1"), "\"'\r=1+1\"");
+        assert_eq!(csv_field("=SUM(1,2)"), "\"'=SUM(1,2)\"");
+
+        let mut store = Store::open_memory().unwrap();
+        store
+            .add_deltas(at(60), &[(app("/Applications/=1+1.app"), 10, 0)])
+            .unwrap();
+        store.add_deltas(at(60), &[(app("=1+1"), 20, 0)]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.csv");
+        store.export_csv(0, 120, &path).unwrap();
+        let csv = std::fs::read_to_string(path).unwrap();
+        assert!(csv.contains(",'=1+1,/Applications/=1+1.app,10,0"));
+        assert!(csv.contains(",'=1+1,'=1+1,20,0"));
     }
 }

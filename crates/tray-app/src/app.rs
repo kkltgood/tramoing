@@ -2708,7 +2708,7 @@ impl App {
     fn export_history(&mut self, zh: bool, ctx: &egui::Context) {
         let ctx = ctx.clone();
         match crate::export::ExportJob::start(
-            move || export_history_csv(zh),
+            move || export_history_csv(zh).unwrap_or_else(|message| message),
             move || ctx.request_repaint(),
         ) {
             Ok(job) => {
@@ -2730,10 +2730,10 @@ impl App {
     }
 }
 
-/// 导出全部历史，返回可以直接展示的提示文案。
+/// 导出全部历史，保留成功/失败状态，文案可以直接展示。
 ///
 /// 界面在后台任务中调用；`--export` 命令行入口直接等待结果。
-pub fn export_history_csv(zh: bool) -> String {
+pub fn export_history_csv(zh: bool) -> Result<String, String> {
     let result = (|| -> Result<(u64, String), String> {
         let path = engine::db_path();
         if !path.try_exists().map_err(|e| e.to_string())? {
@@ -2777,30 +2777,31 @@ pub fn export_history_csv(zh: bool) -> String {
     })();
 
     let msg = match result {
-        Ok((0, _)) => {
+        Ok((0, _)) => Ok({
             if zh {
                 "还没有历史数据".to_owned()
             } else {
                 "No history yet".to_owned()
             }
-        }
-        Ok((n, path)) => {
+        }),
+        Ok((n, path)) => Ok({
             if zh {
                 format!("已导出 {n} 行 → {path}")
             } else {
                 format!("Exported {n} rows → {path}")
             }
-        }
-        Err(e) => {
+        }),
+        Err(e) => Err({
             if zh {
                 format!("导出失败：{e}")
             } else {
                 format!("Export failed: {e}")
             }
-        }
+        }),
     };
     // 终端里也留一份，方便排查
-    eprintln!("[export] {msg}");
+    let (Ok(message) | Err(message)) = &msg;
+    eprintln!("[export] {message}");
     msg
 }
 

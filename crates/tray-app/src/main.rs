@@ -104,7 +104,13 @@ fn main() -> eframe::Result<()> {
     }
     // 无界面导出，方便脚本或定时任务调用：tramoing --export
     if args.iter().any(|a| a == "--export") {
-        println!("{}", app::export_history_csv(true));
+        match app::export_history_csv(true) {
+            Ok(message) => println!("{message}"),
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
     // 开机自启的真实开关。命令行的好处是不用点界面就能验证，
