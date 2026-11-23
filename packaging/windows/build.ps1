@@ -9,7 +9,7 @@
 #
 # 产物：dist\Tramoing-<version>-setup.exe
 #
-# 注意：本文件与 traffic-monitor.nsi 都必须保存成 **UTF-8 with BOM**。
+# 注意：本文件与 tramoing.nsi 都必须保存成 **UTF-8 with BOM**。
 # PowerShell 5.1 读无 BOM 的脚本会按系统 ANSI(GBK) 解析，中文注释直接变乱码、
 # 引号配对错位，报「字符串缺少终止符」；NSIS 同理（无 BOM 会按 ANSI 读源码）。
 # 编辑后用这条命令补 BOM：
@@ -90,7 +90,7 @@ if (-not $makensis) {
 }
 
 Write-Host "==> 生成安装包"
-& $makensis "/DAPP_VERSION=$Version" "packaging\windows\traffic-monitor.nsi"
+& $makensis "/DAPP_VERSION=$Version" "packaging\windows\tramoing.nsi"
 if ($LASTEXITCODE -ne 0) { throw "makensis 失败" }
 
 $installerPath = Join-Path $root "dist\Tramoing-$Version-setup.exe"

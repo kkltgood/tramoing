@@ -18,7 +18,13 @@
 
 pub mod agg;
 pub mod network;
+pub mod network_policy;
 pub mod proto;
+
+#[cfg(windows)]
+pub mod firewall;
+#[cfg(windows)]
+pub mod network_control;
 
 #[cfg(windows)]
 pub mod badge;
@@ -51,7 +57,7 @@ pub mod utilization;
 pub use sampler::WindowsSampler;
 
 /// 命名管道名字。两端必须一致。
-pub const PIPE_NAME: &str = r"\\.\pipe\traffic-monitor-v1";
+pub const PIPE_NAME: &str = r"\\.\pipe\tramoing-v1";
 
 /// ETW 会话名。同一时间只能有一个同名会话，重名会启动失败。
-pub const SESSION_NAME: &str = "TrafficMonitor-Etw";
+pub const SESSION_NAME: &str = "Tramoing-Etw";

@@ -604,7 +604,7 @@ fn open_on_macos(target: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
-/// 追加一行到 `%LOCALAPPDATA%\TrafficMonitor\ui.log`。
+/// 追加一行到 `%LOCALAPPDATA%\Tramoing\ui.log`。
 ///
 /// 不走 `log` crate：那个只在 `TM_LOG=1` 时接 stderr，release 的 GUI 子系统
 /// 根本没有 stderr。更新检测是「静默失败」最典型的地方，必须自己留痕。

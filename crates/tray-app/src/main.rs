@@ -14,11 +14,16 @@ mod autostart;
 // Windows 任务栏的网速贴片。macOS 的状态栏能直接写文字，用不到这个窗口。
 #[cfg(windows)]
 mod badge_window;
+mod color_picker;
 mod engine;
 mod export;
 mod icon;
 mod icons;
 mod instance;
+#[cfg(windows)]
+mod network_access;
+#[cfg(windows)]
+mod network_panel;
 #[cfg(any(target_os = "macos", windows))]
 mod performance;
 mod settings;
@@ -104,6 +109,10 @@ fn main() -> eframe::Result<()> {
     }
     // 无界面导出，方便脚本或定时任务调用：tramoing --export
     if args.iter().any(|a| a == "--export") {
+        if let Err(error) = tm_store::prepare_data_dir() {
+            eprintln!("导入旧数据失败：{error}");
+            std::process::exit(1);
+        }
         match app::export_history_csv(true) {
             Ok(message) => println!("{message}"),
             Err(message) => {
@@ -143,17 +152,24 @@ fn main() -> eframe::Result<()> {
     if !args.iter().any(|a| a == "--mock") {
         match tm_macos::installation::offer_install() {
             Ok(true) => return Ok(()),
-            Ok(false) => {
-                if !settings::Settings::path().exists() {
-                    std::env::set_var("TM_SHOW_ON_START", "1");
-                    std::env::set_var("TM_AFTER_INSTALL", "1");
-                }
-            }
+            Ok(false) => {}
             Err(error) => {
                 update::log_line(&error);
                 tm_macos::installation::show_error(&error);
                 return Ok(());
             }
+        }
+    }
+
+    if std::env::var_os("TM_FORCE_MOCK").is_none() {
+        if let Err(error) = tm_store::prepare_data_dir() {
+            update::log_line(&format!("导入旧数据失败：{error}"));
+            return Err(eframe::Error::AppCreation(Box::new(error)));
+        }
+        #[cfg(target_os = "macos")]
+        if !settings::Settings::path().exists() {
+            std::env::set_var("TM_SHOW_ON_START", "1");
+            std::env::set_var("TM_AFTER_INSTALL", "1");
         }
     }
 
@@ -165,6 +181,15 @@ fn main() -> eframe::Result<()> {
             return Err(eframe::Error::AppCreation(Box::new(e)));
         }
     };
+
+    if std::env::var_os("TM_FORCE_MOCK").is_none()
+        && std::env::var_os("TM_DATA_DIR").is_none()
+        && std::env::var_os("TM_DB_PATH").is_none()
+    {
+        if let Err(error) = autostart::migrate_legacy() {
+            update::log_line(&format!("迁移登录自启项失败：{error}"));
+        }
+    }
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("Tramoing")

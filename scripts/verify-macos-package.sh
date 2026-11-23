@@ -15,7 +15,7 @@ hdiutil verify "$DMG" -quiet
 hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$VERIFY_MOUNT" -quiet
 PACKAGED_APP="$VERIFY_MOUNT/Tramoing.app"
 codesign --verify --deep --strict "$PACKAGED_APP"
-test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$PACKAGED_APP/Contents/Info.plist")" = 'dev.guolongkang.trafficmonitor'
+test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$PACKAGED_APP/Contents/Info.plist")" = 'dev.guolongkang.tramoing'
 cmp "$SOURCE_APP/Contents/Info.plist" "$PACKAGED_APP/Contents/Info.plist"
 cmp "$SOURCE_APP/Contents/MacOS/tramoing" "$PACKAGED_APP/Contents/MacOS/tramoing"
 "${DMGBUILD_PYTHON:-python3}" "$SCRIPT_ROOT/packaging/macos/verify-dmg.py" "$VERIFY_MOUNT"

@@ -13,7 +13,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-const BUNDLE_ID: &str = "dev.guolongkang.trafficmonitor";
+const BUNDLE_ID: &str = tm_core::identity::MACOS_BUNDLE_ID;
+const LEGACY_BUNDLE_ID: &str = tm_core::identity::LEGACY_MACOS_BUNDLE_ID;
 const FINISH_FLAG: &str = "--finish-macos-install";
 const STAGE_PREFIX: &str = ".tramoing-install-";
 
@@ -39,7 +40,8 @@ fn plist_value(bundle: &Path, key: &str) -> Result<String, String> {
 }
 
 fn bundle_version(bundle: &Path) -> Result<String, String> {
-    if plist_value(bundle, "CFBundleIdentifier")? != BUNDLE_ID {
+    let identifier = plist_value(bundle, "CFBundleIdentifier")?;
+    if identifier != BUNDLE_ID && identifier != LEGACY_BUNDLE_ID {
         return Err("目标不是 Tramoing，已停止安装".into());
     }
     if plist_value(bundle, "CFBundleExecutable")? != "tramoing" {
@@ -51,6 +53,15 @@ fn bundle_version(bundle: &Path) -> Result<String, String> {
 }
 
 fn verify_bundle(bundle: &Path) -> Result<String, String> {
+    // 新安装包必须使用当前标识；旧标识只用于替换目标和失败回滚。
+    let version = verify_existing_bundle(bundle)?;
+    if plist_value(bundle, "CFBundleIdentifier")? != BUNDLE_ID {
+        return Err("安装包未使用当前 Tramoing 应用标识".into());
+    }
+    Ok(version)
+}
+
+fn verify_existing_bundle(bundle: &Path) -> Result<String, String> {
     for path in [
         bundle.to_path_buf(),
         bundle.join("Contents/Info.plist"),
@@ -178,24 +189,26 @@ fn with_progress<T: Send + 'static>(
 }
 
 fn installed_destination(source: &Path) -> Result<PathBuf, String> {
-    let applications = NSRunningApplication::runningApplicationsWithBundleIdentifier(
-        &NSString::from_str(BUNDLE_ID),
-    );
-    for app in applications.iter() {
-        if let Some(path) = app.bundleURL().and_then(|url| url.path()) {
-            let path = PathBuf::from(path.to_string());
-            if path != source && !is_distribution_copy(&path) {
-                return Ok(path);
+    for identifier in [BUNDLE_ID, LEGACY_BUNDLE_ID] {
+        let applications = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            &NSString::from_str(identifier),
+        );
+        for app in applications.iter() {
+            if let Some(path) = app.bundleURL().and_then(|url| url.path()) {
+                let path = PathBuf::from(path.to_string());
+                if path != source && !is_distribution_copy(&path) {
+                    return Ok(path);
+                }
             }
         }
-    }
-    if let Some(path) = NSWorkspace::sharedWorkspace()
-        .URLForApplicationWithBundleIdentifier(&NSString::from_str(BUNDLE_ID))
-        .and_then(|url| url.path())
-    {
-        let path = PathBuf::from(path.to_string());
-        if path != source && path.is_dir() && !is_distribution_copy(&path) {
-            return Ok(path);
+        if let Some(path) = NSWorkspace::sharedWorkspace()
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str(identifier))
+            .and_then(|url| url.path())
+        {
+            let path = PathBuf::from(path.to_string());
+            if path != source && path.is_dir() && !is_distribution_copy(&path) {
+                return Ok(path);
+            }
         }
     }
     let user_applications =
@@ -222,28 +235,30 @@ fn installed_destination(source: &Path) -> Result<PathBuf, String> {
 }
 
 fn stop_previous_app(destination: &Path) -> Result<(), String> {
-    let applications = NSRunningApplication::runningApplicationsWithBundleIdentifier(
-        &NSString::from_str(BUNDLE_ID),
-    );
     let mut processes = Vec::new();
-    for app in applications.iter() {
-        let path = app
-            .bundleURL()
-            .and_then(|url| url.path())
-            .map(|p| PathBuf::from(p.to_string()));
-        if path
-            .as_deref()
-            .and_then(|path| path.canonicalize().ok())
-            .as_deref()
-            == Some(destination)
-        {
-            let pid = app.processIdentifier() as u32;
-            if pid != std::process::id() {
-                if let Some(start) = crate::procname::start_time(pid) {
-                    if !app.terminate() {
-                        return Err("请先退出已安装的 Tramoing，再重试安装".into());
+    for identifier in [BUNDLE_ID, LEGACY_BUNDLE_ID] {
+        let applications = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            &NSString::from_str(identifier),
+        );
+        for app in applications.iter() {
+            let path = app
+                .bundleURL()
+                .and_then(|url| url.path())
+                .map(|p| PathBuf::from(p.to_string()));
+            if path
+                .as_deref()
+                .and_then(|path| path.canonicalize().ok())
+                .as_deref()
+                == Some(destination)
+            {
+                let pid = app.processIdentifier() as u32;
+                if pid != std::process::id() {
+                    if let Some(start) = crate::procname::start_time(pid) {
+                        if !app.terminate() {
+                            return Err("请先退出已安装的 Tramoing，再重试安装".into());
+                        }
+                        processes.push((pid, start));
                     }
-                    processes.push((pid, start));
                 }
             }
         }
@@ -514,7 +529,7 @@ fn finish(directory: &Path, destination: &Path, pid: u32, start: (u64, u64)) -> 
     );
     if let Err(error) = result {
         if !previous.is_empty()
-            && verify_bundle(destination).is_ok_and(|version| version == previous)
+            && verify_existing_bundle(destination).is_ok_and(|version| version == previous)
         {
             let _ = open_application(destination, false);
         }
@@ -553,6 +568,10 @@ mod tests {
     use super::*;
 
     fn signed_fixture(path: &Path, version: &str) {
+        signed_fixture_with_id(path, version, BUNDLE_ID);
+    }
+
+    fn signed_fixture_with_id(path: &Path, version: &str, identifier: &str) {
         std::fs::create_dir_all(path.join("Contents/MacOS")).unwrap();
         let source = path.parent().unwrap().join("fixture.c");
         std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
@@ -574,7 +593,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(path.join("Contents/Info.plist"), format!(
-            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string><key>CFBundleExecutable</key><string>tramoing</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>{version}</string><key>CFBundleVersion</key><string>{version}</string></dict></plist>"
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{identifier}</string><key>CFBundleExecutable</key><string>tramoing</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>{version}</string><key>CFBundleVersion</key><string>{version}</string></dict></plist>"
         )).unwrap();
         command_output(
             Command::new("/usr/bin/codesign")
@@ -583,6 +602,26 @@ mod tests {
             "sign fixture",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn current_bundle_can_replace_a_legacy_install_but_legacy_payload_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Download.app");
+        let destination = root.path().join("Tramoing.app");
+        signed_fixture(&source, "1.1.0");
+        signed_fixture_with_id(&destination, "1.0.0", LEGACY_BUNDLE_ID);
+        assert!(verify_bundle(&destination).is_err());
+        assert_eq!(verify_existing_bundle(&destination).unwrap(), "1.0.0");
+        let prepared = prepare(&source, &destination, Some("1.1.0")).unwrap();
+        assert_eq!(
+            verify_bundle(&prepared.directory.path().join("Tramoing.app")).unwrap(),
+            "1.1.0"
+        );
+        assert_eq!(
+            plist_value(&destination, "CFBundleIdentifier").unwrap(),
+            LEGACY_BUNDLE_ID
+        );
     }
 
     #[test]

@@ -2,12 +2,13 @@
 //!
 //! Windows 拿「每进程流量」必须提权，所以把提权的那部分单独做成一个不带界面的
 //! 小程序：开机登录时以最高权限静默运行，开 ETW 会话，把每秒一帧的数据写进命名管道。
-//! 托盘程序始终保持普通权限，只读管道。
+//! 托盘程序始终保持普通权限；统计管道只读，网络控制使用独立的受限管道。
 //!
 //! 用法（需要在管理员终端里执行一次）：
 //!   tramoing-helper.exe --install       注册为登录自启（最高权限）并立即启动
 //!   tramoing-helper.exe --uninstall     停止并移除
 //!   tramoing-helper.exe --dump-events   诊断：把 ETW 原始事件写进日志，用于校准事件表
+//!   tramoing-helper.exe --clear-network-blocks  移除 Tramoing 创建的全部断网规则
 //!
 //! 所有输出写日志文件而不是控制台 —— 它是以隐藏窗口方式在后台跑的，
 //! 打印到 stdout 没人看得到。
@@ -36,14 +37,14 @@ mod win {
     use tm_windows::proc::PathCache;
     use tm_windows::scheduled_task::{self, TASK_NAME};
 
-    pub const LOG_HINT: &str = r"%LOCALAPPDATA%\TrafficMonitor\helper.log";
+    pub const LOG_HINT: &str = r"%LOCALAPPDATA%\Tramoing\helper.log";
 
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let has = |f: &str| args.iter().any(|a| a == f);
 
         if has("--help") || has("-h") {
-            log("用法: tramoing-helper [--install|--uninstall|--dump-events]");
+            log("用法: tramoing-helper [--install|--uninstall|--dump-events|--clear-network-blocks]");
             return;
         }
         if has("--install") {
@@ -51,6 +52,14 @@ mod win {
         }
         if has("--uninstall") {
             std::process::exit(uninstall());
+        }
+        if has("--clear-network-blocks") {
+            let result = tm_windows::firewall::Firewall::open().and_then(|f| f.remove_all());
+            if let Err(error) = result {
+                log(&error);
+                std::process::exit(1);
+            }
+            return;
         }
 
         run(has("--dump-events"));
@@ -60,7 +69,7 @@ mod win {
     fn run(dump_events: bool) -> ! {
         if dump_events {
             etw::set_dump_events(true);
-            log("已开启事件诊断模式（每条 ETW 事件写到 %LOCALAPPDATA%\\TrafficMonitor\\etw-dump.log）");
+            log("已开启事件诊断模式（每条 ETW 事件写到 %LOCALAPPDATA%\\Tramoing\\etw-dump.log）");
         }
         log("助手启动");
 
@@ -82,6 +91,14 @@ mod win {
                 std::process::exit(1);
             }
         };
+
+        std::thread::spawn(|| loop {
+            match tm_windows::network_control::Server::create() {
+                Ok(server) => server.run(log),
+                Err(error) => log(&error),
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        });
 
         // 采样不随 UI 是否连接而停止。原始 PID 表每秒取走，避免无人连接时无限积累。
         let latest = Arc::new((
@@ -178,15 +195,21 @@ mod win {
 
     fn uninstall() -> i32 {
         let _ = std::process::Command::new("schtasks")
+            .args(["/End", "/TN", scheduled_task::LEGACY_TASK_NAME])
+            .output();
+        let _ = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", scheduled_task::LEGACY_TASK_NAME, "/F"])
+            .output();
+        let _ = std::process::Command::new("schtasks")
             .args(["/End", "/TN", TASK_NAME])
             .output();
+        if let Err(error) = tm_windows::firewall::Firewall::open().and_then(|f| f.remove_all()) {
+            log(&format!("断网规则清理失败，保留程序以便恢复联网：{error}"));
+            return 1;
+        }
         let out = std::process::Command::new("schtasks")
             .args(["/Delete", "/TN", TASK_NAME, "/F"])
             .output();
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "tramoing-helper.exe", "/F"])
-            .output();
-
         match out {
             Ok(o) if o.status.success() => {
                 log("已移除自启任务");
@@ -230,7 +253,7 @@ mod win {
     fn log_path() -> std::path::PathBuf {
         let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_owned());
         std::path::Path::new(&base)
-            .join("TrafficMonitor")
+            .join(tm_core::identity::APP_NAME)
             .join("helper.log")
     }
 }

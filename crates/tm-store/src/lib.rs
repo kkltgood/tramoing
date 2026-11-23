@@ -20,6 +20,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use tm_core::AppKey;
 
 pub mod files;
+mod migration;
 
 /// 保留多少天的历史
 pub const RETENTION_DAYS: i64 = 30;
@@ -421,21 +422,34 @@ pub fn default_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("TM_DATA_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir).join("history.db");
     }
+    if let Some(base) = system_data_base() {
+        return base.join(tm_core::identity::APP_NAME).join("history.db");
+    }
+    PathBuf::from("history.db")
+}
+
+fn system_data_base() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home)
-                .join("Library/Application Support/TrafficMonitor")
-                .join("history.db");
-        }
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
     }
     #[cfg(windows)]
     {
-        if let Ok(base) = std::env::var("LOCALAPPDATA") {
-            return Path::new(&base).join("TrafficMonitor").join("history.db");
-        }
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
     }
-    PathBuf::from("history.db")
+    #[cfg(not(any(windows, target_os = "macos")))]
+    None
+}
+
+/// 新版本启动前导入旧数据；显式隔离目录/数据库的开发实例不接触用户数据。
+pub fn prepare_data_dir() -> Result<(), StoreError> {
+    if std::env::var_os("TM_DATA_DIR").is_some() || std::env::var_os("TM_DB_PATH").is_some() {
+        return Ok(());
+    }
+    if let Some(base) = system_data_base() {
+        migration::migrate(&base)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

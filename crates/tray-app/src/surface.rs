@@ -151,6 +151,9 @@ pub fn sparkline(painter: &Painter, rect: Rect, values: &[f64], color: Color32, 
     };
     let step = rect.width() / (crate::engine::TREND_SAMPLES - 1) as f32;
     let left = rect.right() - (values.len() - 1) as f32 * step;
+    // 紧凑卡片只在数值下方留一条趋势带，避免曲线穿过网速文字。
+    let baseline = rect.bottom() - 6.0;
+    let amplitude = 12.0;
     let mut points = Vec::with_capacity(values.len() * 6);
     for i in 0..values.len() - 1 {
         for sub in 0..6 {
@@ -163,13 +166,13 @@ pub fn sparkline(painter: &Painter, rect: Rect, values: &[f64], color: Color32, 
                 + (t3 - t2) * slope(i + 1);
             points.push(egui::pos2(
                 left + (i as f32 + t) * step,
-                rect.bottom() - 10.0 - v.clamp(0.0, 1.0) * 28.0,
+                baseline - v.clamp(0.0, 1.0) * amplitude,
             ));
         }
     }
     points.push(egui::pos2(
         rect.right(),
-        rect.bottom() - 10.0 - normalized[normalized.len() - 1] * 28.0,
+        baseline - normalized[normalized.len() - 1] * amplitude,
     ));
     area(
         painter,

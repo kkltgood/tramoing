@@ -20,7 +20,7 @@ ROOT=$PWD
 APP_NAME="Tramoing"
 APP_DISPLAY_NAME="Tramoing"
 BIN="tramoing"
-BUNDLE_ID="dev.guolongkang.trafficmonitor"
+BUNDLE_ID="dev.guolongkang.tramoing"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"

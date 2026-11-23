@@ -9,7 +9,7 @@
     <key>CFBundleIdentifier</key>
     <!-- 必须和 tray-app/src/autostart.rs 里的 LABEL 一致，
          否则「登录项与扩展」里会出现两个同名条目 -->
-    <string>dev.guolongkang.trafficmonitor</string>
+    <string>dev.guolongkang.tramoing</string>
     <key>CFBundleExecutable</key>
     <string>tramoing</string>
     <key>CFBundleIconFile</key>

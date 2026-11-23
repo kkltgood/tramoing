@@ -71,7 +71,7 @@ pub struct Settings {
     /// 启动后自动检查新版本。
     ///
     /// 新安装默认开启，读取官方 GitHub Releases；已有的关闭选择保持不变。
-    /// 设置页提供开关，版本号和 --check-update 提供手动检查入口。
+    /// 设置页提供开关，“检查更新”按钮和 --check-update 提供手动检查入口。
     pub update_check: bool,
     /// 上次检查更新的时刻（Unix 秒）。0 表示从没查过。
     ///
@@ -290,7 +290,7 @@ impl Settings {
             LangMode::En => "en",
         };
         format!(
-            "# TrafficMonitor 设置。删掉这个文件即恢复全部默认值。\n\
+            "# Tramoing 设置。删掉这个文件即恢复全部默认值。\n\
              tray_mode={tray}\n\
              theme={theme}\n\
              lang={lang}\n\

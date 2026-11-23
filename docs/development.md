@@ -36,7 +36,11 @@ CI 在 Windows 和 macOS 执行这些检查，并在 macOS 检查 Apple Silicon 
 
 Windows 使用独立的提权采集助手，主程序保持普通权限。两个可执行文件通过 `packaging/windows/resources.rs` 共享图标、版本信息和 manifest 构建逻辑。
 
-保持数据目录、计划任务 `TrafficMonitorHelper`、管道 `traffic-monitor-v1`、ETW 会话 `TrafficMonitor-Etw` 和 macOS bundle id `dev.guolongkang.trafficmonitor` 的兼容性；修改它们需要提供迁移方案。
+Windows 网络控制使用独立的账户 SID 命名管道；拒绝远程客户端，DACL 限定当前账户和 SYSTEM，Medium 完整性标签允许普通 UI 写入，双方校验对端 exe 路径，客户端另外核验助手的提升状态。消息有长度上限和总超时，只有 List / Set 两类请求。统计管道协议保持不变。WFP 的专用持久 sublayer 包含按 ALE_APP_ID 匹配的四条 block 规则，增加/移除使用事务；没有关联 provider，避免缺少 auto-start 服务的 provider 在 BFE 重启后使规则禁用。规则状态从系统读取，缓存仅用于保留恢复入口，不能作为成功依据。
+
+当前标识统一为：数据目录及 Windows Run 值 `Tramoing`、计划任务 `TramoingHelper`、统计管道 `tramoing-v1`、ETW 会话 `Tramoing-Etw`、macOS bundle / LaunchAgent id `dev.guolongkang.tramoing`。Windows 安装脚本为 `packaging/windows/tramoing.nsi`。Rust 共用标识集中在 `tm-core::identity`；旧名称仅出现在明确的 legacy 识别、迁移、清理代码及其回归测试中。
+
+数据迁移由主程序在打开设置、数据库和实例锁之前执行：锁住旧 UI，使用 SQLite 快照导入数据库（包括 WAL）、按缺失文件导入设置与 pending，最后写迁移标记；不覆盖新文件，保留旧目录备份。自启仅在旧项存在时迁移，禁用时同时清理旧项。Windows 安装器先停旧进程，注册新任务后清理旧任务、ETW、快捷方式、执行文件及注册项，主程序/助手必须成套升级。macOS 安装器接受旧 bundle 作为替换/回滚目标，新安装包只接受当前 id；旧程序内置更新器会拒绝新 id，首次跨标识升级需手动打开新版 DMG，之后恢复应用内更新。
 
 ## 隔离调试
 
@@ -83,6 +87,9 @@ TM_DATA_DIR="$PWD/target/demo-data" \
 | `TM_TRAY_PNG` / `TM_PERFORMANCE_PNG` | 配合 `TM_TRACE` 保存 macOS 菜单栏离屏渲染 |
 | `TM_CAPTURE_PPM` / `TM_CAPTURE_AFTER` | debug 演示实例保存面板渲染并退出；需设置 `TM_DATA_DIR` |
 | `TM_CAPTURE_STATE=list\|empty\|timeout\|disconnected` | 配合截图模式验证无底部提示的列表、空状态和错误布局 |
+| `TM_CAPTURE_STATE=network-add\|network-add-invalid\|network-add-offline` | Windows 添加应用面板：默认表单、路径错误、联网助手离线；仅注入演示状态，不修改系统网络规则 |
+| `TM_CAPTURE_STATE=settings-general\|settings-statusbar\|settings-statistics` | 设置页三个页签；可配合 `TM_SETTINGS_SCROLL` 检查长内容，Windows 截图实例不创建任务栏统计项 |
+| `TM_CAPTURE_STATE=settings-color-download\|settings-color-gpu` | 打开下载或 GPU 选色面板，检查深浅主题和中英文布局 |
 
 截图来自应用自身渲染，不代表真实桌面点击或焦点行为已通过验证。
 
@@ -103,7 +110,15 @@ powershell -ExecutionPolicy Bypass -File scripts\verify-windows-runtime.ps1 -Exe
 
 # 需要 NSIS 3；独立测试安装器回调，不提权、不操作正在使用的程序或采集任务
 powershell -ExecutionPolicy Bypass -File scripts\verify-windows-upgrade.ps1
+
+# 管理员终端：只阻断临时目录中的测试 exe 副本，失败时也尝试清理规则。
+# 覆盖 TCP/UDP、IPv4/IPv6、本机回环代理路径、已有连接、同名不同路径、恢复和已删除 exe 清理。
+cargo test -p tm-windows --test network_blocking wfp_blocks --locked -- --ignored --nocapture
 ```
+
+断网功能的发布验收还应在安装后的普通权限 UI 上覆盖：断网/恢复、助手错误提示、电脑重启后规则生效、应用退出重启、系统代理/TUN、卸载清理。管理员原生测试不替代这些环境验收，也不修改用户正在使用的软件规则。
+
+控制管道的两端权限验收入口也在 `network_blocking` 集成测试中：在隔离目录复制测试二进制为 `tramoing-helper.exe`、`tramoing.exe` 和 `probe.exe`，设置 `TM_CONTROL_VERIFY=1`；管理员运行前者的 `--exact control_pipe_server_child --ignored --nocapture`，普通权限运行后者的 `--exact control_pipe_client_child --ignored --nocapture`。服务端建立 `ready` 文件后客户端才连接；结束时创建同目录 `stop` 文件。服务端最多运行 90 秒，退出前清理测试目标规则；不应与正式新版助手同时运行，因为使用同一账户控制管道。
 
 macOS：
 
@@ -157,7 +172,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.4` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.5` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -174,15 +189,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.1.4` 为例）：
+发布步骤（以当前 `0.1.5` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.4.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.5.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.4 -m "Release v0.1.4"
-   git push opensource v0.1.4
+   git tag -a v0.1.5 -m "Release v0.1.5"
+   git push opensource v0.1.5
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -205,7 +220,7 @@ Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 
 
 默认更新源为 `https://github.com/kkltgood/tramoing/releases/latest/download/latest.json`，源码构建和官方安装包均可直接使用，不需要 GitHub 令牌，也不占用 GitHub API 的匿名请求配额。上面的发布流程自动提供该附件。首次发布带清单的版本前，检查会提示“更新清单尚未发布”，不会误报已是最新版。
 
-新安装默认 `update_check=on`；旧配置已有的 `update_check=off` 会保留，可在设置 → 软件更新中开启。自动检查有 10 秒启动延迟和 24 小时间隔；macOS 收起后不驱动界面帧，检查可能延迟至面板展开。手动检查使用软件更新里的按钮、设置页版本号或 `--check-update`，不受自动检查开关和间隔限制。`--mock` 不自动联网，但仍可显式手动检查。
+新安装默认 `update_check=on`；旧配置已有的 `update_check=off` 会保留，可在设置 → 通用 → 启动与更新中开启。自动检查有 10 秒启动延迟和 24 小时间隔；macOS 收起后不驱动界面帧，检查可能延迟至面板展开。手动检查使用该区域的“检查更新”按钮或 `--check-update`，不受自动检查开关和间隔限制。`--mock` 不自动联网，但仍可显式手动检查。
 
 发现新版本后，点击提示下载本平台安装包。下载在后台进行，核对文件大小及 SHA-256 后才显示安装入口；检查间隔到期也不会清除待下载提示或已就绪的安装包。Windows 点击“更新并重启”后以 `/UPDATE /APP_PID=<当前进程> /D=<当前程序目录>` 启动安装器。NSIS 要求 `/D=` 为最后一个参数，含空格时也不加引号。UAC 取消或启动失败时保留当前程序和下载包，界面显示重试入口；启动成功后程序正常退出并提交历史，安装器最多等待 15 秒，超时不改动安装文件。随后更新主程序及助手，只显示进度页，成功后通过 Explorer 以普通权限重新启动，保留配置、历史和自启设置。
 

@@ -35,7 +35,7 @@ pub const WINDOW_W: f32 = 408.0;
 /// 一个菜单栏弹窗本来就不该自己改尺寸 —— 固定之后，列表装不下就滚动，
 /// 设置页按可用高度滚动，切页/换数据时窗口一动不动。
 ///
-/// 两页使用相同尺寸，列表填满剩余高度并连续滚动，设置页固定底部开关区。
+/// 两页使用相同尺寸，列表填满剩余高度并连续滚动，设置页固定标题和页签。
 pub const PANEL_H: f32 = 482.0;
 const PANEL_PADDING: i8 = 16;
 
@@ -59,8 +59,6 @@ const FOOTER_H: f32 = 28.0;
 const FOOTER_BAND: f32 = 8.0 + 1.0 + 7.0 + FOOTER_H;
 /// 近 10 分钟超量提醒行的高度（只在真的有提醒时占位）
 const ALERT_H: f32 = 20.0;
-/// 设置页里的临时提示行高度
-const TOAST_H: f32 = 18.0;
 /// 启动后多久才去查更新。
 ///
 /// 开机自启的机器上，前几秒要先建窗口、拉起采样线程、扫一遍应用图标，
@@ -97,6 +95,8 @@ const NUM_GAP: f32 = 6.0;
 /// 行末图钉的独立点击区域，与速率列之间留一点空隙。
 const PIN_SIZE: f32 = 26.0;
 const PIN_GAP: f32 = 4.0;
+#[cfg(windows)]
+const NETWORK_BUTTON_W: f32 = PIN_SIZE;
 /// 右侧给滚动指示条留的过道。行盒不占这一条，指示条才不会压在描边上。
 const SCROLL_GUTTER: f32 = 9.0;
 /// 指示条宽度（自绘，不用 egui 自带的浮动把手）
@@ -153,6 +153,14 @@ pub enum View {
     Settings,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+enum SettingsTab {
+    #[default]
+    StatusBar,
+    Statistics,
+    General,
+}
+
 impl Window {
     pub fn all() -> [Window; 4] {
         [Window::Live, Window::Min1, Window::Min5, Window::Hour1]
@@ -191,7 +199,7 @@ enum TrayEvent {
     /// 用户点了任务栏上的网速或性能贴片（Windows 专属）。
     ///
     /// 和托盘点击分开记，是因为**锚点不一样**：贴片在任务栏条里，和托盘
-    /// 图标之间可能隔着一整个第三方插件（TrafficMonitor 那种）。按托盘
+    /// 图标之间可能隔着一整个第三方任务栏插件。按托盘
     /// 图标摆的话，点最左边的数字、面板却从右边托盘上方冒出来，看着像点
     /// 错了东西。这里直接以被点的贴片为锚点——点哪儿弹哪儿。
     #[cfg(windows)]
@@ -247,12 +255,17 @@ pub struct App {
     launch_at_login: bool,
     /// 用户设置（`settings.conf`）
     settings: Settings,
+    #[cfg(windows)]
+    network_access: crate::network_access::NetworkAccess,
+    #[cfg(windows)]
+    network_panel: crate::network_panel::NetworkPanel,
     /// 采样线程读取的保留天数，改设置后即时生效
     retention: Arc<AtomicI64>,
     /// 只由字体可用性决定的界面语言。`settings.lang` 为 Auto 时用它。
     font_lang: Lang,
     /// 当前是主面板还是设置页
     view: View,
+    settings_tab: SettingsTab,
     /// 切页动画：`(从哪一页切过来的, 开始时刻)`，播完就清空。
     ///
     /// 只有 `view` 停不住的地方才需要它：切页那一帧两页都得画 ——
@@ -439,9 +452,16 @@ impl App {
             } else {
                 View::Main
             },
+            settings_tab: SettingsTab::default(),
             // 首帧不播过渡：从托盘点开就直接是目标页
             transition: None,
             settings,
+            #[cfg(windows)]
+            network_access: crate::network_access::NetworkAccess::new(
+                std::env::var_os("TM_FORCE_MOCK").is_some(),
+            ),
+            #[cfg(windows)]
+            network_panel: crate::network_panel::NetworkPanel::default(),
             retention,
             // 调试用：TM_TOAST="导出 12 行" 让页脚一上来就带着提示，方便核对排版
             toast: std::env::var("TM_TOAST")
@@ -488,6 +508,35 @@ impl App {
         let app = {
             let mut app = app;
             app.ensure_tray();
+            #[cfg(debug_assertions)]
+            crate::ui_capture::prepare_network_panel(
+                &mut app.network_panel,
+                &mut app.network_access,
+                lang,
+            );
+            app
+        };
+
+        #[cfg(debug_assertions)]
+        let app = {
+            let mut app = app;
+            if crate::ui_capture::enabled() {
+                match std::env::var("TM_CAPTURE_STATE").as_deref() {
+                    Ok("settings-general") => {
+                        app.view = View::Settings;
+                        app.settings_tab = SettingsTab::General;
+                    }
+                    Ok("settings-statusbar" | "settings-color-download" | "settings-color-gpu") => {
+                        app.view = View::Settings;
+                        app.settings_tab = SettingsTab::StatusBar;
+                    }
+                    Ok("settings-statistics") => {
+                        app.view = View::Settings;
+                        app.settings_tab = SettingsTab::Statistics;
+                    }
+                    _ => {}
+                }
+            }
             app
         };
 
@@ -669,6 +718,8 @@ impl App {
         ) {
             return;
         }
+        #[cfg(windows)]
+        self.network_panel.close();
         self.park_window(ctx);
     }
 
@@ -937,6 +988,12 @@ impl App {
     fn sync_badge(&mut self, ctx: &egui::Context) {
         use crate::badge_window::BadgeState;
 
+        // 隔离截图可以展示已开启的设置，但不创建真实任务栏统计项。
+        #[cfg(debug_assertions)]
+        if crate::ui_capture::enabled() {
+            return;
+        }
+
         let state = if self.settings.tray_badge || self.settings.performance_enabled {
             let reading = self.performance.reading();
             Some(BadgeState {
@@ -1025,6 +1082,10 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.sync_tray_theme();
         self.drain_engine();
+        #[cfg(windows)]
+        if let Some(message) = self.network_access.tick(ctx) {
+            self.toast = Some((message, Instant::now()));
+        }
         self.sync_tray_title();
         #[cfg(target_os = "macos")]
         self.sync_performance_tray();
@@ -1293,6 +1354,37 @@ impl App {
                     );
                 }
             });
+
+        #[cfg(windows)]
+        if self.visible {
+            if let Some(path) =
+                self.network_panel
+                    .show(ctx, &mut self.network_access, &palette, lang)
+            {
+                let exists = self
+                    .settings
+                    .pinned_apps
+                    .iter()
+                    .any(|key| tm_windows::network_policy::same_path(key, &path));
+                if !exists {
+                    self.settings.toggle_pin(&path);
+                    self.settings.save();
+                }
+                self.next_list_scroll = Some(0.0);
+                self.toast = Some((
+                    format!(
+                        "{} · {}",
+                        pretty_name(&path),
+                        if exists {
+                            lang.t("已在列表中", "Already in the list")
+                        } else {
+                            lang.t("已添加到列表", "Added to list")
+                        }
+                    ),
+                    Instant::now(),
+                ));
+            }
+        }
     }
 
     /// 画一页。`dx` 是横向临时位移，`opacity` 是整页不透明度。
@@ -1398,12 +1490,10 @@ impl App {
         self.footer(ui, p, lang, bounds);
     }
 
-    /// 设置页。
+    /// 设置页按使用场景分组；页签和状态固定，选项区独立滚动。
     fn settings_body(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
-        let zh = matches!(lang, Lang::Zh);
-        let mut changed = false;
-
         let bounds = ui.max_rect();
+        let mut changed = false;
         let (header, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::hover());
         let back_rect = egui::Rect::from_min_size(header.min, Vec2::splat(30.0));
@@ -1413,317 +1503,275 @@ impl App {
         {
             self.goto(View::Main);
         }
-        ui.painter().text(
-            egui::pos2(header.left() + 40.0, header.center().y),
+        let title_rect = ui.painter().text(
+            header.left_center() + egui::vec2(40.0, 0.0),
             egui::Align2::LEFT_CENTER,
             lang.t("设置", "Settings"),
             theme::display_font(17.0),
             p.text,
         );
-        let version_rect =
-            egui::Rect::from_min_max(egui::pos2(header.right() - 58.0, header.top()), header.max);
-        let version = ui
-            .interact(
-                version_rect,
-                ui.id().with("version-check"),
-                egui::Sense::click(),
-            )
-            .on_hover_text(lang.t("检查更新", "Check for updates"));
-        ui.painter()
-            .rect_filled(version_rect.shrink2(egui::vec2(0.0, 3.0)), 12.0, p.chip);
-        surface::focus(ui.painter(), version_rect, &version, p);
-        if version.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        ui.painter().text(
-            version_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("v{}", crate::update::CURRENT),
-            egui::FontId::proportional(10.5),
-            if version.hovered() { p.accent } else { p.unit },
+        let status_rect = egui::Rect::from_min_max(
+            egui::pos2(title_rect.right() + 16.0, header.top()),
+            egui::pos2(header.right() - 2.0, header.bottom()),
         );
-        if version.clicked() {
-            self.check_update();
-        }
-        ui.add_space(12.0);
+        ui.add_space(6.0);
+        settings_tabs(ui, p, lang, &mut self.settings_tab);
+        ui.add_space(6.0);
 
-        // 中间选项独立滚动，标题、返回和开机自启始终留在原位。
-        // 提示区只在有内容时占位，平时滚动区一直延伸到页脚分隔线附近。
-        let has_status = self.update_text(lang).is_some()
-            || self
-                .toast
-                .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() < TOAST_TTL);
-        let line_y = bounds.bottom() - 42.0;
-        let status_height = if has_status { TOAST_H + 7.0 } else { 0.0 };
-        let options_height = (line_y - status_height - 8.0 - ui.cursor().top()).max(1.0);
-        let bar_dark = self.bar_is_dark();
-        ui.spacing_mut().scroll.floating_width = 3.0;
-        settings_scroll_area(options_height, self.initial_settings_scroll.take()).show(ui, |ui| {
-            ui.set_width(ui.available_width() - 8.0);
-            #[cfg(any(target_os = "macos", windows))]
-            {
-                self.performance_options(ui, p, lang, &mut changed);
-                ui.add_space(12.0);
-            }
-            settings_group(ui, p, lang.t("显示", "Display"), |ui| {
-                // ---- 菜单栏（只有 macOS 有这回事）----
-                //
-                // Windows 的任务栏托盘没有文字标题，这两项在那边是纯装饰：
-                // 调了不会有任何变化。宁可少两行，也不能给用户一个假的开关。
-                #[cfg(target_os = "macos")]
-                {
-                    if option_row(
-                        ui,
-                        p,
-                        lang.t("网速显示", "Network speed"),
-                        &mut self.settings.tray_mode,
-                        &[
-                            (TrayMode::Both, lang.t("全部", "Icon+Speed")),
-                            (TrayMode::SpeedOnly, lang.t("仅网速", "Speed")),
-                            (TrayMode::IconOnly, lang.t("仅图标", "Icon")),
-                        ],
-                    ) {
-                        changed = true;
+        let options_height = (bounds.bottom() - ui.cursor().top()).max(1.0);
+        // 分页各自保留滚动位置，滚动条独占空隙，不覆盖颜色输入与开关。
+        let scroll = &mut ui.spacing_mut().scroll;
+        scroll.floating = false;
+        scroll.bar_width = 3.0;
+        scroll.bar_inner_margin = 7.0;
+        scroll.bar_outer_margin = 0.0;
+        scroll.foreground_color = false;
+        let visuals = ui.visuals_mut();
+        visuals.extreme_bg_color = Color32::TRANSPARENT;
+        visuals.widgets.inactive.bg_fill = mix(p.border, p.subtext, 0.25);
+        visuals.widgets.hovered.bg_fill = mix(p.border, p.accent, 0.45);
+        visuals.widgets.active.bg_fill = p.accent;
+        settings_scroll_area(options_height, self.initial_settings_scroll.take())
+            .id_salt(("settings-options", self.settings_tab))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                match self.settings_tab {
+                    SettingsTab::General => self.general_options(ui, p, lang, &mut changed),
+                    SettingsTab::StatusBar => {
+                        self.status_bar_options(ui, p, lang, &mut changed);
                     }
-
-                    // ---- 菜单栏配色 ----
-                    // 彩色时下行绿、上行蓝；单色时全部跟随系统标签色。
-                    if option_row(
-                        ui,
-                        p,
-                        lang.t("网速配色", "Speed color"),
-                        &mut self.settings.tray_color,
-                        &[
-                            (true, lang.t("彩色", "Color")),
-                            (false, lang.t("单色", "Mono")),
-                        ],
-                    ) {
-                        changed = true;
-                    }
-                }
-
-                // ---- 任务栏（只有 Windows 有这回事）----
-                //
-                // Windows 数字由原生任务栏子窗口绘制，这里控制显示和配色。
-                #[cfg(windows)]
-                {
-                    if option_row(
-                        ui,
-                        p,
-                        lang.t("任务栏网速", "Tray speed"),
-                        &mut self.settings.tray_badge,
-                        &[
-                            (true, lang.t("显示", "Show")),
-                            (false, lang.t("隐藏", "Hide")),
-                        ],
-                    ) {
-                        changed = true;
-                    }
-
-                    if option_row(
-                        ui,
-                        p,
-                        lang.t("网速配色", "Speed color"),
-                        &mut self.settings.tray_color,
-                        &[
-                            (true, lang.t("彩色", "Color")),
-                            (false, lang.t("单色", "Mono")),
-                        ],
-                    ) {
-                        changed = true;
-                    }
-                }
-
-                if self.settings.tray_color {
-                    changed |= color_option_row(
-                        ui,
-                        p,
-                        lang,
-                        lang.t("下载颜色", "Download color"),
-                        &mut self.settings.display_colors.download,
-                        tm_core::color::download(bar_dark),
-                    );
-                    changed |= color_option_row(
-                        ui,
-                        p,
-                        lang,
-                        lang.t("上传颜色", "Upload color"),
-                        &mut self.settings.display_colors.upload,
-                        tm_core::color::upload(bar_dark),
-                    );
-                }
-
-                // ---- 外观 ----
-                if option_row(
-                    ui,
-                    p,
-                    lang.t("外观", "Appearance"),
-                    &mut self.settings.theme,
-                    &[
-                        (ThemeMode::System, lang.t("跟随系统", "System")),
-                        (ThemeMode::Light, lang.t("浅色", "Light")),
-                        (ThemeMode::Dark, lang.t("深色", "Dark")),
-                    ],
-                ) {
-                    changed = true;
-                }
-
-                // ---- 语言 ----
-                if option_row(
-                    ui,
-                    p,
-                    lang.t("语言", "Language"),
-                    &mut self.settings.lang,
-                    &[
-                        (LangMode::Auto, lang.t("自动", "Auto")),
-                        (LangMode::Zh, "中文"),
-                        (LangMode::En, "English"),
-                    ],
-                ) {
-                    changed = true;
+                    SettingsTab::Statistics => self.statistics_options(ui, p, lang, &mut changed),
                 }
             });
-            ui.add_space(12.0);
-            settings_group(ui, p, lang.t("统计", "Statistics"), |ui| {
-                // ---- 列表条数 ----
-                // 面板高度固定，所以这一项不再管「窗口多高」，而是「最多列几个应用」：
-                // 置顶项优先保留，超过上限仍可滚动查看。
-                if option_row(
-                    ui,
-                    p,
-                    lang.t("最多展示", "Max apps"),
-                    &mut self.settings.max_apps,
-                    &[(5, "5"), (10, "10"), (20, "20")],
-                ) {
-                    changed = true;
-                }
 
-                // ---- 历史保留 ----
-                if option_row(
-                    ui,
-                    p,
-                    lang.t("历史保留", "History"),
-                    &mut self.settings.retention_days,
-                    &[
-                        (7, if zh { "7 天" } else { "7d" }),
-                        (30, if zh { "30 天" } else { "30d" }),
-                        (90, if zh { "90 天" } else { "90d" }),
-                    ],
-                ) {
-                    changed = true;
-                }
-
-                // ---- 流量提醒 ----
-                if option_row(
-                    ui,
-                    p,
-                    lang.t("流量提醒", "Traffic alert"),
-                    &mut self.settings.alert_mb,
-                    &[
-                        (0, lang.t("关闭", "Off")),
-                        (100, "100M"),
-                        (500, "500M"),
-                        (1024, "1G"),
-                    ],
-                ) {
-                    changed = true;
-                }
-            });
-            ui.add_space(12.0);
-            settings_group(ui, p, lang.t("软件更新", "Software updates"), |ui| {
-                changed |= option_row(
-                    ui,
-                    p,
-                    lang.t("自动检查", "Auto check"),
-                    &mut self.settings.update_check,
-                    &[(false, lang.t("关闭", "Off")), (true, lang.t("开启", "On"))],
-                );
-                if ui
-                    .add_enabled(
-                        !self.update.is_busy(),
-                        egui::Button::new((
-                            egui::Atom::grow(),
-                            RichText::new(lang.t("检查更新", "Check for updates"))
-                                .size(12.0)
-                                .color(p.accent),
-                            egui::Atom::grow(),
-                        ))
-                        .min_size(Vec2::new(ui.available_width(), 30.0))
-                        .fill(p.chip)
-                        .stroke(Stroke::new(0.7_f32, p.border))
-                        .corner_radius(15),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    self.check_update();
-                }
-            });
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(lang.t(
-                            "每天检查 GitHub 新版本，确认更新后自动重启，保留设置和历史。",
-                            "Checks GitHub daily. Updating restarts the app and keeps settings and history.",
-                        ))
-                    .size(10.5)
-                    .color(p.subtext),
-                )
-                .wrap(),
-            );
-        });
-
-        if has_status {
-            let toast_rect = egui::Rect::from_min_size(
-                egui::pos2(bounds.left() + 2.0, line_y - TOAST_H - 7.0),
-                Vec2::new(bounds.width() - 4.0, TOAST_H),
-            );
-            let mut status = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt("settings-status")
-                    .max_rect(toast_rect),
-            );
-            self.toast_line(&mut status, p, lang);
-        }
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(bounds.left(), line_y),
-                egui::pos2(bounds.right(), line_y + 1.0),
-            ),
-            0.0,
-            p.border,
-        );
-        let row = egui::Rect::from_min_max(
-            egui::pos2(bounds.left() + 2.0, line_y + 6.0),
-            egui::pos2(bounds.right() - 2.0, bounds.bottom()),
-        );
-
-        // ---- 开机自启（状态来自系统，不是配置文件）----
-        let mut on = self.launch_at_login;
-        if toggle_row_at(ui, row, p, lang.t("开机自启", "Launch at login"), &mut on) {
-            match autostart::set_enabled(on) {
-                Ok(()) => {
-                    self.launch_at_login = on;
-                    self.toast = Some((
-                        match (zh, on) {
-                            (true, true) => "已开启开机自启".to_owned(),
-                            (true, false) => "已关闭开机自启".to_owned(),
-                            (false, true) => "Launch at login enabled".to_owned(),
-                            (false, false) => "Launch at login disabled".to_owned(),
-                        },
-                        Instant::now(),
-                    ));
-                }
-                Err(e) => self.toast = Some((e, Instant::now())),
-            }
-        }
-
+        self.settings_status(ui, p, lang, status_rect);
         if changed {
             self.apply_settings(ui.ctx());
         }
     }
 
+    fn general_options(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, changed: &mut bool) {
+        settings_group(ui, p, lang.t("界面外观", "Appearance"), |ui| {
+            *changed |= theme_options(ui, p, lang, &mut self.settings.theme);
+            ui.add_space(4.0);
+            *changed |= option_row(
+                ui,
+                p,
+                lang.t("界面语言", "Language"),
+                &mut self.settings.lang,
+                &[
+                    (LangMode::Auto, lang.t("自动", "Auto")),
+                    (LangMode::Zh, "中文"),
+                    (LangMode::En, "English"),
+                ],
+            );
+        });
+        ui.add_space(8.0);
+        settings_group(ui, p, lang.t("启动与更新", "Startup & updates"), |ui| {
+            let mut on = self.launch_at_login;
+            if toggle_row(ui, p, lang.t("开机自启", "Launch at login"), &mut on) {
+                match autostart::set_enabled(on) {
+                    Ok(()) => {
+                        self.launch_at_login = on;
+                        self.toast = Some((
+                            lang.t("已更新开机自启设置", "Startup preference updated")
+                                .into(),
+                            Instant::now(),
+                        ));
+                    }
+                    Err(error) => self.toast = Some((error, Instant::now())),
+                }
+            }
+            settings_separator(ui, p);
+            *changed |= toggle_row(
+                ui,
+                p,
+                lang.t("自动检查更新", "Auto check updates"),
+                &mut self.settings.update_check,
+            );
+            settings_separator(ui, p);
+            ui.horizontal(|ui| {
+                ui.set_height(38.0);
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} v{}",
+                        lang.t("当前版本", "Version"),
+                        crate::update::CURRENT,
+                    ))
+                    .size(11.0)
+                    .color(p.subtext),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if settings_action(
+                        ui,
+                        p,
+                        lang.t("检查更新", "Check now"),
+                        !self.update.is_busy(),
+                    )
+                    .clicked()
+                    {
+                        self.check_update();
+                    }
+                });
+            });
+        });
+    }
+
+    fn status_bar_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        lang: Lang,
+        changed: &mut bool,
+    ) {
+        let bar_dark = self.bar_is_dark();
+        settings_group(ui, p, lang.t("网速显示", "Network speed"), |ui| {
+            #[cfg(windows)]
+            {
+                *changed |= toggle_row(
+                    ui,
+                    p,
+                    lang.t("显示实时网速", "Show network speed"),
+                    &mut self.settings.tray_badge,
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                *changed |= option_row(
+                    ui,
+                    p,
+                    lang.t("显示内容", "Show"),
+                    &mut self.settings.tray_mode,
+                    &[
+                        (TrayMode::Both, lang.t("全部", "Icon+Speed")),
+                        (TrayMode::SpeedOnly, lang.t("仅网速", "Speed")),
+                        (TrayMode::IconOnly, lang.t("仅图标", "Icon")),
+                    ],
+                );
+            }
+            let show_colors = if cfg!(windows) {
+                self.settings.tray_badge
+            } else {
+                self.settings.tray_mode != crate::settings::TrayMode::IconOnly
+            };
+            if show_colors {
+                settings_separator(ui, p);
+                *changed |= option_row(
+                    ui,
+                    p,
+                    lang.t("配色模式", "Colors"),
+                    &mut self.settings.tray_color,
+                    &[
+                        (true, lang.t("彩色", "Color")),
+                        (false, lang.t("单色", "Mono")),
+                    ],
+                );
+                if self.settings.tray_color {
+                    *changed |= color_option_row(
+                        ui,
+                        p,
+                        lang,
+                        lang.t("下载", "Download"),
+                        &mut self.settings.display_colors.download,
+                        tm_core::color::download(bar_dark),
+                    );
+                    *changed |= color_option_row(
+                        ui,
+                        p,
+                        lang,
+                        lang.t("上传", "Upload"),
+                        &mut self.settings.display_colors.upload,
+                        tm_core::color::upload(bar_dark),
+                    );
+                }
+            } else {
+                settings_note(
+                    ui,
+                    p,
+                    lang.t(
+                        "开启后显示实时上传与下载速度。",
+                        "Show live upload and download speeds.",
+                    ),
+                );
+            }
+        });
+        ui.add_space(8.0);
+        #[cfg(any(target_os = "macos", windows))]
+        self.performance_options(ui, p, lang, changed);
+        #[cfg(windows)]
+        {
+            settings_note(
+                ui,
+                p,
+                lang.t(
+                    "按住任务栏中的统计项拖动，即可调整显示顺序。",
+                    "Drag the taskbar items to change their order.",
+                ),
+            );
+        }
+    }
+
+    fn statistics_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        lang: Lang,
+        changed: &mut bool,
+    ) {
+        settings_group(ui, p, lang.t("应用列表", "Application list"), |ui| {
+            *changed |= option_row(
+                ui,
+                p,
+                lang.t("最多展示", "Max apps"),
+                &mut self.settings.max_apps,
+                &[(5, "5"), (10, "10"), (20, "20")],
+            );
+            settings_note(
+                ui,
+                p,
+                lang.t(
+                    "置顶应用优先保留，超出可视区域后可滚动查看。",
+                    "Pinned apps stay first. Scroll to see more apps.",
+                ),
+            );
+        });
+        ui.add_space(8.0);
+        settings_group(ui, p, lang.t("历史与提醒", "History & alerts"), |ui| {
+            *changed |= option_row(
+                ui,
+                p,
+                lang.t("历史保留", "Keep history"),
+                &mut self.settings.retention_days,
+                &[
+                    (7, lang.t("7 天", "7 days")),
+                    (30, lang.t("30 天", "30 days")),
+                    (90, lang.t("90 天", "90 days")),
+                ],
+            );
+            settings_separator(ui, p);
+            *changed |= option_row(
+                ui,
+                p,
+                lang.t("流量提醒", "Traffic alert"),
+                &mut self.settings.alert_mb,
+                &[
+                    (0, lang.t("关闭", "Off")),
+                    (100, "100M"),
+                    (500, "500M"),
+                    (1024, "1G"),
+                ],
+            );
+            settings_note(
+                ui,
+                p,
+                lang.t(
+                    "单个应用在 10 分钟内超过所选流量时提醒。",
+                    "Alert when an app exceeds this amount in 10 minutes.",
+                ),
+            );
+        });
+    }
     fn bar_is_dark(&self) -> bool {
         #[cfg(windows)]
         {
@@ -1745,24 +1793,16 @@ impl App {
         lang: Lang,
         changed: &mut bool,
     ) {
-        let top = ui.cursor().top();
         let bar_dark = self.bar_is_dark();
-        settings_group(
-            ui,
-            p,
-            if cfg!(windows) {
-                lang.t("任务栏性能", "Taskbar performance")
-            } else {
-                lang.t("菜单栏性能", "Menu bar performance")
-            },
-            |ui| {
-                *changed |= option_row(
-                    ui,
-                    p,
-                    "CPU / GPU",
-                    &mut self.settings.performance_enabled,
-                    &[(false, lang.t("关闭", "Off")), (true, lang.t("开启", "On"))],
-                );
+        settings_group(ui, p, lang.t("性能监控", "Performance"), |ui| {
+            *changed |= toggle_row(
+                ui,
+                p,
+                lang.t("显示 CPU / GPU", "Show CPU / GPU"),
+                &mut self.settings.performance_enabled,
+            );
+            if self.settings.performance_enabled {
+                settings_separator(ui, p);
                 *changed |= option_row(
                     ui,
                     p,
@@ -1777,7 +1817,7 @@ impl App {
                 *changed |= option_row(
                     ui,
                     p,
-                    lang.t("性能配色", "Colors"),
+                    lang.t("配色模式", "Colors"),
                     &mut self.settings.performance_color,
                     &[
                         (true, lang.t("彩色", "Color")),
@@ -1789,7 +1829,7 @@ impl App {
                         ui,
                         p,
                         lang,
-                        lang.t("CPU 颜色", "CPU color"),
+                        "CPU",
                         &mut self.settings.display_colors.cpu,
                         tm_core::color::cpu(bar_dark),
                     );
@@ -1797,72 +1837,42 @@ impl App {
                         ui,
                         p,
                         lang,
-                        lang.t("GPU 颜色", "GPU color"),
+                        "GPU",
                         &mut self.settings.display_colors.gpu,
                         tm_core::color::gpu(bar_dark),
                     );
                 }
-            },
-        );
-        let line = egui::Rect::from_min_size(
-            egui::pos2(ui.max_rect().right() - 158.0, top),
-            Vec2::new(158.0, 18.0),
-        );
-        let reading = self.performance.reading();
-        let text = if self.performance.error.is_some() {
-            lang.t("采样未启动", "Sampler unavailable").to_owned()
-        } else if self.settings.performance_enabled {
-            format!(
-                "CPU {}    GPU {}",
-                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.cpu)),
-                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.gpu))
-            )
-        } else {
-            lang.t("上排 CPU · 下排 GPU", "CPU above GPU").to_owned()
-        };
-        ellipsis_text(ui.painter(), line, &text, 10.5, p.subtext, Align::Max);
-        let hint = if self.performance.error.is_some() {
-            lang.t(
-                "性能采样启动失败，请关闭后重新开启",
-                "Could not start; toggle off and on",
-            )
-        } else if !self.settings.performance_enabled {
-            lang.t(
-                "开启后在网速旁以同一组两行显示 CPU 和 GPU 使用率",
-                "Show CPU above GPU in one item beside network speed",
-            )
-        } else if reading
-            .as_ref()
-            .is_none_or(|r| r.cpu.is_none() && r.gpu.is_none())
-        {
-            lang.t("等待性能采样", "Waiting for performance sample")
-        } else if reading.as_ref().is_some_and(|r| r.gpu.is_none()) {
-            lang.t(
-                "GPU 驱动未提供利用率，使用 --% 表示不可用",
-                "GPU driver does not report utilization; --% means unavailable",
-            )
-        } else if cfg!(windows) {
-            lang.t(
-                "CPU 为整机平均占用；GPU 显示所有设备中最忙引擎的使用率",
-                "CPU is the system average; GPU is the busiest engine across all devices",
-            )
-        } else {
-            lang.t(
-                "CPU 为整机平均占用；多 GPU 显示最忙设备",
-                "CPU is the system average; GPU is the busiest device",
-            )
-        };
-        ui.interact(line, ui.id().with("performance-hint"), egui::Sense::hover())
-            .on_hover_text(hint);
-        #[cfg(windows)]
-        ui.label(
-            RichText::new(lang.t(
-                "在任务栏按住统计项拖动，即可调整顺序并自动保存",
-                "Drag taskbar items to reorder; changes are saved automatically.",
-            ))
-            .size(10.5)
-            .color(p.subtext),
-        );
+                let reading = self.performance.reading();
+                let text = if self.performance.error.is_some() {
+                    lang.t(
+                        "采样未启动，请关闭后重新开启。",
+                        "Sampler unavailable. Toggle off and on to retry.",
+                    )
+                    .to_owned()
+                } else {
+                    format!(
+                        "CPU {}    ·    GPU {}",
+                        crate::performance::menu_percent(reading.as_ref().and_then(|r| r.cpu)),
+                        crate::performance::menu_percent(reading.as_ref().and_then(|r| r.gpu))
+                    )
+                };
+                let hint = if cfg!(windows) {
+                    lang.t("CPU 为整机平均占用；GPU 显示最忙引擎的使用率，不可用时显示 --%。", "CPU is the system average; GPU shows the busiest engine. --% means unavailable.")
+                } else {
+                    lang.t("CPU 为整机平均占用；多 GPU 显示最忙设备，不可用时显示 --%。", "CPU is the system average; GPU shows the busiest device. --% means unavailable.")
+                };
+                settings_note(ui, p, &text).on_hover_text(hint);
+            } else {
+                settings_note(
+                    ui,
+                    p,
+                    lang.t(
+                        "在网速旁显示 CPU 与 GPU 使用率。",
+                        "Show CPU and GPU usage beside network speed.",
+                    ),
+                );
+            }
+        });
     }
 
     /// 设置改动后立刻生效并落盘。
@@ -1954,7 +1964,7 @@ impl App {
             ),
         };
 
-        const H: f32 = 102.0;
+        const H: f32 = 78.0;
         let trend = self
             .latest
             .as_ref()
@@ -2004,20 +2014,36 @@ impl App {
     /// 列表上方的一行：左边「应用 · N」，右边时间窗口分段控件。
     fn list_header(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
         // 和列表共用筛选逻辑，计数包含没有流量的置顶项。
-        let count = app_list_rates(self.latest.as_ref(), self.window, &self.settings).len();
+        let count = self.listed_rates().len();
 
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} · {count}", lang.t("应用", "Apps")))
-                    .font(theme::display_font(14.0))
-                    .color(p.text),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(Vec2::new(SEG_W, SEG_H), egui::Sense::hover());
-                segmented_at(ui, rect, &mut self.window, p, lang);
-            });
-        });
+        // 先按控件高度建立整行，再排文字；默认横排的初始高度较小，
+        // 后续按钮撑高后不会重新居中已排好的标签。
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), SEG_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(
+                    RichText::new(format!("{} · {count}", lang.t("应用", "Apps")))
+                        .font(theme::display_font(14.0))
+                        .color(p.text),
+                );
+                #[cfg(windows)]
+                self.network_panel.entry(ui, &self.network_access, p, lang);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::new(SEG_W, SEG_H), egui::Sense::hover());
+                    segmented_at(ui, rect, &mut self.window, p, lang);
+                });
+            },
+        );
+    }
+
+    fn listed_rates(&self) -> Vec<AppRate> {
+        let rates = app_list_rates(self.latest.as_ref(), self.window, &self.settings);
+        #[cfg(windows)]
+        let rates =
+            crate::network_access::keep_restricted_visible(rates, &self.network_access.rules);
+        rates
     }
 
     fn list(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, reveal: f32, has_alert: bool) {
@@ -2034,8 +2060,8 @@ impl App {
 
         // 先定下本帧列表：置顶项按固定顺序保留，剩余名额按采样器的流量排名填充。
         // 使用 owned 数据，下面才能 &mut self 取图标和切换置顶。
-        let rates = app_list_rates(self.latest.as_ref(), self.window, &self.settings);
-        let loading = self.latest.is_none();
+        let rates = self.listed_rates();
+        let loading = self.latest.is_none() && rates.is_empty();
         let note = if loading {
             None
         } else if let Some(error) = self.latest.as_ref().and_then(|s| s.error.as_deref()) {
@@ -2067,14 +2093,19 @@ impl App {
                 Layout::top_down(Align::Min),
                 |ui| self.skeleton(ui, p, rows),
             );
-        } else if let Some(text) = note {
+        } else if let Some(text) = note.filter(|_| rates.is_empty()) {
             empty_note(ui, text, avail, p);
         } else {
+            let note = note.map(str::to_owned);
             let out = app_list_scroll_area(avail, self.next_list_scroll.take()).show(ui, |ui| {
                 // 让出右侧过道：行盒的描边不能和指示条叠在一起
                 ui.set_width(ui.available_width() - SCROLL_GUTTER);
                 // 行距自己控制，不叠加默认 item_spacing。
                 ui.spacing_mut().item_spacing.y = 0.0;
+                if let Some(text) = note.as_deref() {
+                    ui.label(RichText::new(text).small().color(p.warn));
+                    ui.add_space(ROW_GAP);
+                }
                 let n = rates.len();
                 for (i, r) in rates.iter().enumerate() {
                     // 逐行错峰浮现：每行晚 14ms 开始，100ms 淡入
@@ -2212,6 +2243,8 @@ impl App {
         let width = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_BOX_H), egui::Sense::hover());
         let (resp, pin_resp) = app_row_actions(ui, rect, r.app.as_str(), &mut self.settings);
+        #[cfg(windows)]
+        let network_resp = network_row_action(ui, rect, r.app.as_str());
         let pinned = self.settings.is_pinned(r.app.as_str());
         if pin_resp.changed() {
             self.settings.save();
@@ -2319,6 +2352,8 @@ impl App {
             }
         ));
         let resp = resp.on_hover_text(format!("{}\n{}", name, tildify(r.app.as_str())));
+        #[cfg(windows)]
+        self.network_button(ui, &network_resp, r.app.as_str(), p);
         egui::Popup::from_toggle_button_response(&resp)
             .width(280.0)
             .frame(
@@ -2344,6 +2379,26 @@ impl App {
                     .wrap(),
                 );
                 ui.add_space(10.0);
+                #[cfg(windows)]
+                if self.network_access.rule(r.app.as_str()).is_some() {
+                    ui.colored_label(
+                        p.warn,
+                        if self.network_access.verified
+                            && self
+                                .network_access
+                                .rule(r.app.as_str())
+                                .is_some_and(|r| r.complete)
+                        {
+                            self.lang.t(
+                                "已断网 · 点击右侧恢复联网",
+                                "Blocked · use Allow to restore access",
+                            )
+                        } else {
+                            self.lang
+                                .t("断网规则待核验", "Network rules need verification")
+                        },
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("↓ {}", format_speed(r.rx_bps))).color(p.download),
@@ -2354,6 +2409,131 @@ impl App {
                     );
                 });
             });
+    }
+
+    #[cfg(windows)]
+    fn network_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        path: &str,
+        p: &Palette,
+    ) {
+        let restricted = self.network_access.rule(path).is_some();
+        let complete = self.network_access.verified
+            && self.network_access.rule(path).is_some_and(|r| r.complete);
+        let pending = self
+            .network_access
+            .pending_path
+            .as_deref()
+            .is_some_and(|p| tm_windows::network_policy::same_path(p, path));
+        let invalid = tm_windows::network_policy::validate_path(path).err();
+        let reason = invalid
+            .as_deref()
+            .or_else(|| self.network_access.unavailable_reason());
+        let enabled = reason.is_none() && !self.network_access.busy();
+        let label = if pending {
+            self.lang.t("正在修改网络权限", "Changing network access")
+        } else if restricted {
+            self.lang.t("恢复联网", "Allow network access")
+        } else {
+            self.lang.t("断网", "Block network access")
+        };
+        let color = if !enabled {
+            p.subtext
+        } else if restricted {
+            p.warn
+        } else {
+            p.accent
+        };
+        let background = mix(
+            p.surface,
+            color,
+            if response.hovered() && enabled {
+                0.18
+            } else {
+                0.08
+            },
+        );
+        let painter = ui.painter();
+        painter.rect(
+            response.rect.shrink(2.0),
+            CornerRadius::same(6),
+            background,
+            Stroke::new(0.7, mix(p.border, color, if complete { 0.7 } else { 0.3 })),
+            egui::StrokeKind::Inside,
+        );
+        let center = response.rect.center();
+        let stroke = Stroke::new(1.1, color);
+        if pending {
+            let phase = ui.input(|i| i.time) as f32 * 4.0;
+            let points = (0..=24)
+                .map(|i| {
+                    let angle = phase + i as f32 / 24.0 * std::f32::consts::TAU * 0.75;
+                    center + Vec2::angled(angle) * 5.8
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, Stroke::new(1.4, color)));
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        } else {
+            // 地球表示网络权限；仅在系统核验成功后画断网斜线。
+            painter.circle_stroke(center, 6.0, stroke);
+            painter.line_segment(
+                [center - Vec2::new(6.0, 0.0), center + Vec2::new(6.0, 0.0)],
+                stroke,
+            );
+            let meridian = (0..32)
+                .map(|i| {
+                    let angle = i as f32 / 32.0 * std::f32::consts::TAU;
+                    center + Vec2::new(2.7 * angle.cos(), 6.0 * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(meridian, stroke));
+            if complete {
+                let slash = [center - Vec2::splat(5.5), center + Vec2::splat(5.5)];
+                painter.line_segment(slash, Stroke::new(3.8, background));
+                painter.line_segment(slash, Stroke::new(1.5, color));
+            } else if restricted {
+                // 缓存或不完整规则仍提供恢复入口，以圆点标记待核验状态。
+                let badge = center + Vec2::new(5.0, -5.0);
+                painter.circle(badge, 2.5, background, Stroke::new(1.0, p.warn));
+                painter.circle_filled(badge, 0.7, p.warn);
+            }
+        }
+        surface::focus(painter, response.rect, response, p);
+        if enabled && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                enabled,
+                format!("{label} · {}", pretty_name(path)),
+            )
+        });
+        response.clone().on_hover_text(if pending {
+            label
+        } else if let Some(reason) = reason {
+            reason
+        } else if complete {
+                self.lang.t(
+                    "已断网 · 点击恢复联网",
+                    "Blocked · click to allow network access",
+                )
+            } else if restricted {
+                self.lang.t(
+                    "断网规则待核验 · 点击清除限制",
+                    "Rules need verification · click to remove",
+                )
+            } else {
+                self.lang.t(
+                    "允许联网 · 点击断网（包含本机代理连接，重启后保留）",
+                    "Allowed · click to block, including local proxy connections; persists across restarts",
+                )
+            });
+        if enabled && response.clicked() {
+            self.network_access.set(path, !restricted, ui.ctx());
+        }
     }
 
     /// 近 10 分钟单应用超过阈值时给一行提醒。阈值没配就什么都不画。
@@ -2533,8 +2713,7 @@ impl App {
 
     /// 更新状态对应的文案。`None` 表示这一帧没有要显示的。
     ///
-    /// 抽出来是因为主面板页脚和设置页提示行都要画它：点设置页的版本号
-    /// 也能触发检查，那边如果什么都不显示，用户会以为按钮坏了。
+    /// 主面板页脚和设置页标题共用；在「启动与更新」中检查后，切换页签仍能看到进度。
     fn update_text(&self, lang: Lang) -> Option<(String, bool)> {
         use crate::update::Phase;
         let zh = matches!(lang, Lang::Zh);
@@ -2658,11 +2837,9 @@ impl App {
         true
     }
 
-    /// 设置页的提示行。定高，过期自动消失。
-    ///
-    /// 更新状态优先于普通提示：版本号就挂在这一页的标题栏上，点完必须有个回声，
-    /// 否则用户不知道是「还在查」还是「按钮是假的」。
-    fn toast_line(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
+    /// 状态在标题右侧显示，不占用滚动区；长消息省略，悬停可查看全文。
+    /// 更新状态优先于普通提示，没有消息时说明设置会自动保存。
+    fn settings_status(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, rect: egui::Rect) {
         if self
             .toast
             .as_ref()
@@ -2672,36 +2849,46 @@ impl App {
         }
         let update = self.update_text(lang);
         let actionable = update.as_ref().is_some_and(|(_, a)| *a);
-        let rect =
-            egui::Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), TOAST_H));
+        let text = update
+            .as_ref()
+            .map(|(text, _)| text.as_str())
+            .or_else(|| self.toast.as_ref().map(|(text, _)| text.as_str()))
+            .unwrap_or_else(|| {
+                lang.t(
+                    "更改即时生效 · 自动保存",
+                    "Changes apply and save automatically",
+                )
+            });
         let sense = if actionable {
             egui::Sense::click()
         } else {
             egui::Sense::hover()
         };
-        let mut resp = ui.allocate_rect(rect, sense);
+        let mut resp = ui
+            .interact(rect, ui.id().with("settings-status"), sense)
+            .on_hover_text(text);
         if actionable {
-            resp = resp.on_hover_text(lang.t("点击继续", "Click to continue"));
+            resp = resp
+                .on_hover_text(lang.t("点击继续", "Click to continue"))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text)
+            });
+            surface::focus(ui.painter(), rect, &resp, p);
         }
-
-        if let Some((text, _)) = &update {
-            resp = resp.on_hover_text(text);
-            let color = if matches!(&self.update.phase, crate::update::Phase::Error(_)) {
-                p.warn
-            } else if actionable && resp.hovered() {
-                p.accent
-            } else {
-                p.subtext
-            };
-            ellipsis_text(ui.painter(), rect, text, 10.0, color, Align::Min);
-            if actionable && resp.clicked() {
-                self.update_action(ui.ctx());
-            }
-            return;
+        let color = if matches!(&self.update.phase, crate::update::Phase::Error(_)) {
+            p.warn
+        } else if actionable {
+            p.accent
+        } else if update.is_some() || self.toast.is_some() {
+            p.subtext
+        } else {
+            p.unit
+        };
+        ellipsis_text(ui.painter(), rect, text, 10.5, color, Align::Max);
+        if actionable && resp.clicked() {
+            self.update_action(ui.ctx());
         }
-
-        let Some((msg, _)) = &self.toast else { return };
-        ellipsis_text(ui.painter(), rect, msg, 10.0, p.subtext, Align::Min);
     }
 
     /// 把库里全部历史写成 CSV。
@@ -2839,35 +3026,205 @@ fn ellipsis_text(
         .galley(egui::pos2(x, y), galley, color);
 }
 
+fn settings_tabs(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut SettingsTab) {
+    let (bar, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), egui::Sense::hover());
+    ui.painter().rect_filled(bar, 11.0, p.chip);
+    let options = [
+        (
+            SettingsTab::StatusBar,
+            if cfg!(windows) {
+                lang.t("任务栏", "Taskbar")
+            } else {
+                lang.t("菜单栏", "Menu bar")
+            },
+        ),
+        (SettingsTab::Statistics, lang.t("统计", "Statistics")),
+        (SettingsTab::General, lang.t("通用", "General")),
+    ];
+    let width = (bar.width() - 6.0) / options.len() as f32;
+    for (i, (tab, label)) in options.into_iter().enumerate() {
+        let rect = egui::Rect::from_min_size(
+            bar.min + egui::vec2(3.0 + i as f32 * width, 3.0),
+            Vec2::new(width, 28.0),
+        );
+        let response = ui
+            .interact(
+                rect,
+                ui.id().with(("settings-tab", tab)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let selected = *current == tab;
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, label)
+        });
+        if selected {
+            ui.painter().rect(
+                rect,
+                8.0,
+                p.surface,
+                Stroke::new(0.7, p.border),
+                egui::StrokeKind::Inside,
+            );
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 8.0, mix(p.chip, p.surface, 0.5));
+        }
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            if selected { p.accent } else { p.subtext },
+        );
+        surface::focus(ui.painter(), rect, &response, p);
+        if response.clicked() {
+            *current = tab;
+        }
+    }
+}
+
+fn theme_options(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut ThemeMode) -> bool {
+    let (row, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), egui::Sense::hover());
+    let width = (row.width() - 16.0) / 3.0;
+    let before = *current;
+    for (i, (mode, label)) in [
+        (ThemeMode::System, lang.t("跟随系统", "System")),
+        (ThemeMode::Light, lang.t("浅色", "Light")),
+        (ThemeMode::Dark, lang.t("深色", "Dark")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = egui::Rect::from_min_size(
+            row.min + egui::vec2(i as f32 * (width + 8.0), 0.0),
+            Vec2::new(width, row.height()),
+        );
+        let response = ui
+            .interact(
+                rect,
+                ui.id().with(("theme-preset", i)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let selected = *current == mode;
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, label)
+        });
+        ui.painter().rect(
+            rect,
+            9.0,
+            if selected || response.hovered() {
+                mix(p.surface, p.accent, 0.07)
+            } else {
+                mix(p.surface, p.chip, 0.35)
+            },
+            Stroke::new(
+                if selected { 1.2 } else { 0.7 },
+                if selected { p.accent } else { p.border },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let preview = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 22.0),
+            Vec2::new(38.0, 24.0),
+        );
+        let light = Color32::from_rgb(235, 241, 253);
+        let dark = Color32::from_rgb(35, 49, 77);
+        let base = if mode == ThemeMode::Dark { dark } else { light };
+        ui.painter().rect_filled(preview, 4.0, base);
+        if mode == ThemeMode::System {
+            ui.painter()
+                .with_clip_rect(egui::Rect::from_min_max(preview.center_top(), preview.max))
+                .rect_filled(preview, 4.0, dark);
+        }
+        ui.painter().rect_stroke(
+            preview,
+            4.0,
+            Stroke::new(0.6, mix(p.border, p.accent, 0.25)),
+            egui::StrokeKind::Inside,
+        );
+        for (offset, width) in [(7.0, 25.0), (13.0, 16.0)] {
+            let line = egui::Rect::from_min_size(
+                preview.min + egui::vec2(6.0, offset),
+                Vec2::new(width, 3.0),
+            );
+            ui.painter().rect_filled(
+                line,
+                1.5,
+                if mode == ThemeMode::Dark {
+                    Color32::from_rgb(133, 170, 222)
+                } else {
+                    Color32::from_rgb(88, 143, 235)
+                },
+            );
+        }
+        ui.painter().text(
+            egui::pos2(rect.center().x, rect.bottom() - 14.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(11.0),
+            if selected { p.accent } else { p.text },
+        );
+        surface::focus(ui.painter(), rect, &response, p);
+        if response.clicked() {
+            *current = mode;
+        }
+    }
+    before != *current
+}
+
+fn settings_action(ui: &mut egui::Ui, p: &Palette, text: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(text).size(11.0).color(p.accent))
+            .min_size(Vec2::new(82.0, 27.0))
+            .fill(mix(p.surface, p.accent, 0.07))
+            .stroke(Stroke::new(0.7, mix(p.border, p.accent, 0.15)))
+            .corner_radius(8),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn settings_note(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
+    ui.add_space(4.0);
+    let response = ui.add(egui::Label::new(RichText::new(text).size(10.5).color(p.subtext)).wrap());
+    ui.add_space(4.0);
+    response
+}
+
+fn settings_separator(ui: &mut egui::Ui, p: &Palette) {
+    let (line, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [line.left_center(), line.right_center()],
+        Stroke::new(0.7, p.border),
+    );
+}
+
 fn settings_group(ui: &mut egui::Ui, p: &Palette, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     let (label, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), egui::Sense::hover());
-    ui.painter().rect_filled(
-        egui::Rect::from_center_size(
-            label.left_center() + egui::vec2(3.0, 0.0),
-            Vec2::new(3.0, 10.0),
-        ),
-        1.5,
-        p.accent,
-    );
     ui.painter().text(
-        label.left_center() + egui::vec2(12.0, 0.0),
+        label.left_center() + egui::vec2(3.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
         theme::display_font(12.0),
         p.subtext,
     );
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     let width = ui.available_width();
     egui::Frame::NONE
         .fill(p.surface)
         .stroke(Stroke::new(0.7_f32, p.border))
         .corner_radius(CornerRadius::same(12))
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.set_width(width - 21.4);
+            ui.set_width(width - 25.4);
             ui.spacing_mut().item_spacing.y = 0.0;
-            body(ui);
+            ui.push_id(title, |ui| body(ui));
         });
 }
 
@@ -2879,7 +3236,7 @@ fn option_row<T: Copy + PartialEq>(
     current: &mut T,
     options: &[(T, &str)],
 ) -> bool {
-    const ROW_H: f32 = 34.0;
+    const ROW_H: f32 = 38.0;
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_H), egui::Sense::hover());
     let painter = ui.painter();
@@ -2887,8 +3244,8 @@ fn option_row<T: Copy + PartialEq>(
     // 各组选项共用起点；两档、三档、四档都在同一列内均分。
     let ctl_w = 218.0_f32.min(rect.width() * 0.65);
     let ctl = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - ctl_w, rect.top() + 3.0),
-        egui::pos2(rect.right(), rect.bottom() - 3.0),
+        egui::pos2(rect.right() - ctl_w, rect.top() + 5.0),
+        egui::pos2(rect.right(), rect.bottom() - 5.0),
     );
     let label_rect = egui::Rect::from_min_max(
         rect.min + egui::vec2(2.0, 0.0),
@@ -2901,7 +3258,7 @@ fn option_row<T: Copy + PartialEq>(
         egui::Sense::hover(),
     )
     .on_hover_text(label);
-    painter.rect_filled(ctl, CornerRadius::same(14), p.chip);
+    painter.rect_filled(ctl, 8.0, mix(p.surface, p.chip, 0.7));
 
     let item_w = ctl.width() / options.len() as f32;
 
@@ -2916,7 +3273,13 @@ fn option_row<T: Copy + PartialEq>(
             egui::pos2(ctl.left() + pos * item_w, ctl.top()),
             Vec2::new(item_w, ctl.height()),
         );
-        surface::pill(ui.painter(), pill.shrink(2.0), p);
+        ui.painter().rect(
+            pill.shrink(2.0),
+            6.0,
+            p.surface,
+            Stroke::new(0.7, mix(p.border, p.accent, 0.12)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     let mut changed = false;
@@ -2940,7 +3303,7 @@ fn option_row<T: Copy + PartialEq>(
             if !selected {
                 ui.painter().rect_filled(
                     r.shrink(2.0),
-                    CornerRadius::same(12),
+                    CornerRadius::same(6),
                     p.accent.gamma_multiply(0.10),
                 );
             }
@@ -2951,7 +3314,7 @@ fn option_row<T: Copy + PartialEq>(
             r.shrink2(egui::vec2(3.0, 0.0)),
             text,
             10.5,
-            if selected { p.on_selection } else { p.subtext },
+            if selected { p.accent } else { p.subtext },
             Align::Center,
         );
 
@@ -2973,10 +3336,8 @@ fn color_option_row(
     current: &mut Option<tm_core::color::Rgb>,
     automatic: tm_core::color::Rgb,
 ) -> bool {
-    use tm_core::color::Rgb;
-    let before = *current;
     let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), egui::Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::hover());
     let ctl_w = 218.0_f32.min(rect.width() * 0.65);
     let ctl = egui::Rect::from_min_max(
         egui::pos2(rect.right() - ctl_w, rect.top() + 3.0),
@@ -2993,67 +3354,18 @@ fn color_option_row(
             .max_rect(ctl)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    row.spacing_mut().item_spacing.x = 6.0;
-    row.spacing_mut().interact_size = Vec2::new(32.0, 24.0);
-    let color = current.unwrap_or(automatic);
-    let mut srgb = [color.0, color.1, color.2];
-    let swatch = row.color_edit_button_srgb(&mut srgb).on_hover_text(lang.t(
-        "点击选择颜色，也可输入 #RRGGBB",
-        "Pick a color or enter #RRGGBB",
-    ));
-    swatch.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
-    if swatch.changed() {
-        *current = Some(Rgb(srgb[0], srgb[1], srgb[2]));
-    }
-
-    let draft_id = row.id().with("hex-draft");
-    let mut draft = row
-        .data(|data| data.get_temp::<String>(draft_id))
-        .unwrap_or_else(|| current.unwrap_or(automatic).to_hex());
-    if swatch.changed() {
-        draft = current.unwrap_or(automatic).to_hex();
-    }
-    let input = row.add_sized(
-        [86.0, 24.0],
-        egui::TextEdit::singleline(&mut draft)
-            .font(egui::TextStyle::Monospace)
-            .char_limit(7)
-            .hint_text("#RRGGBB"),
-    );
-    input.clone().on_hover_text(format!("{label} · #RRGGBB"));
-    if input.changed() {
-        if let Some(color) = Rgb::from_hex(&draft) {
-            *current = Some(color);
-        }
-    }
-    let reset = row
-        .add_enabled(
-            current.is_some(),
-            egui::Button::new(lang.t("默认", "Default")).min_size(Vec2::new(56.0, 24.0)),
-        )
-        .on_hover_text(lang.t(
-            "恢复随系统明暗切换的默认颜色",
-            "Restore the color for the system theme",
-        ));
-    if reset.clicked() {
-        *current = None;
-    }
-    // has_focus 会读取 Context，必须在持有 data_mut 写锁之前查询。
-    let keep_draft = input.has_focus() && !reset.clicked();
-    row.data_mut(|data| {
-        if keep_draft {
-            data.insert_temp(draft_id, draft);
-        } else {
-            data.remove::<String>(draft_id);
-        }
-    });
-    *current != before
+    row.visuals_mut().selection.bg_fill = p.selection;
+    row.visuals_mut().selection.stroke = Stroke::new(1.0, p.on_selection);
+    crate::color_picker::controls(&mut row, ctl, p, lang, label, current, automatic)
 }
 
 /// 设置项：左边标签，右边一个开关。返回是否被点击。
-///
-/// 行矩形由调用方给定，不走流式布局：设置页底部那行要贴着面板底边定位
-/// （见 `settings_body` 的注释），位置不能再让游标决定。
+fn toggle_row(ui: &mut egui::Ui, p: &Palette, label: &str, on: &mut bool) -> bool {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), egui::Sense::hover());
+    toggle_row_at(ui, rect, p, label, on)
+}
+
 fn toggle_row_at(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -3063,13 +3375,16 @@ fn toggle_row_at(
 ) -> bool {
     // 整行都能点，比只点那个小圆点好按
     let resp = ui.interact(rect, ui.id().with(("toggle", label)), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+    });
 
     let painter = ui.painter();
     painter.text(
         egui::pos2(rect.left() + 2.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(12.0),
         p.text,
     );
 
@@ -3250,36 +3565,70 @@ fn action_button(
 fn paint_pin_button(ui: &egui::Ui, response: &egui::Response, pinned: bool, p: &Palette) {
     let rect = response.rect;
     let painter = ui.painter();
-    if response.hovered() {
-        painter.rect_filled(rect.shrink(2.0), 6.0, p.accent.gamma_multiply(0.07));
+    let hovered = response.hovered();
+    let pressed = response.is_pointer_button_down_on();
+    if pinned || hovered || pressed {
+        let tint = if pressed {
+            0.21
+        } else if hovered {
+            0.15
+        } else {
+            0.09
+        };
+        painter.rect(
+            rect.shrink(2.0),
+            CornerRadius::same(6),
+            mix(p.surface, p.accent, tint),
+            Stroke::new(
+                0.7,
+                mix(p.border, p.accent, if pinned { 0.28 } else { 0.12 }),
+            ),
+            egui::StrokeKind::Inside,
+        );
     }
-    let color = if pinned || response.hovered() {
+    let color = if pinned || hovered || pressed {
         p.accent
     } else {
-        p.subtext.gamma_multiply(0.65)
+        mix(p.surface, p.subtext, 0.78)
     };
     let c = rect.center();
-    // 原轮廓倾斜 45°，回转 30° 后只保留 15° 的轻微倾斜。
-    // 只缩小可见图形，点击区域仍保持易于操作的尺寸。
-    let rotation = egui::emath::Rot2::from_angle(-30.0_f32.to_radians());
-    let at = |x, y| c + rotation * egui::vec2(x, y) * 0.50;
-    let stroke = Stroke::new(if pinned { 1.2_f32 } else { 1.0_f32 }, color);
-    painter.add(egui::Shape::closed_line(
+    let at = |x, y| c + egui::vec2(x, y);
+    let stroke = Stroke::new(1.25, color);
+
+    // 正立、对称的图钉：圆头横帽、收窄的颈部和清楚的针尖。
+    // 实心/描边也表达选中状态，不只依赖颜色；点击范围仍是 26pt。
+    if pinned {
+        painter.rect_filled(
+            egui::Rect::from_min_max(at(-2.5, -5.2), at(2.5, -1.0)),
+            0.0,
+            color,
+        );
+        painter.add(egui::Shape::convex_polygon(
+            vec![at(-2.5, -1.1), at(2.5, -1.1), at(4.4, 2.3), at(-4.4, 2.3)],
+            color,
+            Stroke::NONE,
+        ));
+    }
+    painter.add(egui::Shape::line(
         vec![
-            at(4.0, -9.0),
-            at(9.0, -4.0),
-            at(5.0, -3.0),
-            at(2.0, 0.0),
-            at(1.0, 4.0),
-            at(-4.0, -1.0),
-            at(0.0, -2.0),
-            at(3.0, -5.0),
+            at(-2.5, -5.2),
+            at(-2.5, -1.1),
+            at(-4.4, 2.3),
+            at(4.4, 2.3),
+            at(2.5, -1.1),
+            at(2.5, -5.2),
         ],
         stroke,
     ));
-    painter.line_segment([at(-1.5, 1.5), at(-8.0, 8.0)], stroke);
+    painter.rect_filled(
+        egui::Rect::from_center_size(at(0.0, -5.2), Vec2::new(7.6, 1.25)),
+        0.6,
+        color,
+    );
+    painter.line_segment([at(0.0, 2.3), at(0.0, 6.0)], stroke);
+    painter.circle_filled(at(0.0, 6.0), 0.625, color);
     surface::focus(painter, rect, response, p);
-    if response.hovered() {
+    if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 }
@@ -3400,9 +3749,30 @@ fn app_list_rates(
 }
 
 fn pin_button_rect(row: egui::Rect) -> egui::Rect {
+    #[cfg(windows)]
+    let row = egui::Rect::from_min_max(
+        row.min,
+        row.max - Vec2::new(NETWORK_BUTTON_W + PIN_GAP, 0.0),
+    );
     egui::Rect::from_center_size(
         egui::pos2(row.right() - ROW_PAD_X - PIN_SIZE / 2.0, row.center().y),
         Vec2::splat(PIN_SIZE),
+    )
+}
+
+#[cfg(windows)]
+fn network_row_action(ui: &mut egui::Ui, row: egui::Rect, app: &str) -> egui::Response {
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(
+            row.right() - ROW_PAD_X - NETWORK_BUTTON_W / 2.0,
+            row.center().y,
+        ),
+        Vec2::new(NETWORK_BUTTON_W, PIN_SIZE),
+    );
+    ui.interact(
+        rect,
+        ui.id().with(("app-network", app)),
+        egui::Sense::click(),
     )
 }
 
@@ -3607,7 +3977,7 @@ fn metric(
     );
 
     let down = arrow == "↓";
-    let circle = egui::pos2(rect.left() + 26.0, rect.top() + 47.0);
+    let circle = egui::pos2(rect.left() + 26.0, rect.top() + 41.0);
     let disc = egui::Rect::from_center_size(circle, Vec2::splat(28.0));
     let disc_top = mix(p.surface, color, if p.dark { 0.82 } else { 0.20 });
     let disc_bottom = mix(p.surface, color, if p.dark { 0.53 } else { 0.40 });
@@ -3628,13 +3998,13 @@ fn metric(
     let text_left = rect.left() + 56.0;
     surface::direction(
         painter,
-        egui::pos2(text_left + 3.0, rect.top() + 22.0),
+        egui::pos2(text_left + 3.0, rect.top() + 18.0),
         down,
         3.8,
         color,
     );
     painter.text(
-        egui::pos2(text_left + 12.0, rect.top() + 22.0),
+        egui::pos2(text_left + 12.0, rect.top() + 18.0),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.0),
@@ -3668,7 +4038,7 @@ fn metric(
                     value_color,
                 );
             }
-            let bottom = rect.top() + 64.0;
+            let bottom = rect.top() + 58.0;
             let unit_left = text_left + number.size().x + 5.0;
             painter.galley(
                 egui::pos2(text_left, bottom - number.size().y),
@@ -3684,7 +4054,7 @@ fn metric(
         None => {
             painter.rect_filled(
                 egui::Rect::from_min_size(
-                    egui::pos2(text_left, rect.top() + 43.0),
+                    egui::pos2(text_left, rect.top() + 37.0),
                     Vec2::new(w - 70.0, 16.0),
                 ),
                 5.0,
@@ -4330,6 +4700,60 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn network_button_accepts_click_and_keyboard_without_pin_or_details_actions() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings::default();
+        let mut location = egui::Pos2::ZERO;
+        let mut network_id = None;
+        for frame in 0..4 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(WINDOW_W, PANEL_H),
+                )),
+                time: Some(frame as f64 / 60.0),
+                ..Default::default()
+            };
+            if matches!(frame, 1 | 2) {
+                input.events.push(egui::Event::PointerMoved(location));
+                input.events.push(egui::Event::PointerButton {
+                    pos: location,
+                    button: egui::PointerButton::Primary,
+                    pressed: frame == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            if frame == 3 {
+                ctx.memory_mut(|m| m.request_focus(network_id.unwrap()));
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (row, _) =
+                        ui.allocate_exact_size(Vec2::new(360.0, ROW_BOX_H), egui::Sense::hover());
+                    let (details, pin) = app_row_actions(ui, row, "test.exe", &mut settings);
+                    let network = network_row_action(ui, row, "test.exe");
+                    assert!(!network.rect.intersects(pin.rect));
+                    assert!(!network.rect.intersects(details.rect));
+                    assert!(!details.clicked());
+                    assert!(!pin.clicked());
+                    assert_eq!(network.clicked(), frame >= 2);
+                    location = network.rect.center();
+                    network_id = Some(network.id);
+                });
+            });
+            assert!(settings.pinned_apps.is_empty());
+        }
+    }
+
     fn scroll_frame(
         ctx: &egui::Context,
         frame: usize,
@@ -4534,6 +4958,111 @@ mod tests {
                 if frame >= 3 {
                     assert_eq!(window, Window::Hour1);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_tabs_theme_tiles_and_switches_accept_pointer_and_keyboard() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            theme::install_cjk(&ctx);
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            let p = theme::palette(dark);
+            let mut tab = SettingsTab::default();
+            let mut appearance = ThemeMode::System;
+            let mut enabled = false;
+            let mut tab_at = egui::Pos2::ZERO;
+            let mut theme_at = egui::Pos2::ZERO;
+            let mut tab_id = egui::Id::NULL;
+            let mut theme_id = egui::Id::NULL;
+            let mut toggle_id = egui::Id::NULL;
+            for frame in 0..10 {
+                let mut events = Vec::new();
+                if matches!(frame, 1 | 2 | 4 | 5) {
+                    let pos = if frame < 3 { tab_at } else { theme_at };
+                    events.push(egui::Event::PointerMoved(pos));
+                    events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: matches!(frame, 1 | 4),
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                if matches!(frame, 3 | 6 | 8) {
+                    ctx.memory_mut(|m| {
+                        m.request_focus(match frame {
+                            3 => tab_id,
+                            6 => theme_id,
+                            _ => toggle_id,
+                        })
+                    });
+                }
+                if matches!(frame, 3 | 4 | 6..=9) {
+                    events.push(egui::Event::Key {
+                        key: egui::Key::Space,
+                        physical_key: None,
+                        pressed: matches!(frame, 3 | 6 | 8),
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let mut appearance_changed = false;
+                let mut toggle_changed = false;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(WINDOW_W, PANEL_H),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE.inner_margin(PANEL_PADDING))
+                            .show(ctx, |ui| {
+                                tab_at =
+                                    egui::pos2(ui.max_rect().center().x, ui.cursor().top() + 17.0);
+                                tab_id = ui.id().with(("settings-tab", SettingsTab::General));
+                                settings_tabs(ui, &p, Lang::En, &mut tab);
+                                ui.add_space(12.0);
+                                theme_at = egui::pos2(
+                                    ui.max_rect().right() - 20.0,
+                                    ui.cursor().top() + 31.0,
+                                );
+                                theme_id = ui.id().with(("theme-preset", 1_usize));
+                                appearance_changed =
+                                    theme_options(ui, &p, Lang::En, &mut appearance);
+                                toggle_id = ui.id().with(("toggle", "Show CPU / GPU"));
+                                toggle_changed = toggle_row(ui, &p, "Show CPU / GPU", &mut enabled);
+                            });
+                    },
+                );
+                assert_eq!(
+                    tab,
+                    match frame {
+                        0 | 1 => SettingsTab::StatusBar,
+                        2 => SettingsTab::Statistics,
+                        _ => SettingsTab::General,
+                    }
+                );
+                assert_eq!(
+                    appearance,
+                    match frame {
+                        0..=4 => ThemeMode::System,
+                        5 => ThemeMode::Dark,
+                        _ => ThemeMode::Light,
+                    }
+                );
+                assert_eq!(appearance_changed, matches!(frame, 5 | 6));
+                assert_eq!(enabled, frame >= 8);
+                assert_eq!(toggle_changed, frame == 8);
             }
         }
     }

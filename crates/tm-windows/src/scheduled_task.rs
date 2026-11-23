@@ -12,7 +12,9 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW,
 };
 
-pub const TASK_NAME: &str = "TrafficMonitorHelper";
+pub const TASK_NAME: &str = "TramoingHelper";
+/// 仅供升级/卸载时清理，不能继续注册这个名称。
+pub const LEGACY_TASK_NAME: &str = "TrafficMonitorHelper";
 
 fn xml_escape(value: &str) -> String {
     value
@@ -61,7 +63,7 @@ fn write_definition(writer: &mut impl Write, xml: &str) -> std::io::Result<()> {
     writer.flush()
 }
 
-fn current_user_sid() -> Result<String, String> {
+pub(crate) fn current_user_sid() -> Result<String, String> {
     // SID 来自当前进程令牌，避免本地化账户名、域账户和环境变量造成注册到错误账户。
     unsafe {
         let mut token = std::ptr::null_mut();
@@ -153,6 +155,27 @@ pub fn install(executable: &Path) -> Result<(), String> {
             .creation_flags(CREATE_NO_WINDOW)
             .output(),
     )?;
+    // 新任务注册成功后，停止并移除旧名称的任务，避免登录时启动两个采集助手。
+    // 安装器已停止旧进程；这里也覆盖手工 --install 的情况。
+    if Command::new("schtasks.exe")
+        .args(["/Query", "/TN", LEGACY_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        let _ = Command::new("schtasks.exe")
+            .args(["/End", "/TN", LEGACY_TASK_NAME])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        check_output(
+            "移除旧版采集助手任务",
+            Command::new("schtasks.exe")
+                .args(["/Delete", "/TN", LEGACY_TASK_NAME, "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output(),
+        )?;
+    }
+    crate::etw::stop_legacy_session()?;
     check_output(
         "启动采集助手任务",
         Command::new("schtasks.exe")

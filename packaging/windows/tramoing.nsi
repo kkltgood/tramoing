@@ -1,7 +1,7 @@
 ﻿; Tramoing 的 Windows 安装包脚本（NSIS 3）。
 ;
 ; 由 packaging/windows/build.ps1 调用，也可以在 Windows 上手动执行：
-;   makensis /DAPP_VERSION=0.1.0 packaging\windows\traffic-monitor.nsi
+;   makensis /DAPP_VERSION=0.1.0 packaging\windows\tramoing.nsi
 ;
 ; 安装内容：
 ;   tramoing.exe          托盘主程序（普通权限）
@@ -10,8 +10,7 @@
 ; 关键点：助手不是 Windows 服务，而是登录时以最高权限启动的计划任务
 ; （由 `tramoing-helper.exe --install` 注册，卸载时用 --uninstall 摘掉）。
 ;
-; 产品显示名称使用 Tramoing。数据目录、计划任务和 ETW 标识保留兼容性；
-; 升级时清理旧版的快捷方式和注册表项。
+; 当前名称统一使用 Tramoing；旧名称仅用于识别和清理旧版安装。
 
 Unicode true
 
@@ -25,10 +24,9 @@ Unicode true
 !define APP_EXE "tramoing.exe"
 !define HELPER_EXE "tramoing-helper.exe"
 !define BUNDLE_ID "Tramoing"
-; 旧版的标识，卸载时顺手清掉，避免残留两条 Run 项 / 两套注册表键
-!define LEGACY_BUNDLE_ID "TrafficMonitor"
-;; 数据目录沿用旧名，历史记录和设置不能因为改名丢掉
-!define DATA_DIR "TrafficMonitor"
+!define DATA_DIR "Tramoing"
+!define TASK_NAME "TramoingHelper"
+!include "legacy.nsh"
 !define PUBLISHER "guolongkang"
 
 !ifndef APP_VERSION
@@ -121,7 +119,9 @@ Section "-升级准备：关闭旧进程" SEC_PRE
 
   ; 计划任务在登录时以最高权限拉起助手，先让它退下来，避免拷贝期间
   ; 任务调度器又把旧 exe 拉起来重新占住文件。
-  nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /End /TN "TrafficMonitorHelper"'
+  nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /End /TN "${TASK_NAME}"'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /End /TN "${LEGACY_TASK_NAME}"'
   Pop $0
 
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${HELPER_EXE}" /F'
@@ -129,9 +129,9 @@ Section "-升级准备：关闭旧进程" SEC_PRE
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${APP_EXE}" /F'
   Pop $0
   ; 改名前的 exe 也可能还在跑，一样停掉
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "traffic-monitor.exe" /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${LEGACY_APP_EXE}" /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "tm-helper.exe" /F'
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${LEGACY_HELPER_EXE}" /F'
   Pop $0
 
   ; taskkill 返回后进程对象可能还没完全释放句柄，等一下再删
@@ -156,11 +156,11 @@ Section "托盘程序（必需）" SEC_MAIN
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk" "$INSTDIR\uninstall.exe"
 
-  ; 覆盖安装旧版（当时叫 Traffic Monitor）时，把旧开始菜单项清掉，
-  ; 否则开始菜单里会同时躺着两个名字
-  Delete "$SMPROGRAMS\Traffic Monitor\Traffic Monitor.lnk"
-  Delete "$SMPROGRAMS\Traffic Monitor\卸载 Traffic Monitor.lnk"
-  RMDir "$SMPROGRAMS\Traffic Monitor"
+  ; 清理旧名快捷方式；登录项只在原本启用时迁移，不改变用户的开关选择。
+  Delete "$SMPROGRAMS\${LEGACY_START_MENU}\${LEGACY_START_MENU}.lnk"
+  Delete "$SMPROGRAMS\${LEGACY_START_MENU}\卸载 ${LEGACY_START_MENU}.lnk"
+  RMDir "$SMPROGRAMS\${LEGACY_START_MENU}"
+  !insertmacro MIGRATE_LEGACY_RUN "Software\Microsoft\Windows\CurrentVersion\Run"
 
   ; 控制面板「程序和功能」里的条目
   WriteRegStr HKLM "Software\${BUNDLE_ID}" "InstallDir" "$INSTDIR"
@@ -195,22 +195,38 @@ Section "流量采集助手（按进程统计必需）" SEC_HELPER
       Abort "采集助手更新失败，请按上述提示修复后重新运行程序。"
     ${EndIf}
   ${EndIf}
+  ; 只有新版助手安装成功后才清掉旧执行文件和卸载注册项。
+  ${If} $0 == 0
+    Delete "$INSTDIR\${LEGACY_APP_EXE}"
+    Delete "$INSTDIR\${LEGACY_HELPER_EXE}"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${LEGACY_BUNDLE_ID}"
+    DeleteRegKey HKLM "Software\${LEGACY_BUNDLE_ID}"
+  ${EndIf}
 SectionEnd
 
 ; ---------- 卸载 ----------
 
 Section "Uninstall"
   ; 先停任务再删文件，顺序反了会删不掉正在运行的 exe
+  ExecWait 'taskkill /IM ${APP_EXE} /F'
+  ExecWait '"$SYSDIR\schtasks.exe" /End /TN "${TASK_NAME}"'
+  ExecWait '"$SYSDIR\schtasks.exe" /End /TN "${LEGACY_TASK_NAME}"'
+  ExecWait 'taskkill /IM ${HELPER_EXE} /F'
+  StrCpy $0 -1
+  ExecWait '"$INSTDIR\${HELPER_EXE}" --clear-network-blocks' $0
+  ${If} $0 != 0
+    MessageBox MB_ICONEXCLAMATION|MB_OK "无法清理断网规则或移除助手，已保留程序。请先恢复联网后重试卸载。$\r$\n日志：%LOCALAPPDATA%\${DATA_DIR}\helper.log"
+    Abort "卸载未完成，原程序已保留。"
+  ${EndIf}
   ExecWait '"$INSTDIR\${HELPER_EXE}" --uninstall'
   ExecWait 'taskkill /IM ${HELPER_EXE} /F'
   ExecWait 'taskkill /IM ${APP_EXE} /F'
-  ; 旧版（改名前的 traffic-monitor.exe / tm-helper.exe）如果还在这台机器上跑，一起停掉
-  ExecWait 'taskkill /IM traffic-monitor.exe /F'
-  ExecWait 'taskkill /IM tm-helper.exe /F'
+  ; 改名前的旧程序如果还在运行，一起停掉。
+  ExecWait 'taskkill /IM ${LEGACY_APP_EXE} /F'
+  ExecWait 'taskkill /IM ${LEGACY_HELPER_EXE} /F'
 
   ; 托盘程序自己的开机自启（设置里打开时写在 HKCU）。
-  ; 程序内部仍用旧值名 TrafficMonitor（改了旧机器上的自启项会变成孤儿），
-  ; 所以两个名字都删。
+  ; 同时清理未完成迁移的旧登录项。
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${BUNDLE_ID}"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${LEGACY_BUNDLE_ID}"
 
@@ -222,14 +238,14 @@ Section "Uninstall"
   Delete "$INSTDIR\${HELPER_EXE}"
   Delete "$INSTDIR\LICENSE"
   ; 覆盖安装过旧版的目录里可能还留着老名字的 exe
-  Delete "$INSTDIR\traffic-monitor.exe"
-  Delete "$INSTDIR\tm-helper.exe"
+  Delete "$INSTDIR\${LEGACY_APP_EXE}"
+  Delete "$INSTDIR\${LEGACY_HELPER_EXE}"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}"
   DeleteRegKey HKLM "Software\${BUNDLE_ID}"
-  ; 旧版（Traffic Monitor）的条目也顺手清掉
+  ; 改名前的旧注册项也一起清理。
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${LEGACY_BUNDLE_ID}"
   DeleteRegKey HKLM "Software\${LEGACY_BUNDLE_ID}"
 
@@ -237,7 +253,8 @@ Section "Uninstall"
   System::Call 'shell32::SHChangeNotify(i 0x8000000, i 0, i 0, i 0)'
 
   ; 历史数据默认保留：卸载工具不该顺手把用户一个月的流量记录删了
-  MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除历史数据和设置？$\r$\n（%LOCALAPPDATA%\${DATA_DIR}）" /SD IDNO IDNO KeepData
+  MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除历史数据、设置和旧版迁移备份？$\r$\n（%LOCALAPPDATA%\${DATA_DIR} 及旧版数据目录）" /SD IDNO IDNO KeepData
   RMDir /r "$LOCALAPPDATA\${DATA_DIR}"
+  RMDir /r "$LOCALAPPDATA\${LEGACY_BUNDLE_ID}"
   KeepData:
 SectionEnd

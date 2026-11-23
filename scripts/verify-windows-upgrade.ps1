@@ -145,9 +145,22 @@ try {
     $caseRoot = New-Case 'legacy'
     $installedDir = Join-Path $caseRoot 'Traffic Monitor'
     Set-Installed $installedDir $legacyRegistryPath 'traffic-monitor.exe'
+    $testRunPath = "$registryPath\Run"
+    New-Item -Path $testRunPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $testRunPath -Name "$bundleId-legacy" -Value '"old app.exe"' -PropertyType String | Out-Null
     $result = Run-Case $caseRoot
     Assert-Upgraded $result $installedDir
+    $runValues = Get-ItemProperty -LiteralPath $testRunPath
+    Assert-That ($runValues.$bundleId -eq ('"' + (Join-Path $installedDir 'tramoing.exe') + '"')) 'Migrated login item has an incorrect executable path.'
+    Assert-That ($null -eq $runValues.PSObject.Properties["$bundleId-legacy"]) 'Old login item was not removed.'
     Write-Output 'PASS legacy installation is detected and upgraded in its original directory'
+    Write-Output 'PASS legacy login item migrates to the new name with a quoted path'
+
+    Remove-ItemProperty -LiteralPath $testRunPath -Name $bundleId
+    $result = Run-Case $caseRoot
+    Assert-Upgraded $result $installedDir
+    Assert-That ($null -eq (Get-ItemProperty -LiteralPath $testRunPath).PSObject.Properties[$bundleId]) 'Upgrade enabled a disabled login item.'
+    Write-Output 'PASS upgrade preserves disabled login preference'
 
     New-ItemProperty -LiteralPath $legacyRegistryPath -Name InstallDir -Value (Join-Path $testRoot 'missing') -Force | Out-Null
     $caseRoot = New-Case 'stale-registry'

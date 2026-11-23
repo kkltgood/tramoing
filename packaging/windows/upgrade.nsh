@@ -3,6 +3,7 @@
 !define TRAMOING_UPGRADE_INCLUDED
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
+!include "${__FILEDIR__}\legacy.nsh"
 
 !ifndef INSTALL_REG_ROOT
   !define INSTALL_REG_ROOT HKLM
@@ -39,10 +40,10 @@ Function .onInit
   ; Older clients launch setup without arguments. Detect their existing install
   ; too, so the first upgrade to this installer already skips the setup wizard.
   IfFileExists "$INSTDIR\${APP_EXE}" existing_install
-  IfFileExists "$INSTDIR\traffic-monitor.exe" existing_install
+  IfFileExists "$INSTDIR\${LEGACY_APP_EXE}" existing_install
   ReadRegStr $1 ${INSTALL_REG_ROOT} "Software\${LEGACY_BUNDLE_ID}" "InstallDir"
   ${If} $1 != ""
-    IfFileExists "$1\traffic-monitor.exe" 0 fresh_install
+    IfFileExists "$1\${LEGACY_APP_EXE}" 0 fresh_install
     StrCpy $INSTDIR $1
     Goto existing_install
   ${EndIf}

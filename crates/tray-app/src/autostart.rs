@@ -17,6 +17,14 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
     imp::set_enabled(on)
 }
 
+/// 正式启动时把已有登录项移到当前名称；没有旧登录项时不自动开启自启。
+pub fn migrate_legacy() -> Result<(), String> {
+    if imp::legacy_enabled() {
+        imp::set_enabled(true)?;
+    }
+    Ok(())
+}
+
 // ---------- macOS ----------
 
 #[cfg(target_os = "macos")]
@@ -25,30 +33,36 @@ mod imp {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    const LABEL: &str = "dev.guolongkang.trafficmonitor";
+    const LABEL: &str = tm_core::identity::MACOS_BUNDLE_ID;
+    const LEGACY_LABEL: &str = tm_core::identity::LEGACY_MACOS_BUNDLE_ID;
 
     extern "C" {
         fn getuid() -> u32;
     }
 
-    fn plist_path() -> Option<PathBuf> {
+    fn plist_path(label: &str) -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
         Some(
             PathBuf::from(home)
                 .join("Library/LaunchAgents")
-                .join(format!("{LABEL}.plist")),
+                .join(format!("{label}.plist")),
         )
     }
 
     pub fn is_enabled() -> bool {
-        plist_path().map(|p| p.exists()).unwrap_or(false)
+        plist_path(LABEL).is_some_and(|p| p.exists()) || legacy_enabled()
+    }
+
+    pub fn legacy_enabled() -> bool {
+        plist_path(LEGACY_LABEL).is_some_and(|p| p.exists())
     }
 
     pub fn set_enabled(on: bool) -> Result<(), String> {
-        let path = plist_path().ok_or("读不到 HOME，无法定位 LaunchAgents")?;
+        let path = plist_path(LABEL).ok_or("读不到 HOME，无法定位 LaunchAgents")?;
         if on {
             let exe = std::env::current_exe().map_err(|e| format!("取不到自身路径：{e}"))?;
             write_plist(&path, &launch_argv(&exe))?;
+            remove_agent(LEGACY_LABEL)?;
             // 让它在本次会话立即生效。失败不影响「下次登录自启」——
             // launchd 登录时会自己扫描 LaunchAgents 目录。
             // 某些环境（远程会话、受限会话）根本不允许 launchctl 加载，
@@ -58,13 +72,18 @@ mod imp {
                 let _ = launchctl(&["load", "-w", &path.to_string_lossy()]);
             }
         } else {
-            let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
+            remove_agent(LABEL)?;
+            remove_agent(LEGACY_LABEL)?;
+        }
+        Ok(())
+    }
+
+    fn remove_agent(label: &str) -> Result<(), String> {
+        let path = plist_path(label).ok_or("读不到 HOME，无法定位 LaunchAgents")?;
+        if path.exists() {
+            let _ = launchctl(&["bootout", &format!("{}/{label}", domain())]);
             let _ = launchctl(&["unload", "-w", &path.to_string_lossy()]);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("删除 LaunchAgent 失败：{e}")),
-            }
+            std::fs::remove_file(&path).map_err(|e| format!("删除 LaunchAgent 失败：{e}"))?;
         }
         Ok(())
     }
@@ -157,9 +176,9 @@ mod imp {
 
         #[test]
         fn plist_contains_label_and_args() {
-            let xml = plist_xml(&["/Applications/Traffic Monitor.app".to_owned()]);
-            assert!(xml.contains("<string>dev.guolongkang.trafficmonitor</string>"));
-            assert!(xml.contains("/Applications/Traffic Monitor.app"));
+            let xml = plist_xml(&["/Applications/Tramoing.app".to_owned()]);
+            assert!(xml.contains("<string>dev.guolongkang.tramoing</string>"));
+            assert!(xml.contains("/Applications/Tramoing.app"));
             assert!(xml.contains("<key>RunAtLoad</key>"));
         }
 
@@ -204,7 +223,7 @@ mod imp {
         fn plist_write_remove_roundtrip() {
             let dir = std::env::temp_dir().join("tm-test-launchagent");
             std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("dev.guolongkang.trafficmonitor.plist");
+            let path = dir.join("dev.guolongkang.tramoing.plist");
             let _ = std::fs::remove_file(&path);
 
             write_plist(&path, &["/tmp/tm".to_owned()]).unwrap();
@@ -226,10 +245,15 @@ mod imp {
 mod imp {
     // 注册表读写放在 tm-windows 里：那个 crate 才有 windows-sys 依赖，
     // 也符合「Windows 系统调用集中在 tm-windows」的分层。
-    const VALUE: &str = "TrafficMonitor";
+    const VALUE: &str = tm_core::identity::APP_NAME;
+    const LEGACY_VALUE: &str = tm_core::identity::LEGACY_APP_NAME;
 
     pub fn is_enabled() -> bool {
-        tm_windows::registry_run::value_exists(VALUE)
+        tm_windows::registry_run::value_exists(VALUE) || legacy_enabled()
+    }
+
+    pub fn legacy_enabled() -> bool {
+        tm_windows::registry_run::value_exists(LEGACY_VALUE)
     }
 
     pub fn set_enabled(on: bool) -> Result<(), String> {
@@ -242,6 +266,8 @@ mod imp {
             String::new()
         };
         tm_windows::registry_run::set_value(VALUE, on, &exe)
+            .map_err(|code| format!("写入注册表失败（Win32 错误 {code}）"))?;
+        tm_windows::registry_run::set_value(LEGACY_VALUE, false, "")
             .map_err(|code| format!("写入注册表失败（Win32 错误 {code}）"))
     }
 }
@@ -250,6 +276,10 @@ mod imp {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
+    pub fn legacy_enabled() -> bool {
+        false
+    }
+
     pub fn is_enabled() -> bool {
         false
     }

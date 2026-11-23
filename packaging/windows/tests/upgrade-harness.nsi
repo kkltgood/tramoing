@@ -63,6 +63,7 @@ Section "Test payload"
   FileOpen $0 "$INSTDIR\${APP_EXE}" w
   FileWrite $0 "new payload"
   FileClose $0
+  !insertmacro MIGRATE_LEGACY_RUN "Software\${BUNDLE_ID}\Run"
   WriteINIStr "$EXEDIR\result.ini" "test" "installed" "1"
   WriteINIStr "$EXEDIR\result.ini" "test" "directory" "$INSTDIR"
 SectionEnd

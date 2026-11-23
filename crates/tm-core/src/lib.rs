@@ -5,6 +5,7 @@
 //! 采集层（nettop / ETW）只要负责吐 [`ProcSample`] 就行。
 
 pub mod color;
+pub mod identity;
 pub mod rate;
 pub mod taskbar;
 pub mod types;

@@ -43,6 +43,41 @@ const REAL_TIME_MODE: u32 = 0x0000_0100;
 /// 诊断开关：把每个事件的原始内容写进日志文件，用于校准事件表。
 static DUMP_EVENTS: AtomicBool = AtomicBool::new(false);
 
+/// 安装时移除改名前遗留的采集会话；旧助手仍存活时不抢占它的会话。
+pub(crate) fn stop_legacy_session() -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let _owner = loop {
+        match crate::instance::InstanceGuard::acquire("Global\\TrafficMonitor-Etw-Owner") {
+            Ok(Some(owner)) => break owner,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(None) => return Err("旧采集助手仍在运行，请退出后重新安装".into()),
+            Err(code) => return Err(format!("检查旧采集助手失败（Win32 错误 {code}）")),
+        }
+    };
+    let name: Vec<u16> = "TrafficMonitor-Etw".encode_utf16().chain(Some(0)).collect();
+    let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * size_of::<u16>();
+    let mut buffer = vec![0u64; size.div_ceil(8)];
+    let properties = buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+    // SAFETY: 缓冲区按 u64 对齐，包含属性和会话名称空间；名称由独立 NUL 字符串持有。
+    let code = unsafe {
+        (*properties).Wnode.BufferSize = size as u32;
+        (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            name.as_ptr(),
+            properties,
+            EVENT_TRACE_CONTROL_STOP,
+        )
+    };
+    match code {
+        // ERROR_WMI_INSTANCE_NOT_FOUND：没有旧会话需要清理。
+        ERROR_SUCCESS | 4201 => Ok(()),
+        code => Err(format!("清理旧采集会话失败（Win32 错误 {code}）")),
+    }
+}
+
 /// 诊断日志路径。助手是 `windows_subsystem = "windows"`，没有控制台，
 /// 事件只能落到文件里，否则 `--dump-events` 什么都看不到。
 fn dump_path() -> &'static PathBuf {
@@ -51,7 +86,7 @@ fn dump_path() -> &'static PathBuf {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        base.join("TrafficMonitor").join("etw-dump.log")
+        base.join(tm_core::identity::APP_NAME).join("etw-dump.log")
     })
 }
 
@@ -129,7 +164,7 @@ impl EtwSession {
     pub fn start(sink: Arc<Mutex<Aggregator>>) -> Result<Self, EtwError> {
         // 必须在探测/清理同名会话之前持有跨进程锁。管道忙只表示 UI 已连接，
         // 不能作为助手死亡的依据。Global 与 ETW 会话的机器级作用域一致。
-        let instance = crate::instance::InstanceGuard::acquire("Global\\TrafficMonitor-Etw-Owner")
+        let instance = crate::instance::InstanceGuard::acquire("Global\\Tramoing-Etw-Owner")
             .map_err(EtwError::Start)?
             .ok_or(EtwError::AlreadyRunning)?;
         let mut logger_name: Vec<u16> = crate::SESSION_NAME.encode_utf16().collect();

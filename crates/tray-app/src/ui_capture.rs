@@ -6,10 +6,55 @@ use std::time::Instant;
 
 use eframe::egui;
 
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     std::env::var_os("TM_FORCE_MOCK").is_some()
         && std::env::var_os("TM_DATA_DIR").is_some()
         && std::env::var_os("TM_CAPTURE_PPM").is_some()
+}
+
+/// 仅在隔离预览中打开一次指定的颜色面板。
+pub fn open_color_picker(ctx: &egui::Context, label: &str, lang: crate::theme::Lang) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let target = match std::env::var("TM_CAPTURE_STATE").as_deref() {
+        Ok("settings-color-download") => lang.t("下载", "Download"),
+        Ok("settings-color-gpu") => "GPU",
+        _ => return false,
+    };
+    if label != target {
+        return false;
+    }
+    let id = egui::Id::new("capture-color-opened");
+    ctx.data_mut(|data| {
+        if data.get_temp::<bool>(id).unwrap_or(false) {
+            false
+        } else {
+            data.insert_temp(id, true);
+            true
+        }
+    })
+}
+
+#[cfg(windows)]
+pub fn prepare_network_panel(
+    panel: &mut crate::network_panel::NetworkPanel,
+    access: &mut crate::network_access::NetworkAccess,
+    lang: crate::theme::Lang,
+) {
+    if !enabled() {
+        return;
+    }
+    let state = std::env::var("TM_CAPTURE_STATE").unwrap_or_default();
+    if state.starts_with("network-add") {
+        panel.open();
+        if state == "network-add-invalid" {
+            panel.preview_invalid_path(lang);
+        }
+        if state == "network-add-offline" {
+            access.error = Some("未连接到网络控制助手，请重新运行安装程序以更新助手。".into());
+        }
+    }
 }
 
 /// 只给隔离的渲染验证注入状态；不会断开或启动系统的真实采集助手。
@@ -19,7 +64,7 @@ pub fn preview_snapshot(snapshot: crate::engine::Snapshot) -> crate::engine::Sna
     }
     let error = match std::env::var("TM_CAPTURE_STATE").as_deref() {
         // 验证有数据、无底部提示的布局；采样和持久化仍使用隔离的演示引擎。
-        Ok("list") => {
+        Ok("list" | "network-add" | "network-add-invalid" | "network-add-offline") => {
             return crate::engine::Snapshot {
                 mock: false,
                 ..snapshot

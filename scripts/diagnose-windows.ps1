@@ -56,7 +56,7 @@ Add-Section 'Installed binaries' {
 }
 
 Add-Section 'Collector task' {
-    $task = Get-ScheduledTask -TaskName 'TrafficMonitorHelper'
+    $task = Get-ScheduledTask -TaskName 'TramoingHelper'
     $info = $task | Get-ScheduledTaskInfo
     [pscustomobject]@{
         State = $task.State
@@ -73,7 +73,7 @@ Add-Section 'Collector task' {
 }
 
 Add-Section 'Processes' {
-    Get-Process -Name 'tramoing','tramoing-helper','traffic-monitor','tm-helper' -ErrorAction SilentlyContinue |
+    Get-Process -Name 'tramoing','tramoing-helper' -ErrorAction SilentlyContinue |
         Select-Object ProcessName,Id,SessionId,Path | Format-Table -AutoSize
 }
 
@@ -83,7 +83,7 @@ Add-Section 'Task Scheduler service' {
 
 foreach ($name in @('ui.log', 'helper.log')) {
     Add-Section $name {
-        $path = Join-Path (Join-Path $env:LOCALAPPDATA 'TrafficMonitor') $name
+        $path = Join-Path (Join-Path $env:LOCALAPPDATA 'Tramoing') $name
         'Path: ' + $path
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             Get-Content -LiteralPath $path -Encoding UTF8 -Tail 100
