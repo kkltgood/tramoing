@@ -36,6 +36,9 @@ Function .onInit
   StrCpy $UpgradeMode 0
   StrCpy $UpdateParentPid ""
   ${GetParameters} $0
+  !ifdef TRAMOING_UPGRADE_TEST_TRACE
+    WriteINIStr "$EXEDIR\result.ini" "trace" "arguments" "$0"
+  !endif
   ClearErrors
   ${GetOptions} $0 "/UPDATE" $1
   ${IfNot} ${Errors}
@@ -50,8 +53,14 @@ Function .onInit
       ${ElseIf} $UpdateParentPid <= 0
         Goto invalid_update
       ${EndIf}
+      !ifdef TRAMOING_UPGRADE_TEST_TRACE
+        WriteINIStr "$EXEDIR\result.ini" "trace" "accepted_parent" "$UpdateParentPid"
+      !endif
       Return
     invalid_update:
+      !ifdef TRAMOING_UPGRADE_TEST_TRACE
+        WriteINIStr "$EXEDIR\result.ini" "trace" "invalid_update" "$INSTDIR; parent=$UpdateParentPid"
+      !endif
       MessageBox MB_ICONSTOP|MB_OK "更新参数或安装目录无效，更新已停止。$\r$\n$INSTDIR" /SD IDOK
       SetErrorLevel 1
       Abort
@@ -90,12 +99,21 @@ FunctionEnd
 ; This must run before stopping the collector or changing any installed file.
 ; The new client exits only after ShellExecute confirms that UAC was accepted.
 Function WaitForUpdateParent
+  !ifdef TRAMOING_UPGRADE_TEST_TRACE
+    WriteINIStr "$EXEDIR\result.ini" "trace" "parent_pid" "$UpdateParentPid"
+  !endif
   ${If} $UpdateParentPid != ""
     DetailPrint "正在等待程序保存历史并退出..."
     System::Call 'kernel32::OpenProcess(i 0x00100000, i 0, i $UpdateParentPid) p.r0'
     ${If} $0 P<> 0
+      !ifdef TRAMOING_UPGRADE_TEST_TRACE
+        WriteINIStr "$EXEDIR\result.ini" "trace" "parent_handle" "$0"
+      !endif
       System::Call 'kernel32::WaitForSingleObject(p r0, i 15000) i.r1'
       System::Call 'kernel32::CloseHandle(p r0)'
+      !ifdef TRAMOING_UPGRADE_TEST_TRACE
+        WriteINIStr "$EXEDIR\result.ini" "trace" "wait_result" "$1"
+      !endif
       ${If} $1 != 0
         SetAutoClose false
         SetErrorLevel 1
@@ -103,6 +121,9 @@ Function WaitForUpdateParent
       ${EndIf}
     ${Else}
       System::Call 'kernel32::GetLastError() i.r1'
+      !ifdef TRAMOING_UPGRADE_TEST_TRACE
+        WriteINIStr "$EXEDIR\result.ini" "trace" "open_error" "$1"
+      !endif
       ; ERROR_INVALID_PARAMETER means the process has already exited.
       ${If} $1 != 87
         SetAutoClose false

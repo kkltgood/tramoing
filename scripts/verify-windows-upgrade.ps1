@@ -59,7 +59,8 @@ function Run-Case([string]$CaseRoot, [string]$Arguments = '', [int]$ExpectedExit
     $process = Start-Process @options
     try {
         if (-not $process.WaitForExit(25000)) {
-            throw "Installer stalled on an unexpected page: $CaseRoot"
+            $diagnostics = [IO.File]::ReadAllText($result)
+            throw "Installer stalled on an unexpected page: $CaseRoot`n$diagnostics"
         }
         Assert-That ($process.ExitCode -eq $ExpectedExit) "Unexpected exit $($process.ExitCode): $CaseRoot"
     } finally {
@@ -130,6 +131,9 @@ Start-Sleep -Seconds 4
         # Reuse the already exited PID to cover the other side of the handoff race.
         $result = Run-Case $caseRoot "/UPDATE /APP_PID=$($parent.Id) /D=$installedDir"
         Assert-Upgraded $result $installedDir
+    } catch {
+        Write-Output "Test parent exited: $($parent.HasExited); PID: $($parent.Id)"
+        throw
     } finally {
         if (-not $parent.HasExited) { Stop-Process -Id $parent.Id -Force }
         $parent.Dispose()

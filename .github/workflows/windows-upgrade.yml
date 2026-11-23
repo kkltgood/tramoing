@@ -1,0 +1,40 @@
+name: Windows installer verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: 'Native runner and installer architecture'
+        type: choice
+        options: [arm64, x64]
+        default: arm64
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade:
+    runs-on: ${{ inputs.architecture == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NSIS if needed
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe") -and
+              -not (Test-Path "$env:ProgramFiles\NSIS\makensis.exe")) {
+            choco install nsis --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
+          }
+      - name: Verify upgrade callbacks
+        shell: powershell
+        env:
+          PACKAGE_ARCH: ${{ inputs.architecture }}
+        run: ./scripts/verify-windows-upgrade.ps1 -Architecture $env:PACKAGE_ARCH
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: upgrade-diagnostics-${{ inputs.architecture }}
+          path: target/upgrade-test-*/**/result.ini
+          retention-days: 7

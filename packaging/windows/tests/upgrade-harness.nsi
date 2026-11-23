@@ -8,6 +8,7 @@ RequestExecutionLevel user
 !define BUNDLE_ID "${TEST_BUNDLE_ID}"
 !define LEGACY_BUNDLE_ID "${TEST_BUNDLE_ID}-legacy"
 !define INSTALL_REG_ROOT HKCU
+!define TRAMOING_UPGRADE_TEST_TRACE
 !include "..\upgrade.nsh"
 
 Name "${APP_NAME}"
