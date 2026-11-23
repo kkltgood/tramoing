@@ -108,23 +108,22 @@ try {
     $caseRoot = New-Case 'parent-exit'
     $installedDir = Join-Path $caseRoot 'app'
     Set-Installed $installedDir
-    $sleeper = Join-Path $testRoot 'parent.ps1'
+    $parentExecutable = Join-Path $testRoot 'parent.exe'
     $parentReady = Join-Path $testRoot 'parent-ready'
-    [IO.File]::WriteAllText($sleeper, @'
-param([string]$ReadyFile)
-[IO.File]::WriteAllText($ReadyFile, 'ready')
-Start-Sleep -Seconds 4
-'@)
-    $parent = Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$sleeper`" -ReadyFile `"$parentReady`"" -WindowStyle Hidden -PassThru
+    $parentTarget = if ($Architecture -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+    & rustc --edition=2021 --target $parentTarget -o $parentExecutable (Join-Path $repository 'packaging\windows\tests\upgrade-parent.rs')
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the native test parent.' }
+    $parent = Start-Process -FilePath $parentExecutable -ArgumentList "`"$parentReady`"" -WindowStyle Hidden -PassThru
     try {
-        # Cold PowerShell startup under ARM64 emulation can exceed the installer's
-        # 15-second handoff deadline. Start the test only once its parent is ready.
+        # Use the same native architecture as the application, without depending
+        # on a PowerShell child host's console or shutdown behavior on ARM64.
         $readyWatch = [Diagnostics.Stopwatch]::StartNew()
         while (-not (Test-Path -LiteralPath $parentReady)) {
             if ($parent.HasExited) { throw 'Test parent exited before signaling readiness.' }
             if ($readyWatch.Elapsed.TotalSeconds -ge 60) { throw 'Test parent did not become ready.' }
             Start-Sleep -Milliseconds 50
         }
+        Assert-That ([IO.File]::ReadAllText($parentReady) -eq $parent.Id.ToString()) 'Ready signal came from a different process.'
         $result = Run-Case $caseRoot "/UPDATE /APP_PID=$($parent.Id) /D=$installedDir"
         Assert-That $parent.HasExited 'Installer did not wait for the old application to exit.'
         Assert-Upgraded $result $installedDir

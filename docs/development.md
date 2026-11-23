@@ -155,7 +155,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Architectu
 
 `-Architecture` 支持 `x64`（默认）和 `arm64`，分别指定 `x86_64-pc-windows-msvc` 和 `aarch64-pc-windows-msvc` 编译目标。脚本从 Cargo 返回的实际产物路径收集主程序和助手，兼容自定义 `CARGO_TARGET_DIR`，并校验两个 PE 文件的真实架构。暂存目录为 `dist/windows-<arch>/`，生成 `dist/Tramoing-<version>-windows-<arch>-setup.exe` 和对应的 `.sha256`，安装目录包含项目许可证。安装器在修改现有安装前拒绝不兼容的架构；已有的 x64 程序在 ARM64 Windows 的模拟环境下仍可继续升级 x64 包。`.ps1` 和 `.nsi` 中的中文使用 UTF-8 BOM，以兼容 Windows PowerShell 5.1 和 NSIS。
 
-升级逻辑位于 `packaging/windows/upgrade.nsh`，同样保存为 UTF-8 BOM。`verify-windows-upgrade.ps1` 编译并运行使用这些回调的独立安装器，验证首次安装保留向导、旧客户端升级跳过向导、自定义目录、等待旧进程退出、失败时不重启和旧产品名迁移。测试仅写入 `target/upgrade-test-<id>` 和独立的 HKCU 测试键，结束时清理测试键；发布工作流在 Windows 打包前运行。
+升级逻辑位于 `packaging/windows/upgrade.nsh`，同样保存为 UTF-8 BOM。`verify-windows-upgrade.ps1` 编译并运行使用这些回调的独立安装器，验证首次安装保留向导、旧客户端升级跳过向导、自定义目录、等待旧进程退出、失败时不重启和旧产品名迁移。等待退出的用例用 Rust 编译同架构的临时父进程，并核对其就绪信号；需要安装对应 Rust target 和 MSVC 生成工具。测试仅写入 `target/upgrade-test-<id>` 和独立的 HKCU 测试键，结束时清理测试键；发布工作流在 Windows 打包前运行。也可在 Actions 的 `Windows installer verification` 中选择架构单独运行，失败时保留安装器诊断文件。
 
 macOS：
 
