@@ -2460,11 +2460,14 @@ impl App {
             response.rect.shrink(2.0),
             CornerRadius::same(6),
             background,
-            Stroke::new(0.7, mix(p.border, color, if complete { 0.7 } else { 0.3 })),
+            Stroke::new(
+                0.7_f32,
+                mix(p.border, color, if complete { 0.7 } else { 0.3 }),
+            ),
             egui::StrokeKind::Inside,
         );
         let center = response.rect.center();
-        let stroke = Stroke::new(1.1, color);
+        let stroke = Stroke::new(1.1_f32, color);
         if pending {
             let phase = ui.input(|i| i.time) as f32 * 4.0;
             let points = (0..=24)
@@ -2473,7 +2476,7 @@ impl App {
                     center + Vec2::angled(angle) * 5.8
                 })
                 .collect();
-            painter.add(egui::Shape::line(points, Stroke::new(1.4, color)));
+            painter.add(egui::Shape::line(points, Stroke::new(1.4_f32, color)));
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         } else {
             // 地球表示网络权限；仅在系统核验成功后画断网斜线。
@@ -2491,12 +2494,12 @@ impl App {
             painter.add(egui::Shape::closed_line(meridian, stroke));
             if complete {
                 let slash = [center - Vec2::splat(5.5), center + Vec2::splat(5.5)];
-                painter.line_segment(slash, Stroke::new(3.8, background));
-                painter.line_segment(slash, Stroke::new(1.5, color));
+                painter.line_segment(slash, Stroke::new(3.8_f32, background));
+                painter.line_segment(slash, Stroke::new(1.5_f32, color));
             } else if restricted {
                 // 缓存或不完整规则仍提供恢复入口，以圆点标记待核验状态。
                 let badge = center + Vec2::new(5.0, -5.0);
-                painter.circle(badge, 2.5, background, Stroke::new(1.0, p.warn));
+                painter.circle(badge, 2.5, background, Stroke::new(1.0_f32, p.warn));
                 painter.circle_filled(badge, 0.7, p.warn);
             }
         }
@@ -3064,7 +3067,7 @@ fn settings_tabs(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Setti
                 rect,
                 8.0,
                 p.surface,
-                Stroke::new(0.7, p.border),
+                Stroke::new(0.7_f32, p.border),
                 egui::StrokeKind::Inside,
             );
         } else if response.hovered() {
@@ -3122,7 +3125,7 @@ fn theme_options(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Theme
                 mix(p.surface, p.chip, 0.35)
             },
             Stroke::new(
-                if selected { 1.2 } else { 0.7 },
+                if selected { 1.2_f32 } else { 0.7_f32 },
                 if selected { p.accent } else { p.border },
             ),
             egui::StrokeKind::Inside,
@@ -3143,7 +3146,7 @@ fn theme_options(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Theme
         ui.painter().rect_stroke(
             preview,
             4.0,
-            Stroke::new(0.6, mix(p.border, p.accent, 0.25)),
+            Stroke::new(0.6_f32, mix(p.border, p.accent, 0.25)),
             egui::StrokeKind::Inside,
         );
         for (offset, width) in [(7.0, 25.0), (13.0, 16.0)] {
@@ -3182,7 +3185,7 @@ fn settings_action(ui: &mut egui::Ui, p: &Palette, text: &str, enabled: bool) ->
         egui::Button::new(RichText::new(text).size(11.0).color(p.accent))
             .min_size(Vec2::new(82.0, 27.0))
             .fill(mix(p.surface, p.accent, 0.07))
-            .stroke(Stroke::new(0.7, mix(p.border, p.accent, 0.15)))
+            .stroke(Stroke::new(0.7_f32, mix(p.border, p.accent, 0.15)))
             .corner_radius(8),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -3200,7 +3203,7 @@ fn settings_separator(ui: &mut egui::Ui, p: &Palette) {
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().line_segment(
         [line.left_center(), line.right_center()],
-        Stroke::new(0.7, p.border),
+        Stroke::new(0.7_f32, p.border),
     );
 }
 
@@ -3277,7 +3280,7 @@ fn option_row<T: Copy + PartialEq>(
             pill.shrink(2.0),
             6.0,
             p.surface,
-            Stroke::new(0.7, mix(p.border, p.accent, 0.12)),
+            Stroke::new(0.7_f32, mix(p.border, p.accent, 0.12)),
             egui::StrokeKind::Inside,
         );
     }
@@ -3355,7 +3358,7 @@ fn color_option_row(
             .layout(Layout::left_to_right(Align::Center)),
     );
     row.visuals_mut().selection.bg_fill = p.selection;
-    row.visuals_mut().selection.stroke = Stroke::new(1.0, p.on_selection);
+    row.visuals_mut().selection.stroke = Stroke::new(1.0_f32, p.on_selection);
     crate::color_picker::controls(&mut row, ctl, p, lang, label, current, automatic)
 }
 
@@ -3580,7 +3583,7 @@ fn paint_pin_button(ui: &egui::Ui, response: &egui::Response, pinned: bool, p: &
             CornerRadius::same(6),
             mix(p.surface, p.accent, tint),
             Stroke::new(
-                0.7,
+                0.7_f32,
                 mix(p.border, p.accent, if pinned { 0.28 } else { 0.12 }),
             ),
             egui::StrokeKind::Inside,
@@ -3593,7 +3596,7 @@ fn paint_pin_button(ui: &egui::Ui, response: &egui::Response, pinned: bool, p: &
     };
     let c = rect.center();
     let at = |x, y| c + egui::vec2(x, y);
-    let stroke = Stroke::new(1.25, color);
+    let stroke = Stroke::new(1.25_f32, color);
 
     // 正立、对称的图钉：圆头横帽、收窄的颈部和清楚的针尖。
     // 实心/描边也表达选中状态，不只依赖颜色；点击范围仍是 26pt。

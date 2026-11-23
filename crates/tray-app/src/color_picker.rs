@@ -80,7 +80,7 @@ pub fn controls(
         swatch_rect,
         7.0,
         mix(p.surface, p.chip, 0.4),
-        Stroke::new(0.8, if swatch.hovered() { p.accent } else { p.border }),
+        Stroke::new(0.8_f32, if swatch.hovered() { p.accent } else { p.border }),
         egui::StrokeKind::Inside,
     );
     ui.painter().rect_filled(
@@ -163,7 +163,7 @@ fn picker(
         );
     let frame = egui::Frame::NONE
         .fill(p.surface)
-        .stroke(Stroke::new(1.0, p.border))
+        .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(16)
         .inner_margin(16)
         .shadow(egui::epaint::Shadow {
@@ -214,7 +214,7 @@ fn picker(
                         c + egui::vec2(-3.5, -3.5 * sign),
                         c + egui::vec2(3.5, 3.5 * sign),
                     ],
-                    Stroke::new(1.3, p.subtext),
+                    Stroke::new(1.3_f32, p.subtext),
                 );
             }
             surface::focus(ui.painter(), cross, &response, p);
@@ -273,7 +273,7 @@ fn picker(
                     ui.painter().rect_stroke(
                         rect,
                         8.0,
-                        Stroke::new(1.2, if selected { p.accent } else { p.subtext }),
+                        Stroke::new(1.2_f32, if selected { p.accent } else { p.subtext }),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -289,7 +289,7 @@ fn picker(
                             rect.center() + egui::vec2(-1.0, 3.0),
                             rect.center() + egui::vec2(5.0, -3.0),
                         ],
-                        Stroke::new(1.5, ink),
+                        Stroke::new(1.5_f32, ink),
                     ));
                 }
                 surface::focus(ui.painter(), rect, &response, p);
@@ -314,7 +314,7 @@ fn picker(
                 preview,
                 9.0,
                 color32(color),
-                Stroke::new(0.7, p.border),
+                Stroke::new(0.7_f32, p.border),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
@@ -336,7 +336,7 @@ fn picker(
             let line = region(ui, 1.0);
             ui.painter().line_segment(
                 [line.left_center(), line.right_center()],
-                Stroke::new(0.7, p.border),
+                Stroke::new(0.7_f32, p.border),
             );
             ui.add_space(10.0);
             let footer = region(ui, CONTROL_H);
@@ -395,7 +395,7 @@ fn button(
                 if response.hovered() { 0.13 } else { 0.06 },
             )
         },
-        Stroke::new(0.7, mix(p.border, p.accent, 0.15)),
+        Stroke::new(0.7_f32, mix(p.border, p.accent, 0.15)),
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
@@ -453,7 +453,7 @@ fn hex_field(
         rect,
         7.0,
         Stroke::new(
-            0.8,
+            0.8_f32,
             if parsed.is_none() {
                 p.warn
             } else if input.has_focus() {
@@ -518,7 +518,7 @@ fn saturation_value(
     ui.painter().rect_stroke(
         rect,
         8.0,
-        Stroke::new(0.7, p.border),
+        Stroke::new(0.7_f32, p.border),
         egui::StrokeKind::Inside,
     );
     let at = egui::pos2(
@@ -593,9 +593,9 @@ fn marker(painter: &egui::Painter, at: egui::Pos2, radius: f32, color: Color32) 
     painter.circle_stroke(
         at,
         radius + 0.8,
-        Stroke::new(2.5, Color32::from_black_alpha(100)),
+        Stroke::new(2.5_f32, Color32::from_black_alpha(100)),
     );
-    painter.circle_stroke(at, radius, Stroke::new(1.6, Color32::WHITE));
+    painter.circle_stroke(at, radius, Stroke::new(1.6_f32, Color32::WHITE));
 }
 
 /// 网格边界沿圆角收拢，色板与色相条都不会露出方角。

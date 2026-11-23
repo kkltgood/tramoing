@@ -43,7 +43,7 @@ impl NetworkPanel {
             rect.shrink(1.0),
             9.0,
             mix(p.surface, p.accent, tint),
-            Stroke::new(0.7, mix(p.border, p.accent, 0.16)),
+            Stroke::new(0.7_f32, mix(p.border, p.accent, 0.16)),
             egui::StrokeKind::Inside,
         );
         paint_add_app(ui.painter(), rect.center(), p.accent);
@@ -90,7 +90,7 @@ impl NetworkPanel {
         );
         let frame = egui::Frame::NONE
             .fill(p.surface)
-            .stroke(Stroke::new(1.0, p.border))
+            .stroke(Stroke::new(1.0_f32, p.border))
             .corner_radius(18)
             .inner_margin(20)
             .shadow(egui::epaint::Shadow {
@@ -115,7 +115,7 @@ impl NetworkPanel {
                 scroll.bar_outer_margin = 0.0;
                 ui.visuals_mut().override_text_color = Some(p.text);
                 ui.visuals_mut().selection.bg_fill = p.selection;
-                ui.visuals_mut().selection.stroke = Stroke::new(1.0, p.on_selection);
+                ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, p.on_selection);
                 let widgets = &mut ui.visuals_mut().widgets;
                 for visuals in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active] {
                     visuals.corner_radius = CornerRadius::same(9);
@@ -155,7 +155,7 @@ impl NetworkPanel {
                             self.focus_path = false;
                         }
                         if input.changed() { self.error = None; }
-                        ui.painter().rect_stroke(input.rect, 9.0, Stroke::new(1.0, if self.error.is_some() { p.warn } else if input.has_focus() { p.accent } else { p.border }), egui::StrokeKind::Inside);
+                        ui.painter().rect_stroke(input.rect, 9.0, Stroke::new(1.0_f32, if self.error.is_some() { p.warn } else if input.has_focus() { p.accent } else { p.border }), egui::StrokeKind::Inside);
                         let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.add_space(7.0);
                         ui.add(egui::Label::new(RichText::new(lang.t("例如 C:\\Apps\\Douyin.exe，可直接粘贴带引号的路径。", "For example C:\\Apps\\App.exe. Quoted paths also work.")).size(10.5).color(p.subtext)).wrap());
@@ -175,7 +175,7 @@ impl NetworkPanel {
                         ui.add(egui::Label::new(RichText::new(lang.t("添加后会置顶。使用右侧网络图标控制联网。", "The app will be pinned. Use its network icon to control access.")).size(11.0).color(p.subtext)).wrap());
                         ui.add_space(19.0);
                         let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-                        ui.painter().line_segment([line.left_center(), line.right_center()], Stroke::new(0.7, p.border));
+                        ui.painter().line_segment([line.left_center(), line.right_center()], Stroke::new(0.7_f32, p.border));
                         ui.add_space(14.0);
                         control_status(ui, access, p, lang);
                         ui.add_space(10.0);
@@ -353,7 +353,7 @@ fn small_icon_button(
 }
 
 fn paint_add_app(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let stroke = Stroke::new(1.2, color);
+    let stroke = Stroke::new(1.2_f32, color);
     for offset in [
         Vec2::new(-3.8, -3.8),
         Vec2::new(3.8, -3.8),
@@ -379,7 +379,7 @@ fn paint_add_app(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
 
 fn paint_close(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
     for end in [Vec2::new(3.5, 3.5), Vec2::new(3.5, -3.5)] {
-        painter.line_segment([center - end, center + end], Stroke::new(1.3, color));
+        painter.line_segment([center - end, center + end], Stroke::new(1.3_f32, color));
     }
 }
 
@@ -387,14 +387,14 @@ fn paint_refresh(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
     let points = (0..=24)
         .map(|i| center + Vec2::angled((45.0 + 290.0 * i as f32 / 24.0).to_radians()) * 5.0)
         .collect();
-    painter.add(egui::Shape::line(points, Stroke::new(1.2, color)));
+    painter.add(egui::Shape::line(points, Stroke::new(1.2_f32, color)));
     painter.add(egui::Shape::line(
         vec![
             center + Vec2::new(1.3, -2.0),
             center + Vec2::new(4.6, -2.0),
             center + Vec2::new(4.6, -5.3),
         ],
-        Stroke::new(1.2, color),
+        Stroke::new(1.2_f32, color),
     ));
 }
 
