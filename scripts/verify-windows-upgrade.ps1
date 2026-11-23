@@ -108,9 +108,22 @@ try {
     $installedDir = Join-Path $caseRoot 'app'
     Set-Installed $installedDir
     $sleeper = Join-Path $testRoot 'parent.ps1'
-    [IO.File]::WriteAllText($sleeper, 'Start-Sleep -Seconds 4')
-    $parent = Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$sleeper`"" -WindowStyle Hidden -PassThru
+    $parentReady = Join-Path $testRoot 'parent-ready'
+    [IO.File]::WriteAllText($sleeper, @'
+param([string]$ReadyFile)
+[IO.File]::WriteAllText($ReadyFile, 'ready')
+Start-Sleep -Seconds 4
+'@)
+    $parent = Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$sleeper`" -ReadyFile `"$parentReady`"" -WindowStyle Hidden -PassThru
     try {
+        # Cold PowerShell startup under ARM64 emulation can exceed the installer's
+        # 15-second handoff deadline. Start the test only once its parent is ready.
+        $readyWatch = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $parentReady)) {
+            if ($parent.HasExited) { throw 'Test parent exited before signaling readiness.' }
+            if ($readyWatch.Elapsed.TotalSeconds -ge 60) { throw 'Test parent did not become ready.' }
+            Start-Sleep -Milliseconds 50
+        }
         $result = Run-Case $caseRoot "/UPDATE /APP_PID=$($parent.Id) /D=$installedDir"
         Assert-That $parent.HasExited 'Installer did not wait for the old application to exit.'
         Assert-Upgraded $result $installedDir

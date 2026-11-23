@@ -70,7 +70,7 @@ if [[ -z "${VERSION}" ]]; then
   echo "读不到 Cargo.toml 里的 version" >&2
   exit 1
 fi
-echo "==> 版本 $VERSION，架构 $ARCH"
+echo "==> 版本 ${VERSION}，架构 ${ARCH}"
 if [[ -n "${MACOS_NOTARY_PROFILE:-}" && -z "${MACOS_SIGNING_IDENTITY:-}" ]]; then
   echo "公证需要同时配置 MACOS_SIGNING_IDENTITY（Developer ID Application 身份）" >&2
   exit 1

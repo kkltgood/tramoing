@@ -186,7 +186,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
-首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认四个构建任务都能完成打包。Windows x64 使用 `windows-latest`，Windows ARM64 使用 `windows-11-arm`，macOS Apple Silicon 使用 `macos-15`，macOS Intel 使用 `macos-15-intel`；每个任务在对应架构上执行测试和打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
+首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认四个构建任务都能完成打包。Windows x64 使用 `windows-latest`，Windows ARM64 使用 `windows-11-arm`，macOS Apple Silicon 使用 `macos-latest`，macOS Intel 使用 `macos-15-intel`；每个任务在对应架构上执行测试和打包。macOS 部署目标仍为 11.0，构建脚本会核验产物架构。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
 
 换电脑后，发布流程仍由 GitHub Actions 执行，发起发布的电脑可以是 Windows 或 macOS，本机不需要构建 Windows 安装包。Git 的远端配置不会随代码迁移；若缺少正式发布远端，执行 `git remote add opensource https://github.com/kkltgood/tramoing.git`，保留 `origin` 作为日常开发仓库。
 
