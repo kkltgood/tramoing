@@ -19,7 +19,12 @@ function fixture(t, { existing, failUpload, notes } = {}) {
   const tag = `v${version}`;
   const notesFile = path.join(root, 'notes.md');
   if (notes !== undefined) fs.writeFileSync(notesFile, notes);
-  const packages = [`Tramoing-${version}-setup.exe`, `Tramoing-${version}.dmg`];
+  const packages = [
+    `Tramoing-${version}-windows-x64-setup.exe`,
+    `Tramoing-${version}-windows-arm64-setup.exe`,
+    `Tramoing-${version}-macos-arm64.dmg`,
+    `Tramoing-${version}-macos-x64.dmg`,
+  ];
   for (const name of packages) {
     const bytes = Buffer.from(`test package: ${name}`);
     fs.writeFileSync(path.join(directory, name), bytes);
@@ -72,20 +77,27 @@ function fixture(t, { existing, failUpload, notes } = {}) {
   };
 }
 
-test('publishes a manifest for Windows and both Mac architectures with verified bytes', async t => {
+test('publishes four distinct architecture packages with verified bytes and compatible platform keys', async t => {
   const f = fixture(t);
   await f.run();
   assert.equal(f.events[0], 'create');
   assert.equal(f.events.at(-1), 'publish');
-  assert.equal(f.uploaded.size, 5);
+  assert.equal(f.uploaded.size, 9);
   const manifest = JSON.parse(f.uploaded.get('latest.json'));
   assert.equal(manifest.version, '0.1.1');
   assert.equal(manifest.notes, '测试发布说明');
   assert.equal(manifest.homepage, 'https://github.com/kkltgood/tramoing/releases/tag/v0.1.1');
   assert.ok(Number.isFinite(Date.parse(manifest.pub_date)));
-  assert.deepEqual(Object.keys(manifest.platforms).sort(), ['macos-aarch64', 'macos-x86_64', 'windows-x86_64']);
+  const expected = {
+    'windows-x86_64': 'Tramoing-0.1.1-windows-x64-setup.exe',
+    'windows-aarch64': 'Tramoing-0.1.1-windows-arm64-setup.exe',
+    'macos-aarch64': 'Tramoing-0.1.1-macos-arm64.dmg',
+    'macos-x86_64': 'Tramoing-0.1.1-macos-x64.dmg',
+  };
+  assert.deepEqual(Object.keys(manifest.platforms).sort(), Object.keys(expected).sort());
+  assert.equal(new Set(Object.values(manifest.platforms).map(asset => asset.url)).size, 4);
   for (const [platform, asset] of Object.entries(manifest.platforms)) {
-    const name = platform.startsWith('windows') ? f.packages[0] : f.packages[1];
+    const name = expected[platform];
     const bytes = f.uploaded.get(name);
     assert.equal(asset.url, `https://github.com/kkltgood/tramoing/releases/download/v0.1.1/${name}`);
     assert.equal(asset.sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
@@ -110,6 +122,7 @@ test('missing or empty version notes retain generated release notes', async t =>
     await f.run();
     assert.equal(f.created[0].generate_release_notes, true);
     assert.match(f.created[0].body, /安装包/);
+    for (const name of f.packages) assert.ok(f.created[0].body.includes(name));
     assert.equal(JSON.parse(f.uploaded.get('latest.json')).notes, '测试发布说明');
   }
 });
@@ -135,12 +148,25 @@ test('does not modify an already published release', async t => {
 });
 
 test('rejects corrupt or missing packages before creating a release', async t => {
-  const corrupt = fixture(t);
-  fs.appendFileSync(path.join(corrupt.directory, corrupt.packages[0]), 'tampered');
-  await assert.rejects(corrupt.run(), /Checksum mismatch/);
-  assert.deepEqual(corrupt.events, []);
-  const missing = fixture(t);
-  fs.unlinkSync(path.join(missing.directory, missing.packages[1]));
-  await assert.rejects(missing.run(), /Unexpected release assets/);
-  assert.deepEqual(missing.events, []);
+  for (let index = 0; index < 4; index++) {
+    const corrupt = fixture(t);
+    fs.appendFileSync(path.join(corrupt.directory, corrupt.packages[index]), 'tampered');
+    await assert.rejects(corrupt.run(), /Checksum mismatch/);
+    assert.deepEqual(corrupt.events, []);
+    for (const suffix of ['', '.sha256']) {
+      const missing = fixture(t);
+      fs.unlinkSync(path.join(missing.directory, `${missing.packages[index]}${suffix}`));
+      await assert.rejects(missing.run(), /Unexpected release assets/);
+      assert.deepEqual(missing.events, []);
+    }
+  }
+});
+
+test('rejects stale packages with generic filenames instead of publishing ambiguous downloads', async t => {
+  for (const name of ['Tramoing-0.1.1.dmg', 'Tramoing-0.1.1-setup.exe']) {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.directory, name), 'old package');
+    await assert.rejects(f.run(), /Unexpected release assets/);
+    assert.deepEqual(f.events, []);
+  }
 });

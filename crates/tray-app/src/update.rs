@@ -41,6 +41,8 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// 唯一真源，发布脚本也照这个拼。
 pub const PLATFORM: &str = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
     "windows-x86_64"
+} else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+    "windows-aarch64"
 } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
     "macos-aarch64"
 } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
@@ -773,17 +775,19 @@ mod tests {
             "version": "1.2.0", "notes": "发布说明", "pub_date": "2026-11-21T12:00:00Z",
             "homepage": "https://github.com/kkltgood/tramoing/releases/tag/v1.2.0",
             "platforms": {
-                "windows-x86_64": { "url": "https://example.com/setup.exe", "sha256": "a".repeat(64), "size": 12 },
-                "macos-aarch64": { "url": "https://example.com/app.dmg", "sha256": "b".repeat(64), "size": 34 },
-                "macos-x86_64": { "url": "https://example.com/app.dmg", "sha256": "b".repeat(64), "size": 34 }
+                "windows-x86_64": { "url": "https://example.com/windows-x64-setup.exe", "sha256": "a".repeat(64), "size": 12 },
+                "windows-aarch64": { "url": "https://example.com/windows-arm64-setup.exe", "sha256": "b".repeat(64), "size": 23 },
+                "macos-aarch64": { "url": "https://example.com/macos-arm64.dmg", "sha256": "c".repeat(64), "size": 34 },
+                "macos-x86_64": { "url": "https://example.com/macos-x64.dmg", "sha256": "d".repeat(64), "size": 45 }
             }
         })).unwrap()
         };
-        for platform in [
-            "windows-x86_64",
-            "macos-aarch64",
-            "macos-x86_64",
-            "unsupported",
+        for (platform, filename, size) in [
+            ("windows-x86_64", "windows-x64-setup.exe", 12),
+            ("windows-aarch64", "windows-arm64-setup.exe", 23),
+            ("macos-aarch64", "macos-arm64.dmg", 34),
+            ("macos-x86_64", "macos-x64.dmg", 45),
+            ("unsupported", "", 0),
         ] {
             let available = available_update(parse(), "1.1.0", platform)
                 .unwrap()
@@ -791,10 +795,12 @@ mod tests {
             assert_eq!(available.version, "1.2.0");
             assert_eq!(available.notes, "发布说明");
             assert!(available.homepage.ends_with("/releases/tag/v1.2.0"));
-            match platform {
-                "windows-x86_64" => assert_eq!(available.asset.unwrap().size, 12),
-                "unsupported" => assert!(available.asset.is_none()),
-                _ => assert_eq!(available.asset.unwrap().size, 34),
+            if platform == "unsupported" {
+                assert!(available.asset.is_none());
+            } else {
+                let asset = available.asset.unwrap();
+                assert_eq!(asset.size, size);
+                assert_eq!(asset.url, format!("https://example.com/{filename}"));
             }
         }
         assert!(available_update(parse(), "1.2.0", PLATFORM)

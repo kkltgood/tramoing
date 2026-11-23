@@ -2,10 +2,13 @@
 #
 # macOS 打包：编译 → 组装 .app → 生成图标 → ad-hoc 签名 → 打成 DMG。
 #
-#   ./scripts/package-macos.sh            # 有 x86_64 target 就做通用二进制，否则只做本机架构
-#   ./scripts/package-macos.sh --no-dmg   # 只出 .app
+#   ./scripts/package-macos.sh                  # 只构建本机架构
+#   ./scripts/package-macos.sh --arch arm64     # Apple Silicon
+#   ./scripts/package-macos.sh --arch x64       # Intel
+#   ./scripts/package-macos.sh --arch universal # 可选的通用包，不用于自动发布
+#   ./scripts/package-macos.sh --no-dmg         # 只出 .app
 #
-# 产物：dist/Tramoing.app、dist/Tramoing-<version>.dmg
+# 产物：dist/macos-<arch>/Tramoing.app、dist/Tramoing-<version>-macos-<arch>.dmg
 #
 # 本地构建使用 ad-hoc 签名。面向其他用户发布时需配置 Developer ID 和公证。
 
@@ -23,22 +26,51 @@ BIN="tramoing"
 BUNDLE_ID="dev.guolongkang.tramoing"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST="$ROOT/dist"
-APP="$DIST/$APP_NAME.app"
+ARCH=""
 MAKE_DMG=1
 DMGBUILD_PYTHON=${DMGBUILD_PYTHON:-python3}
+export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-11.0}
 
-for arg in "$@"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --arch)
+      [[ $# -ge 2 ]] || { echo '--arch 需要指定 arm64、x64 或 universal' >&2; exit 1; }
+      ARCH=$2
+      shift
+      ;;
     --no-dmg) MAKE_DMG=0 ;;
-    *) echo "未知参数：$arg" >&2; exit 1 ;;
+    *) echo "未知参数：$1" >&2; exit 1 ;;
   esac
+  shift
+done
+
+if [[ -z "$ARCH" ]]; then
+  case "$(uname -m)" in
+    arm64) ARCH=arm64 ;;
+    x86_64) ARCH=x64 ;;
+    *) echo '不支持的 macOS 架构' >&2; exit 1 ;;
+  esac
+fi
+case "$ARCH" in
+  arm64) TARGETS=(aarch64-apple-darwin); MACH_ARCHS=(arm64) ;;
+  x64) TARGETS=(x86_64-apple-darwin); MACH_ARCHS=(x86_64) ;;
+  universal) TARGETS=(aarch64-apple-darwin x86_64-apple-darwin); MACH_ARCHS=(arm64 x86_64) ;;
+  *) echo '不支持的 --arch，请使用 arm64、x64 或 universal' >&2; exit 1 ;;
+esac
+APP="$DIST/macos-$ARCH/$APP_NAME.app"
+INSTALLED_TARGETS=$(rustup target list --installed)
+for t in "${TARGETS[@]}"; do
+  if ! grep -qx "$t" <<< "$INSTALLED_TARGETS"; then
+    echo "缺少目标，请先执行 rustup target add $t" >&2
+    exit 1
+  fi
 done
 
 if [[ -z "${VERSION}" ]]; then
   echo "读不到 Cargo.toml 里的 version" >&2
   exit 1
 fi
-echo "==> 版本 $VERSION"
+echo "==> 版本 $VERSION，架构 $ARCH"
 if [[ -n "${MACOS_NOTARY_PROFILE:-}" && -z "${MACOS_SIGNING_IDENTITY:-}" ]]; then
   echo "公证需要同时配置 MACOS_SIGNING_IDENTITY（Developer ID Application 身份）" >&2
   exit 1
@@ -53,19 +85,6 @@ TARGET_DIR=$(cargo metadata --format-version=1 --no-deps --locked |
   /usr/bin/plutil -extract target_directory raw -o - -)
 
 # ---------- 1. 编译 ----------
-# 两个 target 都在才做通用二进制。只有本机架构时也能出包，只是别的 CPU 跑不了。
-TARGETS=()
-if rustup target list --installed | grep -qx "aarch64-apple-darwin"; then
-  TARGETS+=("aarch64-apple-darwin")
-fi
-if rustup target list --installed | grep -qx "x86_64-apple-darwin"; then
-  TARGETS+=("x86_64-apple-darwin")
-fi
-if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  echo "没有安装任何 macOS target，先执行 rustup target add aarch64-apple-darwin" >&2
-  exit 1
-fi
-
 for t in "${TARGETS[@]}"; do
   echo "==> 编译 $t (release)"
   cargo build --release --locked -p tray-app --target "$t"
@@ -87,6 +106,11 @@ else
   echo "    单架构（${TARGETS[0]}）"
 fi
 chmod +x "$APP/Contents/MacOS/$BIN"
+lipo "$APP/Contents/MacOS/$BIN" -verify_arch "${MACH_ARCHS[@]}"
+if [[ ${#TARGETS[@]} -eq 1 && "$(lipo -archs "$APP/Contents/MacOS/$BIN")" != "${MACH_ARCHS[0]}" ]]; then
+  echo "包内二进制架构与 $ARCH 不一致" >&2
+  exit 1
+fi
 
 sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 echo -n "APPL????" > "$APP/Contents/PkgInfo"
@@ -125,7 +149,7 @@ codesign --verify --deep --strict "$APP" && echo "    签名校验通过"
 
 if [[ -n "${MACOS_NOTARY_PROFILE:-}" ]]; then
   echo "==> 公证应用并附加公证票据"
-  NOTARY_ZIP="$DIST/Tramoing-$VERSION-notary.zip"
+  NOTARY_ZIP="$DIST/Tramoing-$VERSION-macos-$ARCH-notary.zip"
   ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
   xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$MACOS_NOTARY_PROFILE" --wait
   xcrun stapler staple "$APP"
@@ -134,7 +158,7 @@ fi
 
 # ---------- 5. DMG ----------
 if [[ $MAKE_DMG -eq 1 ]]; then
-  DMG="$DIST/Tramoing-$VERSION.dmg"
+  DMG="$DIST/Tramoing-$VERSION-macos-$ARCH.dmg"
   echo "==> 打包 $DMG"
   # dmgbuild writes a reproducible Finder layout without UI automation or a
   # logged-in Finder session, including a Retina background and icon positions.
@@ -158,5 +182,5 @@ if [[ -d "$APP" ]]; then
   echo "  $APP  ($(du -sh "$APP" | cut -f1))"
 fi
 if [[ $MAKE_DMG -eq 1 ]]; then
-  echo "  $DIST/$APP_NAME-$VERSION.dmg"
+  echo "  $DMG"
 fi

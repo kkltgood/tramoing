@@ -14,10 +14,13 @@ param(
     [string]$BaseUrl = "",
     # 发布说明，写入清单供客户端和发布工具读取
     [string]$Notes = "",
-    [string]$OutFile = ""
+    [string]$OutFile = "",
+    [ValidateSet('x64', 'arm64')]
+    [string]$Architecture = 'x64'
 )
 
 $ErrorActionPreference = "Stop"
+$Architecture = $Architecture.ToLowerInvariant()
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 
 # 版本从 Cargo.toml 读，和 build.ps1 同一个来源，避免两处写不一样
@@ -26,7 +29,7 @@ if (-not $line) { throw "读不到 Cargo.toml 里的 version" }
 $Version = $line.Matches[0].Groups[1].Value
 
 if (-not $Installer) {
-    $Installer = Join-Path $root "dist\Tramoing-$Version-setup.exe"
+    $Installer = Join-Path $root "dist\Tramoing-$Version-windows-$Architecture-setup.exe"
 }
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
     throw "找不到安装包：$Installer（先跑 build.ps1）"
@@ -46,6 +49,7 @@ if (-not $OutFile) {
 
 $file = Get-Item -LiteralPath $Installer
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+$platform = if ($Architecture -eq 'arm64') { 'windows-aarch64' } else { 'windows-x86_64' }
 
 $manifest = [ordered]@{
     version   = $Version
@@ -53,7 +57,7 @@ $manifest = [ordered]@{
     pub_date  = (Get-Date).ToString("yyyy-MM-dd")
     homepage  = "$BaseUrl"
     platforms = [ordered]@{
-        "windows-x86_64" = [ordered]@{
+        $platform = [ordered]@{
             url    = "$BaseUrl/$([Uri]::EscapeDataString($file.Name))"
             sha256 = $hash
             size   = $file.Length

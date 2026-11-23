@@ -1,8 +1,13 @@
 ﻿# Compile a non-elevated NSIS fixture against the real upgrade callbacks.
 # All payloads and registry entries belong to this test run only.
-param([string]$MakeNsis = '')
+param(
+    [string]$MakeNsis = '',
+    [ValidateSet('x64', 'arm64')]
+    [string]$Architecture = 'x64'
+)
 
 $ErrorActionPreference = 'Stop'
+$Architecture = $Architecture.ToLowerInvariant()
 if (-not $MakeNsis) {
     $command = Get-Command makensis -ErrorAction SilentlyContinue
     if ($command) { $MakeNsis = $command.Source }
@@ -76,7 +81,7 @@ function Assert-Upgraded([string]$Result, [string]$Directory) {
 }
 
 try {
-    & $MakeNsis '/V2' "/DTEST_BUNDLE_ID=$bundleId" "/DTEST_OUTPUT=$fixture" (Join-Path $repository 'packaging\windows\tests\upgrade-harness.nsi')
+    & $MakeNsis '/V2' "/DAPP_ARCH=$Architecture" "/DTEST_BUNDLE_ID=$bundleId" "/DTEST_OUTPUT=$fixture" (Join-Path $repository 'packaging\windows\tests\upgrade-harness.nsi')
     if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the NSIS upgrade harness.' }
 
     $caseRoot = New-Case 'fresh'

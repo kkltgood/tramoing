@@ -1,7 +1,7 @@
 ﻿; Tramoing 的 Windows 安装包脚本（NSIS 3）。
 ;
 ; 由 packaging/windows/build.ps1 调用，也可以在 Windows 上手动执行：
-;   makensis /DAPP_VERSION=0.1.0 packaging\windows\tramoing.nsi
+;   makensis /DAPP_VERSION=0.1.0 /DAPP_ARCH=x64 packaging\windows\tramoing.nsi
 ;
 ; 安装内容：
 ;   tramoing.exe          托盘主程序（普通权限）
@@ -32,6 +32,14 @@ Unicode true
 !ifndef APP_VERSION
   !define APP_VERSION "0.1.0"
 !endif
+!ifndef APP_ARCH
+  !define APP_ARCH "x64"
+!endif
+!if "${APP_ARCH}" != "x64"
+!if "${APP_ARCH}" != "arm64"
+  !error "APP_ARCH must be x64 or arm64"
+!endif
+!endif
 
 ; 覆盖安装时正在运行的 exe 会被 Windows 锁住，File 直接覆盖会弹 NSIS 原生
 ; 错误框（中止/重试/忽略），用户点「忽略」就会装出「主程序新版、助手旧版」
@@ -52,8 +60,8 @@ Unicode true
 !macroend
 
 Name "${APP_NAME}"
-BrandingText "${APP_NAME} ${APP_VERSION}"
-OutFile "..\..\dist\${APP_NAME}-${APP_VERSION}-setup.exe"
+BrandingText "${APP_NAME} ${APP_VERSION} (${APP_ARCH})"
+OutFile "..\..\dist\${APP_NAME}-${APP_VERSION}-windows-${APP_ARCH}-setup.exe"
 InstallDir "$PROGRAMFILES64\${APP_NAME}"
 InstallDirRegKey HKLM "Software\${BUNDLE_ID}" "InstallDir"
 ; 装到 Program Files、注册计划任务都需要管理员权限，一次 UAC 换全程静默
@@ -64,7 +72,7 @@ ShowUninstDetails show
 
 VIProductVersion "${APP_VERSION}.0"
 VIAddVersionKey "ProductName" "${APP_NAME}"
-VIAddVersionKey "FileDescription" "${APP_NAME} 安装程序"
+VIAddVersionKey "FileDescription" "${APP_NAME} 安装程序 (${APP_ARCH})"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
@@ -148,7 +156,7 @@ SectionEnd
 Section "托盘程序（必需）" SEC_MAIN
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "..\..\dist\windows\${APP_EXE}"
+  File "..\..\dist\windows-${APP_ARCH}\${APP_EXE}"
   File "..\..\LICENSE"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -181,7 +189,7 @@ SectionEnd
 Section "流量采集助手（按进程统计必需）" SEC_HELPER
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "..\..\dist\windows\${HELPER_EXE}"
+  File "..\..\dist\windows-${APP_ARCH}\${HELPER_EXE}"
 
   DetailPrint "注册登录自启任务（最高权限）..."
   StrCpy $0 -1

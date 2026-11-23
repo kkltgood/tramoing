@@ -4,6 +4,9 @@
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
 !include "${__FILEDIR__}\legacy.nsh"
+!ifdef APP_ARCH
+  !include "x64.nsh"
+!endif
 
 !ifndef INSTALL_REG_ROOT
   !define INSTALL_REG_ROOT HKLM
@@ -13,6 +16,23 @@ Var UpgradeMode
 Var UpdateParentPid
 
 Function .onInit
+  ; Reject incompatible packages before any installed files or processes change.
+  !ifdef APP_ARCH
+    !if "${APP_ARCH}" == "arm64"
+      ${IfNot} ${IsNativeARM64}
+        MessageBox MB_ICONSTOP|MB_OK "此安装包需要 Windows ARM64，请下载 Windows x64 安装包。" /SD IDOK
+        SetErrorLevel 1
+        Abort
+      ${EndIf}
+    !else
+      ; Keep x64 upgrades working for existing clients under ARM64 emulation.
+      ${IfNot} ${RunningX64}
+        MessageBox MB_ICONSTOP|MB_OK "此安装包需要 64 位 Windows。" /SD IDOK
+        SetErrorLevel 1
+        Abort
+      ${EndIf}
+    !endif
+  !endif
   StrCpy $UpgradeMode 0
   StrCpy $UpdateParentPid ""
   ${GetParameters} $0

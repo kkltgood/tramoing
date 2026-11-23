@@ -14,8 +14,13 @@ module.exports = async function publishRelease({
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || tag !== `v${version}`) {
     throw new Error('Release tag must match the stable package version.');
   }
-  const packages = [`Tramoing-${version}-setup.exe`, `Tramoing-${version}.dmg`];
-  const names = packages.flatMap(name => [name, `${name}.sha256`]).sort();
+  const packages = {
+    'windows-x86_64': `Tramoing-${version}-windows-x64-setup.exe`,
+    'windows-aarch64': `Tramoing-${version}-windows-arm64-setup.exe`,
+    'macos-aarch64': `Tramoing-${version}-macos-arm64.dmg`,
+    'macos-x86_64': `Tramoing-${version}-macos-x64.dmg`,
+  };
+  const names = Object.values(packages).flatMap(name => [name, `${name}.sha256`]).sort();
   const actual = fs.readdirSync(directory).sort();
   if (JSON.stringify(actual) !== JSON.stringify(names)) {
     throw new Error(`Unexpected release assets: ${actual.join(', ')}`);
@@ -23,14 +28,14 @@ module.exports = async function publishRelease({
 
   const { owner, repo } = context.repo;
   const baseUrl = `https://github.com/${owner}/${repo}/releases/download/${tag}`;
-  const assets = packages.map(name => {
+  const platforms = Object.fromEntries(Object.entries(packages).map(([platform, name]) => {
     const file = fs.readFileSync(path.join(directory, name));
     if (!file.length) throw new Error(`Empty package: ${name}`);
     const checksum = fs.readFileSync(path.join(directory, `${name}.sha256`), 'utf8').trim();
     const digest = crypto.createHash('sha256').update(file).digest('hex');
     if (checksum !== `${digest}  ${name}`) throw new Error(`Checksum mismatch: ${name}`);
-    return { url: `${baseUrl}/${name}`, sha256: digest, size: file.length };
-  });
+    return [platform, { url: `${baseUrl}/${name}`, sha256: digest, size: file.length }];
+  }));
   const releaseNotes = fs.existsSync(notesFile) ? fs.readFileSync(notesFile, 'utf8').trim() : '';
 
   let release;
@@ -51,7 +56,16 @@ module.exports = async function publishRelease({
     release = (await github.rest.repos.createRelease({
       owner, repo, tag_name: tag, name: `Tramoing ${tag}`, draft: true,
       generate_release_notes: !releaseNotes,
-      body: releaseNotes || '安装包：Windows 10/11 x64 使用 `-setup.exe`；macOS 11+（Apple Silicon / Intel）使用通用 `.dmg`。\n\n每个安装包均附带 SHA-256 校验文件，`latest.json` 用于应用内更新。Windows 安装包尚未做代码签名；macOS 使用 ad-hoc 签名，尚未进行 Developer ID 签名及公证。',
+      body: releaseNotes || [
+        '请按系统和处理器选择安装包：',
+        '',
+        `- Windows 10/11，Intel / AMD 64 位：\`${packages['windows-x86_64']}\`。`,
+        `- Windows 11，ARM64（如 Snapdragon）：\`${packages['windows-aarch64']}\`。`,
+        `- macOS 11+，Apple Silicon（M 系列）：\`${packages['macos-aarch64']}\`。`,
+        `- macOS 11+，Intel：\`${packages['macos-x86_64']}\`。`,
+        '',
+        '每个安装包均附带 SHA-256 校验文件，`latest.json` 用于应用内更新。Windows 安装包尚未做代码签名；macOS 使用 ad-hoc 签名，尚未进行 Developer ID 签名及公证。',
+      ].join('\n'),
     })).data;
   }
 
@@ -60,11 +74,7 @@ module.exports = async function publishRelease({
     notes: release.body || '',
     pub_date: new Date().toISOString(),
     homepage: `https://github.com/${owner}/${repo}/releases/tag/${tag}`,
-    platforms: {
-      'windows-x86_64': assets[0],
-      'macos-aarch64': assets[1],
-      'macos-x86_64': assets[1],
-    },
+    platforms,
   };
   fs.writeFileSync(path.join(directory, 'latest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   names.push('latest.json');

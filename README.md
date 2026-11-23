@@ -34,13 +34,23 @@
 | 平台 | 流量采集 | 注意事项 |
 | --- | --- | --- |
 | Windows 10 / 11 x64 | ETW 采集助手 | 助手需要管理员权限，界面以普通权限运行 |
+| Windows 11 ARM64 | ETW 采集助手 | 使用 ARM64 原生安装包，助手需要管理员权限 |
 | macOS 11+，Apple Silicon / Intel | 系统 `nettop` | 建议通过 `.app` 包运行并验证菜单栏行为 |
 
 CPU / GPU 显示不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
 
 ## 从源码运行
 
-已发布的 Windows 安装包和 macOS 通用 DMG 可在 [Releases](https://github.com/kkltgood/tramoing/releases) 下载；维护者推送版本标签后由 GitHub Actions 自动构建和发布，见[自动发布指南](docs/development.md#自动发布到-github-releases)。
+安装包可在 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。新版发布流程按系统和处理器分别提供以下安装包，每个包均附带 `.sha256` 校验文件：
+
+| 设备 | 安装包 |
+| --- | --- |
+| Windows，Intel / AMD 64 位 | `Tramoing-<version>-windows-x64-setup.exe` |
+| Windows，ARM64（如 Snapdragon） | `Tramoing-<version>-windows-arm64-setup.exe` |
+| macOS，Apple Silicon（M 系列） | `Tramoing-<version>-macos-arm64.dmg` |
+| macOS，Intel | `Tramoing-<version>-macos-x64.dmg` |
+
+Windows 可在“设置 → 系统 → 系统信息 → 系统类型”查看架构，macOS 可在“关于本机”查看芯片或处理器。维护者推送版本标签后由 GitHub Actions 自动构建和发布，见[自动发布指南](docs/development.md#自动发布到-github-releases)。
 
 准备 Rust stable 工具链。Windows 还需要 Visual Studio Build Tools 的“使用 C++ 的桌面开发”和 Windows SDK；macOS 需要 Xcode Command Line Tools。
 
@@ -76,14 +86,14 @@ cargo build --release --locked -p tray-app -p tm-windows --bins
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 ```
 
-产物为 `dist/Tramoing-<version>-setup.exe`。安装器会安装必需的采集助手并注册计划任务。故障诊断方法见[故障排查](docs/troubleshooting.md)。
+默认生成 `dist/Tramoing-<version>-windows-x64-setup.exe`；ARM64 使用 `-Architecture arm64`（需先安装对应 Rust target 和 C++ ARM64 生成工具，见开发指南）。安装器会安装同架构的采集助手并注册计划任务。故障诊断方法见[故障排查](docs/troubleshooting.md)。
 
 ### macOS
 
 ```sh
-# 默认构建已安装的 macOS 目标；两个目标都安装时生成通用二进制
+# 默认只构建本机架构；也可显式指定 --arch arm64 或 --arch x64
 ./scripts/package-macos.sh --no-dmg
-open dist/Tramoing.app
+open dist/macos-arm64/Tramoing.app # Intel 使用 dist/macos-x64/Tramoing.app
 
 # 同时生成 DMG
 ./scripts/package-macos.sh

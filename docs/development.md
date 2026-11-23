@@ -14,7 +14,7 @@ cargo build --release --locked -p tray-app -p tm-windows --bins
 node --test packaging/update/release.test.cjs
 ```
 
-CI 在 Windows 和 macOS 执行这些检查，并在 macOS 检查 Apple Silicon / Intel 两个目标。发布脚本的测试需要 Node.js 20+，验证清单、草稿重试和上传失败处理，不会访问 GitHub。纯逻辑测试跨平台运行；真实桌面、性能计数器、网络采集等验收默认忽略，需要在对应系统上单独执行。
+CI 在 Windows 和 macOS 执行这些检查，并检查 Windows ARM64 以及 macOS Apple Silicon / Intel 目标。发布脚本的测试需要 Node.js 20+，验证四个架构安装包的清单、校验和、草稿重试和上传失败处理，不会访问 GitHub。纯逻辑测试跨平台运行；真实桌面、性能计数器、网络采集等验收默认忽略，需要在对应系统上单独执行。
 
 `Cargo.lock` 随仓库提交。常规构建使用 `--locked`，依赖升级时单独评估并提交锁文件变化。各 crate 是应用内部模块，设置了 `publish = false`。
 
@@ -63,9 +63,10 @@ TM_DATA_DIR="$PWD/target/demo-data" cargo run -p tray-app --locked -- --mock --s
 直接运行二进制可调试面板。验证 macOS 菜单栏位置、焦点、Space 和登录自启时，应打包 `.app`，再运行包内程序：
 
 ```sh
-./scripts/package-macos.sh --no-dmg
+# Apple Silicon；Intel 将 arm64 改为 x64
+./scripts/package-macos.sh --arch arm64 --no-dmg
 TM_DATA_DIR="$PWD/target/demo-data" \
-  ./dist/Tramoing.app/Contents/MacOS/tramoing --mock --show
+  ./dist/macos-arm64/Tramoing.app/Contents/MacOS/tramoing --mock --show
 ```
 
 常用环境变量：
@@ -142,9 +143,13 @@ Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
+
+# Windows ARM64；交叉编译时还需安装 Visual Studio 的 C++ ARM64 生成工具
+rustup target add aarch64-pc-windows-msvc
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Architecture arm64
 ```
 
-脚本从 Cargo 返回的实际产物路径收集主程序和助手，兼容自定义 `CARGO_TARGET_DIR`。默认生成 `dist/Tramoing-<version>-setup.exe` 和对应的 `.sha256`，安装目录包含项目许可证。`.ps1` 和 `.nsi` 中的中文使用 UTF-8 BOM，以兼容 Windows PowerShell 5.1 和 NSIS。
+`-Architecture` 支持 `x64`（默认）和 `arm64`，分别指定 `x86_64-pc-windows-msvc` 和 `aarch64-pc-windows-msvc` 编译目标。脚本从 Cargo 返回的实际产物路径收集主程序和助手，兼容自定义 `CARGO_TARGET_DIR`，并校验两个 PE 文件的真实架构。暂存目录为 `dist/windows-<arch>/`，生成 `dist/Tramoing-<version>-windows-<arch>-setup.exe` 和对应的 `.sha256`，安装目录包含项目许可证。安装器在修改现有安装前拒绝不兼容的架构；已有的 x64 程序在 ARM64 Windows 的模拟环境下仍可继续升级 x64 包。`.ps1` 和 `.nsi` 中的中文使用 UTF-8 BOM，以兼容 Windows PowerShell 5.1 和 NSIS。
 
 升级逻辑位于 `packaging/windows/upgrade.nsh`，同样保存为 UTF-8 BOM。`verify-windows-upgrade.ps1` 编译并运行使用这些回调的独立安装器，验证首次安装保留向导、旧客户端升级跳过向导、自定义目录、等待旧进程退出、失败时不重启和旧产品名迁移。测试仅写入 `target/upgrade-test-<id>` 和独立的 HKCU 测试键，结束时清理测试键；发布工作流在 Windows 打包前运行。
 
@@ -152,10 +157,11 @@ macOS：
 
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
-./scripts/package-macos.sh
+./scripts/package-macos.sh --arch arm64
+./scripts/package-macos.sh --arch x64
 ```
 
-两个目标都安装时生成通用二进制；只安装一个时生成对应架构的包，支持 `CARGO_TARGET_DIR`。产物为 `dist/Tramoing.app`、`dist/Tramoing-<version>.dmg` 和对应的 `.sha256`。生成 DMG 需要 Python 3.10+；打包脚本在 `target/dmgbuild-venv` 中安装固定版本的 `dmgbuild`，也可用 `DMGBUILD_PYTHON` 指向预先准备好的 Python 环境。`--no-dmg` 不需要此工具。
+省略 `--arch` 时只构建本机架构，不受已安装 target 数量影响；显式 `--arch universal` 仍可生成本地通用包，自动发布只使用 `arm64` 和 `x64`。缺少指定的 target 时会报错并提示安装命令，不会悄悄改用其他架构。支持 `CARGO_TARGET_DIR`。产物为 `dist/macos-<arch>/Tramoing.app`、`dist/Tramoing-<version>-macos-<arch>.dmg` 和对应的 `.sha256`；包内应用仍名为 `Tramoing.app`。打包时校验 Mach-O 架构，部署目标默认为 macOS 11.0。生成 DMG 需要 Python 3.10+；打包脚本在 `target/dmgbuild-venv` 中安装固定版本的 `dmgbuild`，也可用 `DMGBUILD_PYTHON` 指向预先准备好的 Python 环境。`--no-dmg` 不需要此工具。
 
 DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-settings.py` 固定写入 `.DS_Store`，不需要 Finder 自动化授权或交互式桌面。背景源为 `dmg-background.svg`，修改设计后同步生成 700×460 的 PNG 和 1400×920 的 `@2x` PNG。安装器支持拖入 Applications，也支持从 DMG 双击应用后确认“安装并打开”；普通账户无法写入 `/Applications` 时，首次安装使用 `~/Applications`。已有安装优先沿用其路径，不会因权限不足悄悄另装一份。安装、更新或第一次启动后展开主面板一次，失焦收起仍正常生效。
 
@@ -172,11 +178,11 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.5` 这样的标签 | 检查版本、运行测试、打包两个平台并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.5` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
-首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认 Windows 和 macOS 都能完成打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
+首次启用时先把工作流推送到开源仓库。然后在 [Actions](https://github.com/kkltgood/tramoing/actions/workflows/release.yml) 手动运行一次，`tag` 留空，确认四个构建任务都能完成打包。Windows x64 使用 `windows-latest`，Windows ARM64 使用 `windows-11-arm`，macOS Apple Silicon 使用 `macos-15`，macOS Intel 使用 `macos-15-intel`；每个任务在对应架构上执行测试和打包。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌；发布任务已声明 `contents: write` 权限。如果仓库或组织禁用了 Actions，需要先由仓库管理员启用。
 
 换电脑后，发布流程仍由 GitHub Actions 执行，发起发布的电脑可以是 Windows 或 macOS，本机不需要构建 Windows 安装包。Git 的远端配置不会随代码迁移；若缺少正式发布远端，执行 `git remote add opensource https://github.com/kkltgood/tramoing.git`，保留 `origin` 作为日常开发仓库。
 
@@ -204,15 +210,18 @@ macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连
 
 不要对 `opensource` 使用 `git push -u`，以免改变日常开发的上游。标签必须与 Cargo 版本完全一致，格式为 `v主版本.次版本.补丁版本`；当前 Windows 安装器要求三个版本分量均为不超过 65535 的非负整数，因此此流程暂不发布预览版本标签。
 
-每次 Release 包含以下五个文件：
+每次 Release 包含四个安装包、各自的 `.sha256` 以及 `latest.json`，共九个附件：
 
-- `Tramoing-<version>-setup.exe`：Windows 10/11 x64，包含主程序和采集助手。
-- `Tramoing-<version>-setup.exe.sha256`：Windows 安装包校验值。
-- `Tramoing-<version>.dmg`：macOS 11+ 通用包，同一包内包含 Apple Silicon 和 Intel 可执行代码。
-- `Tramoing-<version>.dmg.sha256`：macOS DMG 校验值。
-- `latest.json`：应用内更新清单，包含版本、发布说明、日期和三个平台的下载地址、SHA-256、文件大小；两个 macOS 架构共用通用 DMG。
+| 安装包 | 适用设备 | 更新清单平台键 |
+| --- | --- | --- |
+| `Tramoing-<version>-windows-x64-setup.exe` | Windows 10/11，Intel / AMD 64 位 | `windows-x86_64` |
+| `Tramoing-<version>-windows-arm64-setup.exe` | Windows 11，ARM64（如 Snapdragon） | `windows-aarch64` |
+| `Tramoing-<version>-macos-arm64.dmg` | macOS 11+，Apple Silicon（M 系列） | `macos-aarch64` |
+| `Tramoing-<version>-macos-x64.dmg` | macOS 11+，Intel | `macos-x86_64` |
 
-所有平台的格式、测试、Clippy 和打包都通过后，发布任务再次核对文件及 SHA-256，再创建草稿、生成清单、上传全部五个附件并公开 Release。清单中的安装包地址固定到本次版本标签，避免下一次发布时下载到不同文件。打包失败不会发布；上传失败会保留草稿供重试。已经公开的同版本 Release 不会被覆盖，需要修复时发布新版本。当前项目不支持 Linux，因此不生成 Linux 安装包。
+Windows 包均包含同架构的主程序和采集助手。`latest.json` 包含版本、发布说明、日期以及四个平台各自的下载地址、SHA-256 和文件大小。已有客户端的平台键保持兼容，旧 macOS 通用程序升级后会下载与当前运行架构一致的专用 DMG；在 Rosetta 或 Windows x64 模拟环境下运行的程序继续选择 x64 包，需要切换到 ARM64 时手动安装对应包。
+
+所有平台的格式、测试、Clippy 和打包都通过后，发布任务再次核对全部八个输入文件及 SHA-256，再创建草稿、生成清单、上传全部九个附件并公开 Release。缺少任意架构的安装包或校验文件都会停止发布。清单中的安装包地址固定到本次版本标签，避免下一次发布时下载到不同文件。打包失败不会发布；上传失败会保留草稿供重试。已经公开的同版本 Release 不会被覆盖，需要修复时发布新版本。历史 Release 保留原有文件名；新的拆分包从采用此流程的下一版本开始提供。当前项目不支持 Linux，因此不生成 Linux 安装包。
 
 Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 Developer ID 签名和公证，系统仍可能显示来源或安全提示。
 
@@ -237,7 +246,7 @@ powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
   -BaseUrl 'https://example.com/releases/v0.1.3' -Notes '发布说明'
 ```
 
-脚本计算安装包的 SHA-256 和文件大小，生成 `dist/latest.json`。客户端支持的平台键为 `windows-x86_64`、`macos-aarch64`、`macos-x86_64`；脚本默认生成 Windows 条目，其他平台按同一格式添加：
+脚本计算安装包的 SHA-256 和文件大小，生成 `dist/latest.json`。客户端支持的平台键为 `windows-x86_64`、`windows-aarch64`、`macos-aarch64`、`macos-x86_64`；脚本默认生成 Windows x64 条目，使用 `-Architecture arm64` 时读取 ARM64 安装包并生成 `windows-aarch64` 条目。该脚本每次生成单个 Windows 架构的清单，多架构发布使用上面的自动发布流程，或按同一格式合并条目：
 
 ```json
 {
@@ -246,7 +255,7 @@ powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
   "homepage": "https://example.com/releases",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://example.com/releases/Tramoing-0.1.3-setup.exe",
+      "url": "https://example.com/releases/Tramoing-0.1.3-windows-x64-setup.exe",
       "sha256": "由脚本生成的64位十六进制摘要",
       "size": 123456
     }
