@@ -7,3 +7,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+
+[[bench]]
+name = "window_tracker"
+harness = false

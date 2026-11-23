@@ -34,6 +34,10 @@ CI 在 Windows 和 macOS 执行这些检查，并检查 Windows ARM64 以及 mac
 
 采样器向核心层提供累计值，核心层计算速率并按应用归并。采样线程保留最新快照供界面读取，每 5 秒将增量写入历史库。导出和更新下载在独立后台任务中执行。
 
+时间窗口保留原始秒桶，并为 1 分钟、5 分钟、10 分钟提醒和 1 小时维护滚动累计，避免每秒反复扫描历史；累计使用 `u128`，对外仍按 `u64` 饱和，保证极端流量过期后的统计正确。休眠超过完整窗口时直接释放失效应用历史。图标缓存将纹理、失败记录和待加载请求合计限制为 256 项，满额时淘汰最久未使用的已完成记录。
+
+可运行 `cargo bench -p tm-core --bench window_tracker --locked` 检查窗口统计开销。基准预填 64 个应用的一小时历史，每轮推入一秒数据并查询上述四个窗口，报告五次运行的中位耗时；它衡量窗口计算，不代表整机 CPU 占用。
+
 Windows 使用独立的提权采集助手，主程序保持普通权限。两个可执行文件通过 `packaging/windows/resources.rs` 共享图标、版本信息和 manifest 构建逻辑。
 
 Windows 网络控制使用独立的账户 SID 命名管道；拒绝远程客户端，DACL 限定当前账户和 SYSTEM，Medium 完整性标签允许普通 UI 写入，双方校验对端 exe 路径，客户端另外核验助手的提升状态。消息有长度上限和总超时，只有 List / Set 两类请求。统计管道协议保持不变。WFP 的专用持久 sublayer 包含按 ALE_APP_ID 匹配的四条 block 规则，增加/移除使用事务；没有关联 provider，避免缺少 auto-start 服务的 provider 在 BFE 重启后使规则禁用。规则状态从系统读取，缓存仅用于保留恢复入口，不能作为成功依据。
@@ -178,7 +182,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.5` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.6` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -195,15 +199,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.1.5` 为例）：
+发布步骤（以当前 `0.1.6` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.5.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.6.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.5 -m "Release v0.1.5"
-   git push opensource v0.1.5
+   git tag -a v0.1.6 -m "Release v0.1.6"
+   git push opensource v0.1.6
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。

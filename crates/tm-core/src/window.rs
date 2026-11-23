@@ -9,7 +9,7 @@
 //! 每个应用都保留同样长度的槽位，**这一秒没有流量的应用补 0**。
 //! 不补的话不同应用的时间轴会错位，`rates(60)` 算出来的就不是同一分钟。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 
 use crate::types::AppKey;
 
@@ -19,17 +19,93 @@ type Slot = (u64, u64);
 /// 最多记住 1 小时
 pub const MAX_SLOTS: usize = 3600;
 
+/// 主面板的三个窗口和流量提醒窗口。其他长度仍支持按槽位求和。
+const CACHED_WINDOWS: [usize; 4] = [60, 300, 600, MAX_SLOTS];
+
+#[derive(Debug)]
+struct History {
+    slots: VecDeque<Slot>,
+    // 必须保留超出 u64 的部分，否则饱和后移出旧桶会错误地扣掉仍在窗口内的字节。
+    sums: [(u128, u128); CACHED_WINDOWS.len()],
+}
+
+impl History {
+    fn zeros(len: usize) -> Self {
+        Self {
+            slots: std::iter::repeat_n((0, 0), len).collect(),
+            sums: [(0, 0); CACHED_WINDOWS.len()],
+        }
+    }
+
+    /// 一次推进多个空桶；先移出过期槽位，避免满环插入时触发不必要的扩容。
+    fn advance(&mut self, count: usize, max_slots: usize) {
+        if count >= max_slots {
+            self.slots.clear();
+            self.slots.resize(max_slots, (0, 0));
+            self.sums.fill((0, 0));
+            return;
+        }
+
+        let len = self.slots.len();
+        for (sum, window) in self.sums.iter_mut().zip(CACHED_WINDOWS) {
+            let n = window.min(max_slots);
+            if count >= n {
+                *sum = (0, 0);
+            } else {
+                let start = len.saturating_sub(n);
+                let end = len.saturating_sub(n - count);
+                for (rx, tx) in self.slots.range(start..end) {
+                    sum.0 -= *rx as u128;
+                    sum.1 -= *tx as u128;
+                }
+            }
+        }
+        let expired = count.saturating_sub(max_slots - len);
+        self.slots.drain(..expired);
+        self.slots.resize(self.slots.len() + count, (0, 0));
+    }
+
+    fn add(&mut self, rx: u64, tx: u64) {
+        if let Some(slot) = self.slots.back_mut() {
+            let updated = (slot.0.saturating_add(rx), slot.1.saturating_add(tx));
+            for sum in &mut self.sums {
+                sum.0 += (updated.0 - slot.0) as u128;
+                sum.1 += (updated.1 - slot.1) as u128;
+            }
+            *slot = updated;
+        }
+    }
+
+    fn sum_last(&self, n: usize, max_slots: usize) -> Slot {
+        if let Some(index) = CACHED_WINDOWS
+            .iter()
+            .position(|window| (*window).min(max_slots) == n)
+        {
+            let (rx, tx) = self.sums[index];
+            return (
+                rx.min(u64::MAX as u128) as u64,
+                tx.min(u64::MAX as u128) as u64,
+            );
+        }
+        self.slots
+            .iter()
+            .rev()
+            .take(n)
+            .fold((0u64, 0u64), |(rx, tx), (r, t)| {
+                (rx.saturating_add(*r), tx.saturating_add(*t))
+            })
+    }
+}
+
 #[derive(Debug)]
 pub struct WindowTracker {
     max_slots: usize,
-    per_app: HashMap<AppKey, VecDeque>,
-    total: VecDeque,
+    per_app: HashMap<AppKey, History>,
+    total: History,
     clock: Option<std::time::Instant>,
     started: Option<std::time::Instant>,
     elapsed: f64,
 }
-
-type VecDeque = std::collections::VecDeque<Slot>;
 
 impl Default for WindowTracker {
     fn default() -> Self {
@@ -43,39 +119,42 @@ impl WindowTracker {
         Self {
             max_slots,
             per_app: HashMap::new(),
-            total: std::collections::VecDeque::with_capacity(max_slots),
+            total: History::zeros(0),
             clock: None,
             started: None,
             elapsed: 0.0,
         }
     }
 
-    /// 推入这一秒的增量。必须是「每个应用每秒恰好调用一次」，缺的应用会自动补 0。
+    /// 推入这一秒的增量。同一应用的多条记录会合并，缺的应用自动补 0。
     pub fn push(&mut self, deltas: &[(AppKey, u64, u64)]) {
-        let mut seen: HashSet<&AppKey> = HashSet::with_capacity(deltas.len());
-        let mut total_rx = 0u64;
-        let mut total_tx = 0u64;
+        self.advance(1);
+        self.add_deltas(deltas);
+    }
 
-        for (app, rx, tx) in deltas {
-            let history = self.total.len().min(self.max_slots.saturating_sub(1));
-            let d = self
-                .per_app
-                .entry(app.clone())
-                .or_insert_with(|| std::iter::repeat_n((0, 0), history).collect());
-            push_slot(d, *rx, *tx, self.max_slots);
-            seen.insert(app);
-            total_rx = total_rx.saturating_add(*rx);
-            total_tx = total_tx.saturating_add(*tx);
-        }
-
-        // 本秒没有流量的应用补 0，保证所有应用时间轴对齐
-        for (app, d) in self.per_app.iter_mut() {
-            if !seen.contains(app) {
-                push_slot(d, 0, 0, self.max_slots);
+    fn advance(&mut self, count: usize) {
+        if count >= self.max_slots {
+            // 休眠超过完整窗口时，所有应用历史都已失效，无需逐秒逐应用补零。
+            self.per_app.clear();
+        } else {
+            for history in self.per_app.values_mut() {
+                history.advance(count, self.max_slots);
             }
         }
+        self.total.advance(count, self.max_slots);
+    }
 
-        push_slot(&mut self.total, total_rx, total_tx, self.max_slots);
+    fn add_deltas(&mut self, deltas: &[(AppKey, u64, u64)]) {
+        for (app, rx, tx) in deltas {
+            if let Some(history) = self.per_app.get_mut(app) {
+                history.add(*rx, *tx);
+            } else {
+                let mut history = History::zeros(self.total.slots.len());
+                history.add(*rx, *tx);
+                self.per_app.insert(app.clone(), history);
+            }
+            self.total.add(*rx, *tx);
+        }
     }
 
     /// 按真实单调时钟推进；超时/休眠期间补空桶，同一秒的数据合并。
@@ -90,25 +169,10 @@ impl WindowTracker {
         };
         let elapsed = now.saturating_duration_since(clock).as_secs();
         if elapsed > 0 {
-            for _ in 0..elapsed.min(self.max_slots as u64) {
-                self.push(&[]);
-            }
+            self.advance(elapsed.min(self.max_slots as u64) as usize);
             self.clock = Some(clock + std::time::Duration::from_secs(elapsed));
         }
-        for (app, rx, tx) in deltas {
-            let d = self
-                .per_app
-                .entry(app.clone())
-                .or_insert_with(|| std::iter::repeat_n((0, 0), self.total.len()).collect());
-            if let Some(slot) = d.back_mut() {
-                slot.0 = slot.0.saturating_add(*rx);
-                slot.1 = slot.1.saturating_add(*tx);
-            }
-            if let Some(slot) = self.total.back_mut() {
-                slot.0 = slot.0.saturating_add(*rx);
-                slot.1 = slot.1.saturating_add(*tx);
-            }
-        }
+        self.add_deltas(deltas);
     }
 
     pub fn bytes(&self, secs: usize) -> Vec<(AppKey, u64, u64)> {
@@ -116,7 +180,7 @@ impl WindowTracker {
         self.per_app
             .iter()
             .filter_map(|(app, d)| {
-                let (rx, tx) = sum_last(d, n);
+                let (rx, tx) = d.sum_last(n, self.max_slots);
                 (rx > 0 || tx > 0).then(|| (app.clone(), rx, tx))
             })
             .collect()
@@ -135,7 +199,7 @@ impl WindowTracker {
             .per_app
             .iter()
             .filter_map(|(app, d)| {
-                let (rx, tx) = sum_last(d, n);
+                let (rx, tx) = d.sum_last(n, self.max_slots);
                 let (rx, tx) = (rx as f64 / denom, tx as f64 / denom);
                 // 平均下来不到 1 B/s 的，界面上就是「0 B/s」，不占列表位置
                 if rx < 1.0 && tx < 1.0 {
@@ -156,7 +220,7 @@ impl WindowTracker {
     /// 最近 `secs` 秒的总平均速率。分母规则同 [`Self::rates`]。
     pub fn total_rate(&self, secs: usize) -> (f64, f64) {
         let n = secs.clamp(1, self.max_slots);
-        let (rx, tx) = sum_last(&self.total, n);
+        let (rx, tx) = self.total.sum_last(n, self.max_slots);
         let denom = self.denominator(n);
         (rx as f64 / denom, tx as f64 / denom)
     }
@@ -164,8 +228,9 @@ impl WindowTracker {
     /// 最近 `secs` 秒每秒的总下载量，给折线图用。长度不足时前面少几个点。
     pub fn series(&self, secs: usize) -> Vec<f32> {
         let n = secs.clamp(1, self.max_slots);
-        let skip = self.total.len().saturating_sub(n);
+        let skip = self.total.slots.len().saturating_sub(n);
         self.total
+            .slots
             .iter()
             .skip(skip)
             .map(|(rx, _)| *rx as f32)
@@ -176,7 +241,7 @@ impl WindowTracker {
     pub fn sweep_idle(&mut self, secs: usize) {
         let n = secs.clamp(1, self.max_slots);
         self.per_app.retain(|_, d| {
-            let (rx, tx) = sum_last(d, n);
+            let (rx, tx) = d.sum_last(n, self.max_slots);
             rx > 0 || tx > 0
         });
     }
@@ -189,31 +254,155 @@ impl WindowTracker {
         if self.started.is_some() {
             self.elapsed.min(n as f64).max(1.0)
         } else {
-            n.min(self.total.len()).max(1) as f64
+            n.min(self.total.slots.len()).max(1) as f64
         }
     }
-}
-
-fn push_slot(d: &mut VecDeque, rx: u64, tx: u64, max_slots: usize) {
-    d.push_back((rx, tx));
-    while d.len() > max_slots {
-        d.pop_front();
-    }
-}
-
-fn sum_last(d: &VecDeque, n: usize) -> (u64, u64) {
-    let mut rx = 0u64;
-    let mut tx = 0u64;
-    for (r, t) in d.iter().rev().take(n) {
-        rx = rx.saturating_add(*r);
-        tx = tx.saturating_add(*t);
-    }
-    (rx, tx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn duplicate_records_and_subsecond_updates_share_one_bucket() {
+        let mut w = WindowTracker::default();
+        w.push(&[(app("a"), 5, 1), (app("a"), 7, 2), (app("b"), 20, 0)]);
+        assert!(w.bytes(1).contains(&(app("a"), 12, 3)));
+        assert_eq!(w.series(60), vec![32.0]);
+        w.push(&[]);
+        assert!(w.bytes(1).is_empty());
+        assert!(w.bytes(60).contains(&(app("a"), 12, 3)));
+
+        let mut w = WindowTracker::default();
+        let start = Instant::now();
+        w.push_at(start, &[(app("a"), 5, 1), (app("a"), 7, 2)]);
+        w.push_at(start + Duration::from_millis(900), &[(app("a"), 8, 3)]);
+        assert_eq!(w.bytes(60), vec![(app("a"), 20, 6)]);
+        assert_eq!(w.series(60), vec![20.0]);
+        w.push_at(start + Duration::from_secs(60), &[]);
+        assert!(w.bytes(60).is_empty());
+        assert_eq!(w.bytes(300), vec![(app("a"), 20, 6)]);
+    }
+
+    #[test]
+    fn cached_windows_keep_saturated_bytes_until_their_own_bucket_expires() {
+        for window in CACHED_WINDOWS {
+            let mut w = WindowTracker::default();
+            let start = Instant::now();
+            w.push_at(start, &[(app("a"), u64::MAX, 10)]);
+            w.push_at(start + Duration::from_secs(1), &[(app("a"), u64::MAX, 20)]);
+            // 同一桶饱和后新增的字节不能进入滚动累计，否则移出该桶时会残留。
+            w.push_at(start + Duration::from_millis(1500), &[(app("a"), 99, 1)]);
+            w.push_at(start + Duration::from_secs(2), &[(app("a"), 17, 30)]);
+            w.push_at(start + Duration::from_secs(window as u64), &[]);
+            assert_eq!(w.bytes(window), vec![(app("a"), u64::MAX, 51)]);
+            w.push_at(start + Duration::from_secs(window as u64 + 1), &[]);
+            assert_eq!(w.bytes(window), vec![(app("a"), 17, 30)]);
+            assert_eq!(
+                w.total_rate(window),
+                (17.0 / window as f64, 30.0 / window as f64)
+            );
+            w.push_at(start + Duration::from_secs(window as u64 + 2), &[]);
+            assert!(w.bytes(window).is_empty());
+            assert_eq!(w.total_rate(window), (0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn windows_match_timestamped_reference_through_wraparound_and_gaps() {
+        for max_slots in [1, 17, 60, 317, MAX_SLOTS, MAX_SLOTS + 10] {
+            let mut w = WindowTracker::new(max_slots);
+            let start = Instant::now();
+            let mut millis = 0u64;
+            let mut records = Vec::new();
+            for tick in 0..4200u64 {
+                if tick > 0 {
+                    millis += match tick {
+                        4000 => 86_400_000,
+                        n if n % 211 == 0 => 61_000,
+                        n => [0, 200, 800, 1000, 2200][n as usize % 5],
+                    };
+                }
+                let second = millis / 1000;
+                let deltas: Vec<_> = (0..3u64)
+                    .filter(|index| tick % (index + 2) == 0)
+                    .map(|index| (app(&format!("app-{index}")), tick + 1, index * 7))
+                    .collect();
+                for (app, rx, tx) in &deltas {
+                    records.push((second, app.clone(), *rx, *tx));
+                }
+                w.push_at(start + Duration::from_millis(millis), &deltas);
+                if tick % 101 != 0 && tick != 4000 && tick != 4199 {
+                    continue;
+                }
+
+                for secs in [0, 1, 17, 59, 60, 61, 299, 300, 600, 3600, 5000] {
+                    let n = secs.clamp(1, max_slots);
+                    let from = second.saturating_sub(n as u64 - 1);
+                    let mut expected = BTreeMap::<AppKey, Slot>::new();
+                    let mut series = BTreeMap::<u64, u64>::new();
+                    for (at, app, rx, tx) in &records {
+                        if *at >= from {
+                            let entry = expected.entry(app.clone()).or_default();
+                            entry.0 += rx;
+                            entry.1 += tx;
+                            *series.entry(*at).or_default() += rx;
+                        }
+                    }
+                    let expected: Vec<_> = expected
+                        .into_iter()
+                        .map(|(app, (rx, tx))| (app, rx, tx))
+                        .collect();
+                    let mut actual = w.bytes(secs);
+                    actual.sort_by(|a, b| a.0.cmp(&b.0));
+                    assert_eq!(
+                        actual, expected,
+                        "max={max_slots}, tick={tick}, secs={secs}"
+                    );
+                    let denom = (millis as f64 / 1000.0).min(n as f64).max(1.0);
+                    let expected_rates: Vec<_> = expected
+                        .iter()
+                        .map(|(app, rx, tx)| (app.clone(), *rx as f64 / denom, *tx as f64 / denom))
+                        .filter(|(_, rx, tx)| *rx >= 1.0 || *tx >= 1.0)
+                        .collect();
+                    let mut actual_rates = w.rates(secs);
+                    assert!(actual_rates
+                        .windows(2)
+                        .all(|r| r[0].1 + r[0].2 >= r[1].1 + r[1].2));
+                    actual_rates.sort_by(|a, b| a.0.cmp(&b.0));
+                    assert_eq!(actual_rates, expected_rates);
+                    let (rx, tx) = expected
+                        .iter()
+                        .fold((0u64, 0u64), |(rx, tx), (_, r, t)| (rx + r, tx + t));
+                    assert_eq!(w.total_rate(secs), (rx as f64 / denom, tx as f64 / denom));
+                    let expected_series: Vec<_> = (from..=second)
+                        .map(|at| series.get(&at).copied().unwrap_or_default() as f32)
+                        .collect();
+                    assert_eq!(w.series(secs), expected_series);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_history_reuses_its_allocation_and_sleep_releases_expired_apps() {
+        let mut w = WindowTracker::new(60);
+        let start = Instant::now();
+        w.push_at(start, &[]);
+        w.push_at(start + Duration::from_secs(59), &[(app("a"), 100, 0)]);
+        let capacity = w.per_app[&app("a")].slots.capacity();
+        for tick in 60..120 {
+            w.push_at(start + Duration::from_secs(tick), &[(app("a"), 100, 0)]);
+        }
+        assert_eq!(w.per_app[&app("a")].slots.capacity(), capacity);
+        w.push_at(start + Duration::from_secs(86_400), &[]);
+        assert_eq!(w.app_count(), 0);
+        assert_eq!(w.series(60), vec![0.0; 60]);
+        w.push_at(start + Duration::from_secs(86_401), &[(app("a"), 120, 60)]);
+        assert_eq!(w.rates(60), vec![(app("a"), 2.0, 1.0)]);
+    }
 
     #[test]
     fn late_app_uses_shared_window_and_retains_large_deltas() {

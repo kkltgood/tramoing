@@ -36,9 +36,9 @@ pub struct IconSet {
     textures: HashMap<String, egui::TextureHandle>,
     /// 已经发给后台、还没回来的键
     pending: HashSet<String>,
-    /// 确认取不到的键，不用每次重试
+    /// 确认取不到的键，在缓存淘汰前不用每次重试
     missing: HashSet<String>,
-    /// 每帧自增，配合 `seen` 做过期淘汰
+    /// 每帧自增，配合 `seen` 淘汰最久未使用的缓存
     frame: u64,
     /// 键 → 最后一次被列表请求的帧号
     seen: HashMap<String, u64>,
@@ -48,10 +48,9 @@ pub struct IconSet {
     res_rx: Receiver<(String, Option<egui::ColorImage>)>,
 }
 
-/// 纹理上限。一个应用一张 48×48 图 ≈ 9 KB，256 张不到 3 MB；
-/// 超过就按「多久没被用到」淘汰。长会话里进程开了又关，
-/// 不做这件事纹理表只增不减（虽然慢，但确实是泄漏）。
-const MAX_TEXTURES: usize = 256;
+/// 图标缓存和待加载请求的总上限，包括取不到图标的应用。
+/// 一个应用一张 48×48 图 ≈ 9 KB，256 张不到 3 MB。
+const MAX_ICONS: usize = 256;
 
 impl IconSet {
     pub fn new(ctx: egui::Context) -> Self {
@@ -104,21 +103,20 @@ impl IconSet {
                 }
             }
         }
-
-        if self.textures.len() > MAX_TEXTURES {
-            let now = self.frame;
-            // 面板每秒至少重绘一次，600 帧≈10 分钟没上过榜的图标可以丢掉
-            self.textures
-                .retain(|k, _| now.saturating_sub(*self.seen.get(k).unwrap_or(&0)) < 600);
-            self.seen
-                .retain(|k, _| self.textures.contains_key(k) || self.pending.contains(k));
-        }
     }
 
     /// 取图标纹理；没有就顺手排进后台队列，本帧返回 `None`。
     pub fn get(&mut self, key: &str) -> Option<egui::TextureHandle> {
-        // 记一次「本帧还在用」，供过期淘汰参考
-        self.seen.insert(key.to_owned(), self.frame);
+        if let Some(seen) = self.seen.get_mut(key) {
+            // 命中缓存时直接更新时间，避免每帧为每行重复分配路径字符串。
+            *seen = self.frame;
+        } else {
+            if self.seen.len() >= MAX_ICONS && !self.evict_oldest() {
+                // 全部都还在加载时等待结果，不继续往后台堆积请求。
+                return None;
+            }
+            self.seen.insert(key.to_owned(), self.frame);
+        }
         if let Some(t) = self.textures.get(key) {
             return Some(t.clone());
         }
@@ -129,6 +127,20 @@ impl IconSet {
             self.pending.insert(key.to_owned());
         }
         None
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let oldest = self
+            .seen
+            .iter()
+            .filter(|(key, _)| !self.pending.contains(*key))
+            .min_by_key(|(_, frame)| *frame)
+            .map(|(key, _)| key.clone());
+        let Some(key) = oldest else { return false };
+        self.textures.remove(&key);
+        self.missing.remove(&key);
+        self.seen.remove(&key);
+        true
     }
 
     /// 系统服务的齿轮纹理。形状见 [`crate::icon::gear`]，只烘一次、所有服务共用。
@@ -214,6 +226,97 @@ fn load(key: &str) -> Option<egui::ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct IconHarness {
+        icons: IconSet,
+        requests: Receiver<String>,
+        results: Sender<(String, Option<egui::ColorImage>)>,
+    }
+
+    impl IconHarness {
+        fn new() -> Self {
+            let (req_tx, requests) = mpsc::channel();
+            let (results, res_rx) = mpsc::channel();
+            Self {
+                icons: IconSet {
+                    ctx: egui::Context::default(),
+                    textures: HashMap::new(),
+                    pending: HashSet::new(),
+                    missing: HashSet::new(),
+                    frame: 0,
+                    seen: HashMap::new(),
+                    service: None,
+                    req_tx,
+                    res_rx,
+                },
+                requests,
+                results,
+            }
+        }
+    }
+
+    #[test]
+    fn icon_churn_bounds_successes_failures_and_access_records() {
+        let mut harness = IconHarness::new();
+        for index in 0..MAX_ICONS * 3 {
+            if index >= 2 {
+                assert!(harness.icons.get("app-0").is_some());
+                assert!(harness.icons.get("app-1").is_none());
+                assert!(
+                    harness.requests.try_recv().is_err(),
+                    "cached failures must not reload"
+                );
+            }
+            let key = format!("app-{index}");
+            assert!(harness.icons.get(&key).is_none());
+            assert_eq!(harness.requests.try_recv().unwrap(), key);
+            let image =
+                (index % 2 == 0).then(|| egui::ColorImage::filled([2, 2], egui::Color32::WHITE));
+            harness.results.send((key, image)).unwrap();
+            harness.icons.poll();
+            assert!(harness.icons.seen.len() <= MAX_ICONS);
+            assert_eq!(
+                harness.icons.textures.len() + harness.icons.missing.len(),
+                harness.icons.seen.len(),
+            );
+            assert!(harness.icons.pending.is_empty());
+        }
+        assert!(harness.icons.textures.contains_key("app-0"));
+        assert!(harness.icons.missing.contains("app-1"));
+        assert!(!harness.icons.seen.contains_key("app-2"));
+        assert!(!harness.icons.textures.contains_key("app-2"));
+        assert!(!harness.icons.missing.contains("app-3"));
+        assert!(harness.icons.get("app-3").is_none());
+        assert_eq!(harness.requests.try_recv().unwrap(), "app-3");
+        assert_eq!(harness.icons.seen.len(), MAX_ICONS);
+    }
+
+    #[test]
+    fn slow_loader_bounds_requests_and_retries_when_capacity_is_available() {
+        let mut harness = IconHarness::new();
+        for index in 0..MAX_ICONS {
+            let key = format!("app-{index}");
+            assert!(harness.icons.get(&key).is_none());
+            assert_eq!(harness.requests.try_recv().unwrap(), key);
+        }
+        for _ in 0..3 {
+            assert!(harness.icons.get("app-0").is_none());
+            assert!(harness.icons.get("waiting").is_none());
+            assert!(harness.requests.try_recv().is_err());
+        }
+        assert_eq!(harness.icons.pending.len(), MAX_ICONS);
+        assert_eq!(harness.icons.seen.len(), MAX_ICONS);
+
+        harness.results.send(("app-0".into(), None)).unwrap();
+        harness.icons.poll();
+        assert!(harness.icons.get("waiting").is_none());
+        assert_eq!(harness.requests.try_recv().unwrap(), "waiting");
+        assert!(harness.icons.get("waiting").is_none());
+        assert!(harness.requests.try_recv().is_err());
+        assert_eq!(harness.icons.pending.len(), MAX_ICONS);
+        assert_eq!(harness.icons.seen.len(), MAX_ICONS);
+        assert!(!harness.icons.missing.contains("app-0"));
+    }
 
     #[test]
     fn tile_color_is_stable_and_in_palette() {

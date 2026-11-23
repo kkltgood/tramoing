@@ -265,7 +265,7 @@ where
                     }
                 }
 
-                let mut sampled = false;
+                let mut rates = None;
                 if let Some(s) = sampler.as_mut() {
                     match s.sample() {
                         Ok(samples) => {
@@ -276,11 +276,11 @@ where
                             last_good = Instant::now();
                             error = None;
                             backoff = 1;
-                            calc.update(s.sampled_at().unwrap_or(last_good), &samples);
+                            rates =
+                                Some(calc.update(s.sampled_at().unwrap_or(last_good), &samples));
                             let deltas = calc.take_deltas();
                             tracker.push_at(last_good, &deltas);
                             pending.add(SystemTime::now(), &deltas);
-                            sampled = true;
                         }
                         Err(SamplerError::Timeout) => {
                             if last_good.elapsed() >= STALE_AFTER {
@@ -352,7 +352,7 @@ where
                 if error.is_some() {
                     // 中断前后的点不连接，避免把缺失采样画成连续的流量。
                     trend.clear();
-                } else if sampled {
+                } else if rates.is_some() {
                     if trend.len() == TREND_SAMPLES {
                         trend.pop_front();
                     }
@@ -360,7 +360,7 @@ where
                 }
                 let (session_rx, session_tx) = calc.session_total();
                 let snapshot = Snapshot {
-                    rates: calc.snapshot(),
+                    rates: rates.unwrap_or_else(|| calc.snapshot()),
                     windowed: WindowedRates {
                         min1: to_rates(tracker.rates(60)),
                         min5: to_rates(tracker.rates(300)),
