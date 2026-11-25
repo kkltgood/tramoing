@@ -115,6 +115,13 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify sensor selection
+        if: runner.os == 'Windows'
+        run: dotnet run --project sensors/Tramoing.Sensors.Tests -c Release
       - run: node --test packaging/update/release.test.cjs
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked --target ${{ matrix.target }}
@@ -138,6 +145,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./packaging/windows/build.ps1 -Version $env:RELEASE_VERSION -Architecture $env:PACKAGE_ARCH
+      - name: Verify sensor worker protocol
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/verify-windows-sensors.ps1 -Architecture $env:PACKAGE_ARCH
       - name: Build macOS DMG for the selected architecture
         if: runner.os == 'macOS'
         shell: bash

@@ -256,6 +256,7 @@ impl Sampler {
                     "unavailable"
                 }
             ),
+            ..Default::default()
         }
     }
 }

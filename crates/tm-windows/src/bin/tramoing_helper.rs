@@ -97,11 +97,16 @@ mod win {
                 std::process::exit(0);
             }
             Err(e) => {
-                log(&format!("ETW 启动失败：{e}"));
-                log("请确认本程序以管理员权限运行（--install 注册的任务会自动带最高权限）");
+                log::error!(target: "tramoing::helper", "ETW 启动失败：{e}");
+                if matches!(e, etw::EtwError::NeedAdmin) {
+                    log("请确认本程序以管理员权限运行（--install 注册的任务会自动带最高权限）");
+                }
                 std::process::exit(1);
             }
         };
+
+        // Sensor calls cannot block ETW or firewall control.
+        std::thread::spawn(|| tm_windows::temperature_service::run());
 
         std::thread::spawn(|| loop {
             match tm_windows::network_control::Server::create() {

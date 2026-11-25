@@ -1,5 +1,7 @@
 /target
 /dist
+/sensors/**/bin/
+/sensors/**/obj/
 .workbuddy
 .DS_Store
 

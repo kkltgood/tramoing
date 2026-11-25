@@ -43,7 +43,7 @@ An open-source network speed and traffic monitor for the Windows taskbar and mac
 | Windows 11 ARM64 | ETW 采集助手 | 使用 ARM64 原生安装包，助手需要管理员权限 |
 | macOS 11+，Apple Silicon / Intel | 系统 `nettop` | 建议通过 `.app` 包运行并验证菜单栏行为 |
 
-CPU / GPU 显示不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。温度显示在对应使用率旁，关闭“显示温度”会停止温度采集，保留使用率。macOS 从 AppleSMC 读取已适配的 Intel / Apple Silicon 传感器；Windows GPU 优先读取 WDDM 驱动温度，CPU 需要运行并开放 WMI 的 LibreHardwareMonitor / OpenHardwareMonitor（GPU 也可从这些工具读取）。不自动安装驱动或上述工具；传感器不可用时显示 `--°C`。温度取可用核心/芯片传感器中的最高值，多 GPU 的温度和使用率可能来自不同设备。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
+CPU / GPU 使用率不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。温度显示在对应使用率旁，关闭“显示温度”会停止温度采集，保留使用率。macOS 从 AppleSMC 读取已适配的 Intel / Apple Silicon 传感器。Windows x64 的 CPU 温度由管理员助手管理的独立组件读取，使用 LibreHardwareMonitor 0.9.6；安装程序默认选中“CPU 温度支持”，部署官方签名的 PawnIO 2.2 驱动，无需另开监控软件。Windows GPU 优先读取 WDDM 驱动温度。已有 LibreHardwareMonitor / OpenHardwareMonitor 的 WMI 数据仍可作为补充来源。ARM64 及部分老型号没有内置 CPU 传感器适配，程序正常运行并提示原因；不可用时显示 `--°C`。温度取可用核心/芯片传感器中的最高值，多 GPU 的温度和使用率可能来自不同设备。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
 
 ## 从源码运行
 

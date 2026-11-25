@@ -8,6 +8,7 @@
 #   2. Rust 工具链：rustup target add x86_64-pc-windows-msvc（ARM64 使用 aarch64-pc-windows-msvc）
 #      交叉编译 ARM64 还需安装 Visual Studio 的 C++ ARM64 生成工具
 #   3. NSIS 3：winget install NSIS.NSIS
+#   4. .NET 10 SDK（仅构建传感器组件需要，安装包自带运行时）
 #
 # 产物：dist\Tramoing-<version>-windows-<arch>-setup.exe
 #
@@ -21,7 +22,8 @@
 param(
     [string]$Version = "",
     [ValidateSet('x64', 'arm64')]
-    [string]$Architecture = 'x64'
+    [string]$Architecture = 'x64',
+    [string]$DotNet = 'dotnet'
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,6 +99,9 @@ foreach ($binary in @('tramoing', 'tramoing-helper')) {
     Write-Host "    $binary <- $($artifacts[$binary])"
 }
 Write-Host "    已收集到 $stage"
+
+& (Join-Path $PSScriptRoot 'build-sensors.ps1') -Architecture $Architecture -DotNet $DotNet
+Assert-PeArchitecture (Join-Path $stage 'sensors/tramoing-sensors.exe')
 
 # winget 装的 NSIS 不会把自己写进 PATH，所以先查命令、再退到默认安装目录
 $makensis = $null

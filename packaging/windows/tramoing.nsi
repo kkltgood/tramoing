@@ -19,6 +19,8 @@ Unicode true
 ; Modern UI 2：经典页面集里没有「完成」页（Page 只有 directory / components /
 ; instfiles），装完窗口直接消失 —— 既看不到「装好了」，也没机会顺手把程序拉起来。
 !include "MUI2.nsh"
+!include "WordFunc.nsh"
+!include "Sections.nsh"
 
 !define APP_NAME "Tramoing"
 !define APP_EXE "tramoing.exe"
@@ -78,6 +80,7 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
 
 ; System plugin calls in the upgrade callbacks must follow SetCompressor.
+!define TRAMOING_SENSOR_COMPONENT
 !include "upgrade.nsh"
 
 ; ---------- 安装界面 ----------
@@ -150,6 +153,11 @@ Section "-升级准备：关闭旧进程" SEC_PRE
 
   !insertmacro PREPARE_OVERWRITE "$INSTDIR\${APP_EXE}" prep_main
   !insertmacro PREPARE_OVERWRITE "$INSTDIR\${HELPER_EXE}" prep_helper
+  ; The helper's kill-on-close job normally stops this child. Also cover an
+  ; interrupted older installation before replacing its runtime files.
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "tramoing-sensors.exe" /F'
+  Pop $0
+  !insertmacro PREPARE_OVERWRITE "$INSTDIR\sensors\tramoing-sensors.exe" prep_sensors
   !insertmacro PREPARE_OVERWRITE "$INSTDIR\uninstall.exe" prep_uninst
 SectionEnd
 
@@ -158,6 +166,9 @@ Section "托盘程序（必需）" SEC_MAIN
   SetOutPath "$INSTDIR"
   File "..\..\dist\windows-${APP_ARCH}\${APP_EXE}"
   File "..\..\LICENSE"
+  SetOutPath "$INSTDIR\sensors"
+  File /r "..\..\dist\windows-${APP_ARCH}\sensors\*"
+  SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
@@ -172,6 +183,9 @@ Section "托盘程序（必需）" SEC_MAIN
 
   ; 控制面板「程序和功能」里的条目
   WriteRegStr HKLM "Software\${BUNDLE_ID}" "InstallDir" "$INSTDIR"
+  !if "${APP_ARCH}" == "x64"
+    Call SaveSensorSelection
+  !endif
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}" "DisplayName" "${APP_NAME}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${BUNDLE_ID}" "Publisher" "${PUBLISHER}"
@@ -185,6 +199,36 @@ Section "托盘程序（必需）" SEC_MAIN
   ; 是安装程序里最常用的一招，代价只是让资源管理器重读一次图标。
   System::Call 'shell32::SHChangeNotify(i 0x8000000, i 0, i 0, i 0)'
 SectionEnd
+
+!if "${APP_ARCH}" == "x64"
+Section "CPU 温度支持（安装 PawnIO 驱动）" SEC_TEMPERATURE
+  ; Never install the x86 hardware driver under ARM64 emulation. The UI and
+  ; worker still run there, with WMI as a possible platform-specific source.
+  ${IfNot} ${IsNativeARM64}
+    SetRegView 64
+    ReadRegStr $1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO" "DisplayVersion"
+    ${VersionCompare} "$1" "2.2.0" $2
+    ${If} $1 == ""
+    ${OrIf} $2 == 2
+      InitPluginsDir
+      SetOutPath "$PLUGINSDIR"
+      File "..\..\dist\windows-x64\PawnIO_setup.exe"
+      DetailPrint "安装 CPU 温度所需的 PawnIO 驱动..."
+      StrCpy $0 -1
+      ExecWait '"$PLUGINSDIR\PawnIO_setup.exe" -install -silent' $0
+      ${If} $0 == 3010
+        SetRebootFlag true
+        DetailPrint "PawnIO 已安装，重启 Windows 后生效。"
+      ${ElseIf} $0 != 0
+        MessageBox MB_ICONEXCLAMATION|MB_OK "CPU 温度驱动安装失败（错误码 $0），其他功能可正常使用。$\r$\n若已安装旧版 PawnIO，请通过官方安装器升级到 2.2 或更新版本，再重启 Tramoing。" /SD IDOK
+      ${EndIf}
+      Delete "$PLUGINSDIR\PawnIO_setup.exe"
+      SetOutPath "$INSTDIR"
+    ${EndIf}
+    SetRegView lastused
+  ${EndIf}
+SectionEnd
+!endif
 
 Section "流量采集助手（按进程统计必需）" SEC_HELPER
   SectionIn RO
@@ -214,12 +258,38 @@ SectionEnd
 
 ; ---------- 卸载 ----------
 
+Function InitializeSensorSelection
+  !if "${APP_ARCH}" == "x64"
+    ; A user who opted out keeps that choice on automatic upgrades.
+    ClearErrors
+    ReadRegDWORD $0 HKLM "Software\${BUNDLE_ID}" "CpuTemperatureSupport"
+    ${IfNot} ${Errors}
+      ${If} $0 == 0
+        !insertmacro UnselectSection ${SEC_TEMPERATURE}
+      ${EndIf}
+    ${EndIf}
+    ${If} ${IsNativeARM64}
+      !insertmacro UnselectSection ${SEC_TEMPERATURE}
+      SectionSetText ${SEC_TEMPERATURE} ""
+    ${EndIf}
+  !endif
+FunctionEnd
+
+Function SaveSensorSelection
+  !if "${APP_ARCH}" == "x64"
+    SectionGetFlags ${SEC_TEMPERATURE} $0
+    IntOp $0 $0 & ${SF_SELECTED}
+    WriteRegDWORD HKLM "Software\${BUNDLE_ID}" "CpuTemperatureSupport" $0
+  !endif
+FunctionEnd
+
 Section "Uninstall"
   ; 先停任务再删文件，顺序反了会删不掉正在运行的 exe
   ExecWait 'taskkill /IM ${APP_EXE} /F'
   ExecWait '"$SYSDIR\schtasks.exe" /End /TN "${TASK_NAME}"'
   ExecWait '"$SYSDIR\schtasks.exe" /End /TN "${LEGACY_TASK_NAME}"'
   ExecWait 'taskkill /IM ${HELPER_EXE} /F'
+  ExecWait 'taskkill /IM tramoing-sensors.exe /F'
   StrCpy $0 -1
   ExecWait '"$INSTDIR\${HELPER_EXE}" --clear-network-blocks' $0
   ${If} $0 != 0
@@ -244,6 +314,9 @@ Section "Uninstall"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\${HELPER_EXE}"
+  ; Only Tramoing's private component is removed. PawnIO may be shared by other
+  ; hardware monitors and retains its own Programs and Features uninstaller.
+  RMDir /r "$INSTDIR\sensors"
   Delete "$INSTDIR\LICENSE"
   ; 覆盖安装过旧版的目录里可能还留着老名字的 exe
   Delete "$INSTDIR\${LEGACY_APP_EXE}"

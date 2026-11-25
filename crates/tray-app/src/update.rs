@@ -18,8 +18,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-pub const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/kkltgood/tramoing/releases/latest/download/latest.json";
+pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+pub const RELEASES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
+pub const DEFAULT_MANIFEST_URL: &str = concat!(
+    env!("CARGO_PKG_REPOSITORY"),
+    "/releases/latest/download/latest.json"
+);
 
 /// 运行时环境变量 > 构建时配置 > 官方 GitHub Releases；空值显式禁用。
 pub fn manifest_url() -> Option<String> {

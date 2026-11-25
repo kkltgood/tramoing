@@ -152,6 +152,7 @@ impl Monitor {
                         cpu: Some(54.0),
                         gpu: Some(48.0),
                         source: "Demo data".into(),
+                        ..Default::default()
                     }
                 } else {
                     thermal.as_mut().unwrap().sample()

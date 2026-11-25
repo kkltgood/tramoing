@@ -20,6 +20,7 @@ pub mod agg;
 pub mod network;
 pub mod network_policy;
 pub mod proto;
+pub mod temperature_protocol;
 
 #[cfg(windows)]
 pub mod firewall;
@@ -50,6 +51,8 @@ pub mod scheduled_task;
 pub mod screen;
 #[cfg(windows)]
 pub mod temperature;
+#[cfg(windows)]
+pub mod temperature_service;
 #[cfg(windows)]
 pub mod theme;
 #[cfg(windows)]

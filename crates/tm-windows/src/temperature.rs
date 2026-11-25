@@ -1,4 +1,4 @@
-//! GPU: WDDM 2.4+ driver telemetry. CPU: optional LHM/OHM WMI provider.
+//! GPU: WDDM telemetry. CPU: supervised built-in sensors, then optional WMI.
 //! ACPI thermal zones are intentionally not labelled as CPU temperatures.
 use std::fs;
 use std::io::Read;
@@ -117,6 +117,7 @@ impl Provider {
                 cpu: frame.cpu.and_then(valid),
                 gpu: frame.gpu.and_then(valid),
                 source: frame.source,
+                ..Default::default()
             };
         }
         // A stalled WMI service must never freeze utilization, settings or shutdown.
@@ -166,6 +167,9 @@ pub struct Sampler {
     provider: Option<Provider>,
     retry: Instant,
     status: String,
+    helper_retry: Instant,
+    helper_reading: Option<crate::temperature_protocol::Snapshot>,
+    helper_error: String,
 }
 impl Default for Sampler {
     fn default() -> Self {
@@ -173,11 +177,38 @@ impl Default for Sampler {
             provider: None,
             retry: Instant::now(),
             status: "WMI temperature provider starting".into(),
+            helper_retry: Instant::now(),
+            helper_reading: None,
+            helper_error: String::new(),
         }
     }
 }
 impl Sampler {
     pub fn sample(&mut self) -> Temperatures {
+        if Instant::now() >= self.helper_retry {
+            self.helper_reading = match crate::temperature_service::request() {
+                Ok(reading) => {
+                    self.helper_error.clear();
+                    self.helper_retry = Instant::now() + Duration::from_secs(2);
+                    Some(reading)
+                }
+                Err(error) => {
+                    self.helper_error = format!("Built-in sensor helper unavailable: {error}");
+                    self.helper_retry = Instant::now() + Duration::from_secs(10);
+                    None
+                }
+            };
+        }
+        let native = self.helper_reading.as_ref().map(|r| r.temperatures());
+        let driver_gpu = gpu_temperature();
+        if let Some(native) = native
+            .as_ref()
+            .filter(|r| r.cpu.is_some() && driver_gpu.is_some())
+        {
+            // Built-in sensors recovered: release the fallback PowerShell process.
+            self.provider = None;
+            return with_gpu(native.clone(), driver_gpu);
+        }
         if self.provider.is_none() && Instant::now() >= self.retry {
             self.retry = Instant::now() + Duration::from_secs(60);
             match Provider::start() {
@@ -203,14 +234,37 @@ impl Sampler {
                 self.retry = Instant::now() + Duration::from_secs(60);
             }
         }
-        if let Some(gpu) = gpu_temperature() {
-            result.gpu = Some(gpu);
-            result
-                .source
-                .push_str("; GPU=WDDM driver (hottest adapter)");
+        if let Some(native) = native {
+            if native.cpu.is_some() {
+                result.cpu = native.cpu;
+                result.cpu_unavailable = None;
+            }
+            if result.gpu.is_none() {
+                result.gpu = native.gpu;
+            }
+            if result.cpu.is_none() {
+                result.cpu_unavailable = native.cpu_unavailable;
+            }
+            result.source = format!("{}; {}", native.source, result.source);
         } else {
-            result.source.push_str("; GPU WDDM temperature unavailable");
+            if result.cpu.is_none() {
+                result.cpu_unavailable =
+                    Some(tm_core::temperature::CpuUnavailable::HelperUnavailable);
+            }
+            result.source = format!("{}; {}", self.helper_error, result.source);
         }
-        result
+        with_gpu(result, driver_gpu)
     }
+}
+
+fn with_gpu(mut result: Temperatures, driver_gpu: Option<f64>) -> Temperatures {
+    if let Some(gpu) = driver_gpu {
+        result.gpu = Some(gpu);
+        result
+            .source
+            .push_str("; GPU=WDDM driver (hottest adapter)");
+    } else {
+        result.source.push_str("; GPU WDDM temperature unavailable");
+    }
+    result
 }

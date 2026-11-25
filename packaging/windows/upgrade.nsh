@@ -16,6 +16,9 @@ Var UpgradeMode
 Var UpdateParentPid
 
 Function .onInit
+  !ifdef TRAMOING_SENSOR_COMPONENT
+    Call InitializeSensorSelection
+  !endif
   ; Reject incompatible packages before any installed files or processes change.
   !ifdef APP_ARCH
     !if "${APP_ARCH}" == "arm64"

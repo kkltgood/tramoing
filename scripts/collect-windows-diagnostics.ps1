@@ -24,13 +24,17 @@ Section 'Windows and account' {
 }
 
 Section 'Installed binaries beside this UI' {
-    foreach ($name in @('tramoing.exe', 'tramoing-helper.exe')) {
+    foreach ($name in @('tramoing.exe', 'tramoing-helper.exe', 'sensors\tramoing-sensors.exe', 'sensors\LibreHardwareMonitorLib.dll')) {
         $path = Join-Path (Split-Path -LiteralPath $executable) $name
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             $file = Get-Item -LiteralPath $path
             [pscustomobject]@{ Path = $path; Version = $file.VersionInfo.ProductVersion; Bytes = $file.Length; Modified = $file.LastWriteTimeUtc } | Format-List
         } else { 'MISSING: ' + $path }
     }
+}
+
+Section 'Display adapters and drivers' {
+    Get-CimInstance Win32_VideoController | Select-Object Name,AdapterCompatibility,DriverVersion,CurrentHorizontalResolution,CurrentVerticalResolution | Format-List
 }
 
 Section 'Collector scheduled task' {
@@ -57,7 +61,7 @@ Section 'Collector scheduled task' {
 }
 
 Section 'Collector processes' {
-    $processes = @(Get-CimInstance Win32_Process -Filter "Name='tramoing.exe' OR Name='tramoing-helper.exe'")
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name='tramoing.exe' OR Name='tramoing-helper.exe' OR Name='tramoing-sensors.exe'")
     if (-not $processes.Count) { '(none)' }
     foreach ($process in $processes) {
         $sameUser = 'unknown'
@@ -73,12 +77,24 @@ Section 'Services' {
     Get-Service -Name Schedule,BFE | Select-Object Name,Status,StartType | Format-Table -AutoSize
 }
 
+Section 'CPU temperature driver' {
+    $key = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $driverKey = $key.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO')
+        if ($driverKey) {
+            try { 'PawnIO version: ' + $driverKey.GetValue('DisplayVersion') } finally { $driverKey.Dispose() }
+        } else { 'PawnIO is not installed' }
+    } finally { $key.Dispose() }
+    Get-CimInstance Win32_SystemDriver -Filter "Name='PawnIO'" | Select-Object Name,State,StartMode,PathName | Format-List
+}
+
 Section 'Named pipe presence (no connection opened)' {
     try {
         $pipes = [IO.Directory]::GetFiles('\\.\pipe\')
         [pscustomobject]@{
             StatisticsPipePresent = $pipes -contains '\\.\pipe\tramoing-v1'
             CurrentAccountControlPipePresent = $pipes -contains ('\\.\pipe\Tramoing-Network-Control-' + $sid + '-v1')
+            CurrentAccountTemperaturePipePresent = $pipes -contains ('\\.\pipe\Tramoing-Temperature-' + $sid + '-v1')
         } | Format-List
     } catch { 'Unavailable: ' + $_.Exception.Message }
 }

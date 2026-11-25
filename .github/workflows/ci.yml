@@ -25,6 +25,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify Windows sensor component
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet run --project sensors/Tramoing.Sensors.Tests -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./packaging/windows/build-sensors.ps1 -Architecture x64
+          ./packaging/windows/build-sensors.ps1 -Architecture arm64
+          ./scripts/verify-windows-sensors.ps1
       - name: Check macOS packaging script syntax
         if: runner.os == 'macOS'
         run: |

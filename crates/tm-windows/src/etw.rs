@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_SUCCESS};
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, CONTROLTRACE_HANDLE,
     EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
@@ -43,6 +43,56 @@ const REAL_TIME_MODE: u32 = 0x0000_0100;
 /// 诊断开关：把每个事件的原始内容写进日志文件，用于校准事件表。
 static DUMP_EVENTS: AtomicBool = AtomicBool::new(false);
 
+/// StartTrace/ControlTrace write session metadata back into this allocation.
+/// Reserve both UTF-16 name slots, including their terminators, even for a
+/// real-time session with no log file. A header followed by only the exact
+/// session name leaves no room for additional metadata returned by Windows.
+#[repr(C)]
+struct TraceProperties {
+    properties: EVENT_TRACE_PROPERTIES,
+    logger_name: [u16; 1025],
+    log_file_name: [u16; 1025],
+}
+
+impl TraceProperties {
+    fn new() -> Self {
+        // SAFETY: the header and UTF-16 arrays have valid all-zero values.
+        let mut value: Self = unsafe { std::mem::zeroed() };
+        value.properties.Wnode.BufferSize = size_of::<Self>() as u32;
+        value.properties.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        value.properties.LogFileMode = REAL_TIME_MODE;
+        value.properties.FlushTimer = 1;
+        value.properties.LoggerNameOffset = std::mem::offset_of!(Self, logger_name) as u32;
+        // Zero disables file output; the reserved slot is only output capacity.
+        value.properties.LogFileNameOffset = 0;
+        value
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut EVENT_TRACE_PROPERTIES {
+        // Derive from the whole allocation: the API also writes the tail slots.
+        (self as *mut Self).cast()
+    }
+}
+
+fn start_trace(
+    handle: &mut CONTROLTRACE_HANDLE,
+    logger_name: &[u16],
+    properties: &mut TraceProperties,
+) -> u32 {
+    // Both StartTraceW and ControlTraceW are in/out APIs. Never reuse their
+    // output (e.g. offsets, flags or sizes) as the input of a subsequent start.
+    *properties = TraceProperties::new();
+    // SAFETY: the name is NUL-terminated and the aligned properties allocation
+    // includes the writable name slots declared by Wnode.BufferSize.
+    unsafe {
+        windows_sys::Win32::System::Diagnostics::Etw::StartTraceW(
+            handle,
+            logger_name.as_ptr(),
+            properties.as_mut_ptr(),
+        )
+    }
+}
+
 /// 安装时移除改名前遗留的采集会话；旧助手仍存活时不抢占它的会话。
 pub(crate) fn stop_legacy_session() -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -57,17 +107,13 @@ pub(crate) fn stop_legacy_session() -> Result<(), String> {
         }
     };
     let name: Vec<u16> = "TrafficMonitor-Etw".encode_utf16().chain(Some(0)).collect();
-    let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * size_of::<u16>();
-    let mut buffer = vec![0u64; size.div_ceil(8)];
-    let properties = buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-    // SAFETY: 缓冲区按 u64 对齐，包含属性和会话名称空间；名称由独立 NUL 字符串持有。
+    let mut properties = TraceProperties::new();
+    // SAFETY: 属性结构正确对齐，预留完整名称空间；名称由独立 NUL 字符串持有。
     let code = unsafe {
-        (*properties).Wnode.BufferSize = size as u32;
-        (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
         ControlTraceW(
             CONTROLTRACE_HANDLE { Value: 0 },
             name.as_ptr(),
-            properties,
+            properties.as_mut_ptr(),
             EVENT_TRACE_CONTROL_STOP,
         )
     };
@@ -132,6 +178,10 @@ pub enum EtwError {
 impl std::fmt::Display for EtwError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Start(ERROR_BAD_LENGTH) => write!(
+                f,
+                "启动 ETW 会话失败（Win32 错误 24 / ERROR_BAD_LENGTH）：会话属性缓冲区长度不兼容，请更新采集助手并导出诊断日志"
+            ),
             Self::Start(c) => write!(f, "启动 ETW 会话失败（Win32 错误 {c}）"),
             Self::Enable(c) => write!(f, "启用内核网络 provider 失败（Win32 错误 {c}）"),
             Self::OpenTrace => write!(f, "OpenTrace 返回了无效句柄"),
@@ -152,10 +202,6 @@ pub struct EtwSession {
     handle: CONTROLTRACE_HANDLE,
     /// 会话名必须活到 STOP 调用之后
     logger_name: Vec<u16>,
-    /// 属性缓冲区，STOP 时还要用一次。
-    /// 用 `Vec<u64>` 而不是 `Vec<u8>` 作底层存储：`EVENT_TRACE_PROPERTIES` 含 u64 字段，
-    /// 必须 8 字节对齐，`Vec<u8>` 只保证 1 字节对齐。
-    props: Vec<u64>,
     consumer: Option<JoinHandle<()>>,
 }
 
@@ -170,39 +216,9 @@ impl EtwSession {
         let mut logger_name: Vec<u16> = crate::SESSION_NAME.encode_utf16().collect();
         logger_name.push(0);
 
-        // EVENT_TRACE_PROPERTIES 后面紧跟会话名，用一块连续内存装下。
-        // 底层用 u64 数组保证 8 字节对齐（结构体里有 u64 字段）。
-        let props_size =
-            std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + logger_name.len() * size_of::<u16>();
-        let mut props: Vec<u64> = vec![0; props_size.div_ceil(8)];
-        let base = props.as_mut_ptr() as *mut u8;
-        let name_offset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-
-        // SAFETY: props 的字节数 >= props_size，且按 8 字节对齐；
-        // name_offset 之后的 name.len()*2 字节都在缓冲区内。
-        unsafe {
-            let p = base as *mut EVENT_TRACE_PROPERTIES;
-            (*p).Wnode.BufferSize = props_size as u32;
-            (*p).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            (*p).LogFileMode = REAL_TIME_MODE;
-            (*p).FlushTimer = 1;
-            (*p).LoggerNameOffset = name_offset as u32;
-            std::ptr::copy_nonoverlapping(
-                logger_name.as_ptr() as *const u8,
-                base.add(name_offset),
-                logger_name.len() * size_of::<u16>(),
-            );
-        }
-
+        let mut props = TraceProperties::new();
         let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-        // SAFETY: 指针指向我们持有到会话结束的缓冲区
-        let mut rc = unsafe {
-            windows_sys::Win32::System::Diagnostics::Etw::StartTraceW(
-                &mut handle,
-                logger_name.as_ptr(),
-                base as *mut EVENT_TRACE_PROPERTIES,
-            )
-        };
+        let mut rc = start_trace(&mut handle, &logger_name, &mut props);
 
         // 183 = ERROR_ALREADY_EXISTS：同名会话已经存在。两种可能，处理方式相反：
         //   - 管道能连上 → 真有一个助手在跑，本进程没有存在的意义；
@@ -218,27 +234,21 @@ impl EtwSession {
             ) {
                 return Err(EtwError::AlreadyRunning);
             }
+            let mut stop_props = TraceProperties::new();
             // SAFETY: 按名字停会话时 ControlHandle 传 0，名字以 NUL 结尾
             unsafe {
                 ControlTraceW(
                     CONTROLTRACE_HANDLE { Value: 0 },
                     logger_name.as_ptr(),
-                    props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                    stop_props.as_mut_ptr(),
                     EVENT_TRACE_CONTROL_STOP,
                 );
             }
-            // SAFETY: 同上面的 StartTraceW
-            rc = unsafe {
-                windows_sys::Win32::System::Diagnostics::Etw::StartTraceW(
-                    &mut handle,
-                    logger_name.as_ptr(),
-                    base as *mut EVENT_TRACE_PROPERTIES,
-                )
-            };
+            rc = start_trace(&mut handle, &logger_name, &mut props);
         }
 
         if rc != ERROR_SUCCESS {
-            return Err(if rc == 5 {
+            return Err(if rc == ERROR_ACCESS_DENIED {
                 EtwError::NeedAdmin
             } else {
                 EtwError::Start(rc)
@@ -261,11 +271,12 @@ impl EtwSession {
         };
         if rc != ERROR_SUCCESS {
             // 会话已经建起来了，失败也要收掉，否则下次启动会撞名
+            let mut stop_props = TraceProperties::new();
             unsafe {
                 ControlTraceW(
                     handle,
                     std::ptr::null(),
-                    props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                    stop_props.as_mut_ptr(),
                     EVENT_TRACE_CONTROL_STOP,
                 );
             }
@@ -281,7 +292,6 @@ impl EtwSession {
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect(),
-            props,
             consumer: None,
         };
         session.consumer = Some(
@@ -301,12 +311,13 @@ impl EtwSession {
 impl Drop for EtwSession {
     fn drop(&mut self) {
         // 先停会话，ProcessTrace 才会返回，消费线程才可能 join
-        // SAFETY: props 与 handle 都还在有效期内
+        let mut properties = TraceProperties::new();
+        // SAFETY: properties 与 handle 都还在有效期内
         unsafe {
             ControlTraceW(
                 self.handle,
                 std::ptr::null(),
-                self.props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                properties.as_mut_ptr(),
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
@@ -380,6 +391,145 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     if let Some(sink) = (rec.UserContext as *const Mutex<Aggregator>).as_ref() {
         if let Ok(mut agg) = sink.lock() {
             agg.add(event.pid, event.dir, event.bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Diagnostics::Etw::{
+        EventRegister, EventUnregister, StartTraceW, EVENT_TRACE_CONTROL_QUERY,
+        EVENT_TRACE_FILE_MODE_SEQUENTIAL, EVENT_TRACE_PRIVATE_IN_PROC,
+        EVENT_TRACE_PRIVATE_LOGGER_MODE,
+    };
+
+    #[test]
+    fn native_properties_support_private_session_query_and_stop() {
+        // Private in-process sessions exercise the actual Windows property
+        // marshalling without elevation or touching the installed collector.
+        let provider = windows_sys::core::GUID::from_u128(0x9a2daa45_f5cf_4308_839c_3110b87b9435);
+        let name: Vec<u16> = "Tramoing-Properties-Test"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut registration = 0;
+        assert_eq!(
+            unsafe { EventRegister(&provider, None, std::ptr::null(), &mut registration) },
+            ERROR_SUCCESS
+        );
+        struct Registration(i64);
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                unsafe { EventUnregister(self.0) };
+            }
+        }
+        let _registration = Registration(registration as i64);
+
+        let mut properties = TraceProperties::new();
+        properties.properties.Wnode.Guid = provider;
+        properties.properties.LogFileMode = EVENT_TRACE_PRIVATE_LOGGER_MODE
+            | EVENT_TRACE_PRIVATE_IN_PROC
+            | EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+        let directory = tempfile::tempdir().unwrap();
+        let file_name: Vec<u16> = directory
+            .path()
+            .join("private.etl")
+            .to_str()
+            .unwrap()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        properties.log_file_name[..file_name.len()].copy_from_slice(&file_name);
+        properties.properties.LogFileNameOffset =
+            std::mem::offset_of!(TraceProperties, log_file_name) as u32;
+        let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
+        let rc = unsafe { StartTraceW(&mut handle, name.as_ptr(), properties.as_mut_ptr()) };
+        assert_eq!(rc, ERROR_SUCCESS, "private StartTraceW: {rc}");
+
+        struct Session(CONTROLTRACE_HANDLE);
+        impl Drop for Session {
+            fn drop(&mut self) {
+                let mut properties = TraceProperties::new();
+                unsafe {
+                    ControlTraceW(
+                        self.0,
+                        std::ptr::null(),
+                        properties.as_mut_ptr(),
+                        EVENT_TRACE_CONTROL_STOP,
+                    );
+                }
+            }
+        }
+        let session = Session(handle);
+        let mut queried = TraceProperties::new();
+        let rc = unsafe {
+            ControlTraceW(
+                session.0,
+                std::ptr::null(),
+                queried.as_mut_ptr(),
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS, "private ControlTraceW query: {rc}");
+        assert_eq!(&queried.logger_name[..name.len()], name.as_slice());
+        // Stop must also have enough space for the system's output properties.
+        let rc = unsafe {
+            ControlTraceW(
+                session.0,
+                std::ptr::null(),
+                queried.as_mut_ptr(),
+                EVENT_TRACE_CONTROL_STOP,
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS, "private ControlTraceW stop: {rc}");
+        std::mem::forget(session);
+    }
+
+    #[test]
+    fn bad_length_identifies_a_buffer_failure_instead_of_missing_privileges() {
+        let message = EtwError::Start(ERROR_BAD_LENGTH).to_string();
+        assert!(message.contains("24 / ERROR_BAD_LENGTH"));
+        assert!(message.contains("缓冲区"));
+        assert!(!message.contains("管理员"));
+        assert!(EtwError::NeedAdmin.to_string().contains("管理员"));
+    }
+
+    #[test]
+    #[ignore = "requires administrator; starts only the isolated Tramoing-Etw-Verification session"]
+    fn native_realtime_session_restarts_after_control_overwrites_properties() {
+        let name: Vec<u16> = "Tramoing-Etw-Verification"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut properties = TraceProperties::new();
+        for _ in 0..2 {
+            let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
+            let rc = start_trace(&mut handle, &name, &mut properties);
+            assert_eq!(rc, ERROR_SUCCESS, "real-time StartTraceW: {rc}");
+            let enabled = unsafe {
+                EnableTraceEx2(
+                    handle,
+                    &PROVIDER,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    4,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            // Always stop our session, including on provider-enabling failure.
+            let stopped = unsafe {
+                ControlTraceW(
+                    handle,
+                    std::ptr::null(),
+                    properties.as_mut_ptr(),
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+            };
+            assert_eq!(enabled, ERROR_SUCCESS, "EnableTraceEx2: {enabled}");
+            assert_eq!(stopped, ERROR_SUCCESS, "ControlTraceW stop: {stopped}");
         }
     }
 }

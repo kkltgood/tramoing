@@ -45,7 +45,7 @@ fn tick(deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
-fn read(handle: HANDLE, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
+pub(crate) fn read(handle: HANDLE, buffer: &mut [u8], deadline: Instant) -> Result<(), String> {
     let mut offset = 0;
     while offset < buffer.len() {
         if Instant::now() >= deadline {
@@ -99,7 +99,10 @@ fn write(handle: HANDLE, buffer: &[u8], deadline: Instant) -> Result<(), String>
     Ok(())
 }
 
-fn receive<T: serde::de::DeserializeOwned>(handle: HANDLE, deadline: Instant) -> Result<T, String> {
+pub(crate) fn receive<T: serde::de::DeserializeOwned>(
+    handle: HANDLE,
+    deadline: Instant,
+) -> Result<T, String> {
     let mut header = [0u8; 4];
     read(handle, &mut header, deadline)?;
     let len = u32::from_le_bytes(header) as usize;
@@ -111,7 +114,11 @@ fn receive<T: serde::de::DeserializeOwned>(handle: HANDLE, deadline: Instant) ->
     serde_json::from_slice(&body).map_err(|e| format!("网络控制消息格式错误：{e}"))
 }
 
-fn send<T: serde::Serialize>(handle: HANDLE, value: &T, deadline: Instant) -> Result<(), String> {
+pub(crate) fn send<T: serde::Serialize>(
+    handle: HANDLE,
+    value: &T,
+    deadline: Instant,
+) -> Result<(), String> {
     let body = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     if body.len() > MAX_MESSAGE {
         return Err("网络控制规则过多".into());
@@ -120,7 +127,7 @@ fn send<T: serde::Serialize>(handle: HANDLE, value: &T, deadline: Instant) -> Re
     write(handle, &body, deadline)
 }
 
-fn verify_peer(handle: HANDLE, server: bool) -> Result<(), String> {
+pub(crate) fn verify_peer(handle: HANDLE, server: bool) -> Result<(), String> {
     let mut pid = 0;
     let ok = unsafe {
         if server {
@@ -176,8 +183,16 @@ fn verify_peer(handle: HANDLE, server: bool) -> Result<(), String> {
 
 /// 从后台工作线程调用；UI 线程不等待管道。
 pub fn request(request: &Request) -> Result<Reply, String> {
-    let name = wide(&pipe_name()?);
-    let deadline = Instant::now() + TIMEOUT;
+    request_named(&pipe_name()?, request, TIMEOUT)
+}
+
+pub(crate) fn request_named<R: serde::Serialize, T: serde::de::DeserializeOwned>(
+    name: &str,
+    request: &R,
+    timeout: Duration,
+) -> Result<T, String> {
+    let name = wide(name);
+    let deadline = Instant::now() + timeout;
     let raw = loop {
         let handle = unsafe {
             CreateFileW(
@@ -216,7 +231,7 @@ impl Server {
         Self::create_named(&pipe_name()?)
     }
 
-    fn create_named(name: &str) -> Result<Self, String> {
+    pub(crate) fn create_named(name: &str) -> Result<Self, String> {
         let sid = crate::scheduled_task::current_user_sid()?;
         // 不使用 Everyone/Authenticated Users，也不允许远程管道访问。
         // Medium 标签允许普通权限界面写入由提权助手创建的管道。
@@ -256,6 +271,10 @@ impl Server {
             return Err(error("创建网络控制通道失败"));
         }
         Ok(Self(unsafe { OwnedHandle::from_raw_handle(raw) }))
+    }
+
+    pub(crate) fn raw_handle(&self) -> HANDLE {
+        self.0.as_raw_handle()
     }
 
     pub fn run(self, log: impl Fn(&str)) -> ! {

@@ -226,16 +226,26 @@ impl TaskbarBadge {
         };
         let previous = self.state.content.borrow();
         let changed = *previous != content;
-        let layout_changed =
-            previous.visible_items().ne(content.visible_items()) || previous.order != content.order;
+        let layout_changed = previous.visible_items().ne(content.visible_items())
+            || previous.order != content.order
+            || previous
+                .performance
+                .as_ref()
+                .is_some_and(|p| p.temperatures.is_some())
+                != content
+                    .performance
+                    .as_ref()
+                    .is_some_and(|p| p.temperatures.is_some());
         drop(previous);
         if layout_changed {
             unsafe {
                 self.state.cancel_drag();
             }
         }
-        *self.state.content.borrow_mut() = content;
-        if changed {
+        // 拖动期间冻结采样显示，防止文字位数变化引发 WM_SIZE 并取消换序。
+        // 松开后下一次采样更新数值、窗口尺寸和绘制区域。
+        if changed && self.state.drag.borrow().is_none() {
+            *self.state.content.borrow_mut() = content;
             self.state.needs_paint.set(true);
         }
         unsafe {
@@ -289,7 +299,7 @@ impl TaskbarBadge {
     unsafe fn layout(&mut self) -> Result<(), &'static str> {
         let band = client_rect(self.shell).ok_or("无法读取任务栏布局")?;
         let dpi = GetDpiForWindow(self.shell).max(96) as i32;
-        let width = surface::width_dip(&self.state.content.borrow()) * dpi / 96;
+        let width = surface::width_px(&self.state.content.borrow(), dpi);
         let gap = 4 * dpi / 96;
         let tray = FindWindowExW(
             self.shell,
@@ -309,7 +319,7 @@ impl TaskbarBadge {
         let stacked = vertical && band.right < width;
         let height = if stacked {
             let content = self.state.content.borrow();
-            if band.right < surface::minimum_width_dip(&content) * dpi / 96 {
+            if band.right < surface::minimum_width_px(&content, dpi) {
                 return Err("任务栏太窄，无法放入统计项");
             }
             36 * content.visible_items().count() as i32
@@ -700,14 +710,24 @@ mod tests {
     #[test]
     fn drag_reorders_both_groups_in_both_orientations_and_can_return_or_cancel() {
         for dpi in [96, 120, 144, 168, 192] {
-            for performance_first in [false, true] {
-                let content = combined_content(performance_first);
-                for (width, height) in [(surface::width_dip(&content), 48), (80, 72)] {
+            for (performance_first, temperatures) in [false, true]
+                .into_iter()
+                .flat_map(|first| [false, true].map(|temperatures| (first, temperatures)))
+            {
+                let mut content = combined_content(performance_first);
+                if temperatures {
+                    content.performance.as_mut().unwrap().temperatures =
+                        Some(("48°C".into(), "41°C".into()));
+                }
+                for (width, height) in [
+                    (surface::width_px(&content, dpi), 48 * dpi / 96),
+                    (80 * dpi / 96, 72 * dpi / 96),
+                ] {
                     let area = RECT {
                         left: 0,
                         top: 0,
-                        right: width * dpi / 96,
-                        bottom: height * dpi / 96,
+                        right: width,
+                        bottom: height,
                     };
                     let layout = surface::layout(&content, area.right, area.bottom, dpi);
                     for (group, source, destination) in [
@@ -737,7 +757,7 @@ mod tests {
                         drag.track(target.0, target.1, area, &layout, threshold);
                         assert!(drag.moved);
                         assert_ne!(drag.preview_order, content.order);
-                        // 预览期间采样数值可以刷新；排序判定始终使用原始布局，避免来回抖动。
+                        // 排序判定始终使用原始布局，避免预览换位后反复跳动。
                         drag.track(target.0, target.1, area, &layout, threshold);
                         assert_ne!(drag.preview_order, content.order);
                         drag.track(start.0, start.1, area, &layout, threshold);
@@ -763,7 +783,7 @@ mod tests {
                 let area = RECT {
                     left: 0,
                     top: 0,
-                    right: surface::width_dip(&content),
+                    right: surface::width_px(&content, 96),
                     bottom: 48,
                 };
                 let layout = surface::layout(&content, area.right, area.bottom, 96);
@@ -839,7 +859,7 @@ mod tests {
             assert_eq!(CLICKS.load(Ordering::Relaxed), 1);
             let mut combined = content.clone();
             combined.performance = Some(Performance {
-                temperatures: None,
+                temperatures: Some(("48°C".into(), "41°C".into())),
                 cpu: "100%".into(),
                 gpu: " --%".into(),
                 colored: true,
@@ -855,20 +875,25 @@ mod tests {
             SendMessageW(hwnd, WM_LBUTTONUP, 0, point);
             assert_eq!(CLICKS.load(Ordering::Relaxed), 11);
             let coord = |x: i32, y: i32| x as u16 as isize | ((y as u16 as isize) << 16);
-            // 从性能区域拖向左侧：原生窗口即时预览，松开只发送排序事件。
+            // 从性能区域拖向左侧：预览期间冻结数值，松开只发送排序事件。
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, coord(2, 4));
             assert_eq!(badge.state.display_content().order, order(true));
             combined.performance.as_mut().unwrap().cpu = "3%".into();
             badge.update(Some(combined.clone())).unwrap(); // 模拟采样刷新
             assert_eq!(badge.state.display_content().order, order(true));
-            assert_eq!(badge.state.display_content().performance.unwrap().cpu, "3%");
+            assert_eq!(
+                badge.state.display_content().performance.unwrap().cpu,
+                "100%"
+            );
             SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(2, 4));
             assert_eq!(badge.state.content.borrow().order, order(true));
             assert_eq!(REORDERS.load(Ordering::Relaxed), 1);
             assert_eq!(CLICKS.load(Ordering::Relaxed), 11);
             combined.order = order(true);
             badge.update(Some(combined.clone())).unwrap();
+            assert_eq!(badge.state.display_content().performance.unwrap().cpu, "3%");
+            let combined_rect = client_rect(hwnd).unwrap();
             SendMessageW(hwnd, WM_LBUTTONDOWN, 0, coord(4, 4));
             SendMessageW(hwnd, WM_LBUTTONUP, 0, coord(4, 4));
             assert_eq!(

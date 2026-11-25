@@ -14,9 +14,9 @@ const HIT_ALPHA: u32 = 1;
 // 12px 字号下保留最宽四字符（如 999M）的空间，收紧箭头列及左右留白。
 pub(super) const WIDTH_DIP: i32 = 40;
 const PERFORMANCE_WIDTH_DIP: i32 = 58;
-const TEMPERATURE_WIDTH_DIP: i32 = 104;
-const TEMPERATURE_LEFT_DIP: i32 = 64;
-// 相邻统计项统一留白，不借用百分比末尾的空位；网速在前时也要明显分组。
+const TEMPERATURE_WIDTH_DIP: i32 = 102;
+const TEMPERATURE_GAP_DIP: i32 = 10;
+// 相邻统计项在文字区域之外统一留白，不再叠加性能列的空余宽度。
 const GROUP_GAP_DIP: i32 = 10;
 const ARROW_LEFT_DIP: i32 = 1;
 const ARROW_RIGHT_DIP: i32 = 8;
@@ -25,35 +25,56 @@ const PERFORMANCE_LABEL_RIGHT_DIP: i32 = 24;
 const PERFORMANCE_NUMBER_LEFT_DIP: i32 = 27;
 const RIGHT_PADDING_DIP: i32 = 1;
 
-pub(super) fn width_dip(content: &Content) -> i32 {
-    let count = content.visible_items().count();
-    content
-        .visible_items()
-        .map(|group| group_width_dip(content, group))
-        .sum::<i32>()
-        + count.saturating_sub(1) as i32 * GROUP_GAP_DIP
+pub(super) fn width_px(content: &Content, dpi: i32) -> i32 {
+    Widths::new(content, dpi).total(content)
 }
 
-pub(super) fn minimum_width_dip(content: &Content) -> i32 {
+pub(super) fn minimum_width_px(content: &Content, dpi: i32) -> i32 {
+    let widths = Widths::new(content, dpi);
     content
         .visible_items()
-        .map(|group| group_width_dip(content, group))
+        .map(|group| widths.group(group))
         .max()
         .unwrap_or(0)
 }
 
-fn group_width_dip(content: &Content, group: Group) -> i32 {
-    match group {
-        Group::Speed => WIDTH_DIP,
-        Group::Performance
-            if content
-                .performance
-                .as_ref()
-                .is_some_and(|p| p.temperatures.is_some()) =>
-        {
-            TEMPERATURE_WIDTH_DIP
+struct Widths {
+    speed: i32,
+    performance: i32,
+    gap: i32,
+}
+
+impl Widths {
+    fn new(content: &Content, dpi: i32) -> Self {
+        let performance = content
+            .performance
+            .as_ref()
+            .filter(|p| p.temperatures.is_some())
+            .map(|p| unsafe {
+                measure_performance_width(p, dpi).unwrap_or(TEMPERATURE_WIDTH_DIP * dpi / 96)
+            })
+            .unwrap_or(PERFORMANCE_WIDTH_DIP * dpi / 96);
+        Self {
+            speed: WIDTH_DIP * dpi / 96,
+            performance,
+            gap: GROUP_GAP_DIP * dpi / 96,
         }
-        Group::Performance => PERFORMANCE_WIDTH_DIP,
+    }
+
+    fn group(&self, group: Group) -> i32 {
+        match group {
+            Group::Speed => self.speed,
+            Group::Performance => self.performance,
+        }
+    }
+
+    fn total(&self, content: &Content) -> i32 {
+        let count = content.visible_items().count();
+        content
+            .visible_items()
+            .map(|group| self.group(group))
+            .sum::<i32>()
+            + count.saturating_sub(1) as i32 * self.gap
     }
 }
 
@@ -91,12 +112,10 @@ pub(super) fn layout(content: &Content, width: i32, height: i32, dpi: i32) -> La
     };
     let items: Vec<_> = content.visible_items().collect();
     let count = items.len() as i32;
-    let stacked = count > 1 && width < width_dip(content) * dpi / 96;
-    // 各项宽度单独取整，剩余像素分配到间距，换序不改变文字区域宽度。
-    let item_width: i32 = items
-        .iter()
-        .map(|item| group_width_dip(content, *item) * dpi / 96)
-        .sum();
+    let widths = Widths::new(content, dpi);
+    let stacked = count > 1 && width < widths.total(content);
+    // 绘制、窗口尺寸和命中区域使用相同的实际字体宽度，换序后间距保持一致。
+    let item_width: i32 = items.iter().map(|item| widths.group(*item)).sum();
     let mut offset = 0;
     let groups = items
         .into_iter()
@@ -114,7 +133,7 @@ pub(super) fn layout(content: &Content, width: i32, height: i32, dpi: i32) -> La
                 }
             } else {
                 let left = offset + (width - item_width) * index / (count - 1);
-                let item_width = group_width_dip(content, item) * dpi / 96;
+                let item_width = widths.group(item);
                 offset += item_width;
                 RECT {
                     left,
@@ -288,13 +307,17 @@ unsafe fn rasterize(
             true,
         );
         if let Some((cpu, gpu)) = &performance.temperatures {
+            // 温度紧跟两行中较宽的使用率，避免个位数百分比后留下三位数的空位。
+            let temperature_left =
+                temperature_left(surface.dc, rect, dpi, [&performance.cpu, &performance.gpu]);
+            drawn &= temperature_left.is_some();
             let height = rect.bottom - rect.top;
             let line = (14 * dpi / 96).min(height / 2);
             let top = rect.top + (height - line * 2) / 2;
             for (index, value) in [cpu, gpu].into_iter().enumerate() {
                 let text = wide(value.trim());
                 let mut area = RECT {
-                    left: rect.left + TEMPERATURE_LEFT_DIP * dpi / 96,
+                    left: temperature_left.unwrap_or(rect.right),
                     right: rect.right - RIGHT_PADDING_DIP * dpi / 96,
                     top: top + index as i32 * line,
                     bottom: top + (index as i32 + 1) * line,
@@ -328,6 +351,54 @@ unsafe fn rasterize(
         }
     }
     Ok(surface)
+}
+
+unsafe fn widest_text(dc: HDC, values: [&str; 2]) -> Option<i32> {
+    let mut width = 0;
+    for value in values {
+        let text = wide(value.trim());
+        let mut size = SIZE { cx: 0, cy: 0 };
+        if GetTextExtentPoint32W(dc, text.as_ptr(), (text.len() - 1) as i32, &mut size) == 0 {
+            return None;
+        }
+        width = width.max(size.cx);
+    }
+    Some(width)
+}
+
+unsafe fn temperature_left(dc: HDC, area: RECT, dpi: i32, usage: [&str; 2]) -> Option<i32> {
+    Some(
+        area.left
+            + PERFORMANCE_NUMBER_LEFT_DIP * dpi / 96
+            + widest_text(dc, usage)?
+            + TEMPERATURE_GAP_DIP * dpi / 96,
+    )
+}
+
+unsafe fn measure_performance_width(performance: &super::Performance, dpi: i32) -> Option<i32> {
+    let (cpu, gpu) = performance.temperatures.as_ref()?;
+    let surface = Surface::new(1, 1).ok()?;
+    let font = create_font(dpi);
+    if font.is_null() {
+        return None;
+    }
+    let old = SelectObject(surface.dc, font);
+    if old.is_null() || old as isize == -1 {
+        DeleteObject(font);
+        return None;
+    }
+    let width = widest_text(surface.dc, [&performance.cpu, &performance.gpu])
+        .zip(widest_text(surface.dc, [cpu, gpu]))
+        .map(|(usage, temperature)| {
+            PERFORMANCE_NUMBER_LEFT_DIP * dpi / 96
+                + usage
+                + TEMPERATURE_GAP_DIP * dpi / 96
+                + temperature
+                + RIGHT_PADDING_DIP * dpi / 96
+        });
+    SelectObject(surface.dc, old);
+    DeleteObject(font);
+    width
 }
 
 unsafe fn draw_lines(
@@ -453,20 +524,22 @@ mod tests {
     fn temperature_columns_fit_and_hiding_them_restores_compact_layout() {
         for dpi in [96, 120, 144, 168, 192] {
             let mut content = content(false, true);
-            let compact = width_dip(&content);
+            let compact = width_px(&content, dpi);
             content.performance.as_mut().unwrap().temperatures =
                 Some(("150°C".into(), " --°C".into()));
-            assert_eq!(
-                width_dip(&content) - compact,
-                TEMPERATURE_WIDTH_DIP - PERFORMANCE_WIDTH_DIP
-            );
-            let width = width_dip(&content) * dpi / 96;
+            let width = width_px(&content, dpi);
+            assert!(width > compact);
             let height = 48 * dpi / 96;
             let layout = layout(&content, width, height, dpi);
             let area = layout.rect(Group::Performance).unwrap();
             let mut surface = unsafe { rasterize(&content, width, height, dpi).unwrap() };
             let font = unsafe { create_font(dpi) };
             let old = unsafe { SelectObject(surface.dc, font) };
+            let performance = content.performance.as_ref().unwrap();
+            let start = unsafe {
+                temperature_left(surface.dc, area, dpi, [&performance.cpu, &performance.gpu])
+                    .unwrap()
+            };
             for text in ["150°C", "--°C"] {
                 let text = wide(text);
                 let mut size = SIZE { cx: 0, cy: 0 };
@@ -481,17 +554,12 @@ mod tests {
                     },
                     0
                 );
-                assert!(
-                    size.cx
-                        <= (TEMPERATURE_WIDTH_DIP - TEMPERATURE_LEFT_DIP - RIGHT_PADDING_DIP) * dpi
-                            / 96
-                );
+                assert!(size.cx <= area.right - RIGHT_PADDING_DIP * dpi / 96 - start);
             }
             unsafe {
                 SelectObject(surface.dc, old);
                 DeleteObject(font);
             }
-            let start = area.left + TEMPERATURE_LEFT_DIP * dpi / 96;
             for (top, bottom) in [(0, height / 2), (height / 2, height)] {
                 assert!((top..bottom).any(|y| surface.pixels_mut()
                     [(y * width + start) as usize..(y * width + area.right) as usize]
@@ -499,7 +567,7 @@ mod tests {
                     .any(|p| p >> 24 == 255)));
             }
             content.performance.as_mut().unwrap().temperatures = None;
-            assert_eq!(width_dip(&content), compact);
+            assert_eq!(width_px(&content, dpi), compact);
         }
     }
 
@@ -572,7 +640,7 @@ mod tests {
                 cpu: Some(Rgb(255, 80, 80)),
                 gpu: Some(Rgb(160, 240, 32)),
             };
-            let width = width_dip(&content);
+            let width = width_px(&content, 96);
             let mut surface = unsafe { rasterize(&content, width, 48, 96).unwrap() };
             for color in [
                 content.colors.download,
@@ -612,7 +680,7 @@ mod tests {
         {
             let mut content = content(false, true);
             content.order = order(performance_first);
-            let width = width_dip(&content) * dpi / 96;
+            let width = width_px(&content, dpi);
             let horizontal = layout(&content, width, 48 * dpi / 96, dpi);
             let speed = horizontal.rect(Group::Speed).unwrap();
             let perf = horizontal.rect(Group::Performance).unwrap();
@@ -641,7 +709,7 @@ mod tests {
             assert_eq!(vertical.group_at(0, speed.top), Some(Group::Speed));
             assert_eq!(vertical.group_at(0, perf.top), Some(Group::Performance));
             content.speed = None;
-            assert_eq!(width_dip(&content), PERFORMANCE_WIDTH_DIP);
+            assert_eq!(width_px(&content, dpi), PERFORMANCE_WIDTH_DIP * dpi / 96);
             let only = layout(
                 &content,
                 PERFORMANCE_WIDTH_DIP * dpi / 96,
@@ -651,7 +719,7 @@ mod tests {
             assert!(only.rect(Group::Speed).is_none());
             assert_eq!(only.rect(Group::Performance).unwrap().left, 0);
             content.performance = None;
-            assert_eq!(width_dip(&content), 0);
+            assert_eq!(width_px(&content, dpi), 0);
         }
     }
 
@@ -665,8 +733,10 @@ mod tests {
                 for colored in [false, true] {
                     let mut content = content(light, colored);
                     content.order = order(performance_first);
-                    for (dip_width, dip_height) in [(width_dip(&content), 48), (80, 72)] {
-                        let (width, height) = (dip_width * dpi / 96, dip_height * dpi / 96);
+                    for (width, height) in [
+                        (width_px(&content, dpi), 48 * dpi / 96),
+                        (80 * dpi / 96, 72 * dpi / 96),
+                    ] {
                         let layout = layout(&content, width, height, dpi);
                         let perf = layout.rect(Group::Performance).unwrap();
                         let mut labels = None;
@@ -720,11 +790,35 @@ mod tests {
     fn short_percentages_stay_by_labels_and_groups_have_visible_separation() {
         for dpi in [96, 120, 144, 168, 192] {
             for performance_first in [false, true] {
-                for (case, down, up, cpu, gpu) in [
-                    ("reported", "118B", "144B", "  3%", "  1%"),
-                    ("reordered", "344K", " 18K", "  2%", "  5%"),
-                    ("widest", "999M", "1.5G", "100%", " 99%"),
-                    ("unavailable", "  0B", "  9B", " --%", "100%"),
+                for (case, down, up, cpu, gpu, temperatures) in [
+                    ("reported", "118B", "144B", "  3%", "  1%", None),
+                    ("reordered", "344K", " 18K", "  2%", "  5%", None),
+                    ("widest", "999M", "1.5G", "100%", " 99%", None),
+                    ("unavailable", "  0B", "  9B", " --%", "100%", None),
+                    (
+                        "temperature-reordered",
+                        "2.4K",
+                        "1.1K",
+                        "  2%",
+                        "  2%",
+                        Some((" 48°C", " 41°C")),
+                    ),
+                    (
+                        "temperature-widest",
+                        "999M",
+                        "1.5G",
+                        "100%",
+                        " 99%",
+                        Some(("150°C", " --°C")),
+                    ),
+                    (
+                        "temperature-unavailable",
+                        "  0B",
+                        "  9B",
+                        " --%",
+                        " --%",
+                        Some((" --°C", " --°C")),
+                    ),
                 ] {
                     let mut content = content(false, true);
                     content.order = order(performance_first);
@@ -734,16 +828,21 @@ mod tests {
                         colored: true,
                     });
                     content.performance = Some(Performance {
-                        temperatures: None,
+                        temperatures: temperatures.map(|(cpu, gpu)| (cpu.into(), gpu.into())),
                         cpu: cpu.into(),
                         gpu: gpu.into(),
                         colored: true,
                     });
-                    let width = width_dip(&content) * dpi / 96;
+                    let width = width_px(&content, dpi);
                     let height = 36 * dpi / 96;
                     let layout = layout(&content, width, height, dpi);
                     let speed = layout.rect(Group::Speed).unwrap();
                     let perf = layout.rect(Group::Performance).unwrap();
+                    assert_eq!(layout.group_at(speed.left, 0), Some(Group::Speed));
+                    assert_eq!(layout.group_at(perf.right - 1, 0), Some(Group::Performance));
+                    let mut reversed = content.clone();
+                    reversed.order = order(!performance_first);
+                    assert_eq!(width_px(&reversed, dpi), width);
                     let mut surface = unsafe { rasterize(&content, width, height, dpi).unwrap() };
                     let pixels = surface.pixels_mut();
                     let bounds = |left, right, top, bottom| {
@@ -802,6 +901,20 @@ mod tests {
                             }
                         }
                         file.flush().unwrap();
+                    }
+                    if temperatures.is_some() {
+                        let (first, second) = if performance_first {
+                            (perf, speed)
+                        } else {
+                            (speed, perf)
+                        };
+                        let (_, first_end) = bounds(first.left, first.right, 0, height);
+                        let (second_start, _) = bounds(second.left, second.right, 0, height);
+                        let gap = second_start - first_end - 1;
+                        assert!(
+                            gap <= (GROUP_GAP_DIP + 5) * dpi / 96,
+                            "{case} at {dpi} DPI, performance first={performance_first}: visible group gap {gap}px is too wide"
+                        );
                     }
                 }
             }

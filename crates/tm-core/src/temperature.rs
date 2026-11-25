@@ -5,6 +5,21 @@ pub struct Temperatures {
     pub gpu: Option<f64>,
     /// Provider / failure details for local diagnostics, never a temperature estimate.
     pub source: String,
+    /// Stable reason used for a localized CPU-unavailable explanation in the UI.
+    pub cpu_unavailable: Option<CpuUnavailable>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuUnavailable {
+    Starting,
+    HelperUnavailable,
+    ComponentMissing,
+    DriverMissing,
+    DriverUnavailable,
+    PermissionDenied,
+    UnsupportedPlatform,
+    SensorUnavailable,
+    Failed,
 }
 
 pub fn valid(value: f64) -> Option<f64> {

@@ -12,6 +12,29 @@ pub fn enabled() -> bool {
         && std::env::var_os("TM_CAPTURE_PPM").is_some()
 }
 
+/// 诊断卡片的静态预览；不导出文件，也不伪造真实实例的任务结果。
+pub fn diagnostics_result(lang: crate::theme::Lang) -> Option<Result<std::path::PathBuf, String>> {
+    if !enabled() {
+        return None;
+    }
+    match std::env::var("TM_CAPTURE_STATE").as_deref() {
+        Ok("settings-diagnostics-saved") => Some(Ok(tm_store::data_dir()
+            .join("diagnostics")
+            .join("Tramoing-diagnostics-20261125T095231Z-preview.txt"))),
+        Ok("settings-diagnostics-error") => Some(Err(lang
+            .t(
+                "无法写入报告文件，请检查目标文件夹的存储权限（系统错误 5）。",
+                "Could not write the report. Check the destination folder's permissions (OS error 5).",
+            )
+            .into())),
+        _ => None,
+    }
+}
+
+pub fn diagnostics_busy() -> bool {
+    enabled() && std::env::var("TM_CAPTURE_STATE").as_deref() == Ok("settings-diagnostics-busy")
+}
+
 /// 仅在隔离预览中打开一次指定的颜色面板。
 pub fn open_color_picker(ctx: &egui::Context, label: &str, lang: crate::theme::Lang) -> bool {
     if !enabled() {

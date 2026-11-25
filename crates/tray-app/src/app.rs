@@ -360,6 +360,18 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(windows)]
+        {
+            crate::windows_panel::prepare(cc);
+            if let Some(gl) = &cc.gl {
+                use eframe::glow::{HasContext, RENDERER, VENDOR, VERSION};
+                // Read-only context metadata makes driver-specific UI reports actionable.
+                unsafe {
+                    log::info!(target: "tramoing::window", "OpenGL vendor={} renderer={} version={}",
+                        gl.get_parameter_string(VENDOR), gl.get_parameter_string(RENDERER), gl.get_parameter_string(VERSION));
+                }
+            }
+        }
         let ctx = cc.egui_ctx.clone();
         let _ = CTX.set(ctx.clone());
         tm_diagnostics::set_error_waker({
@@ -554,9 +566,15 @@ impl App {
             let mut app = app;
             if crate::ui_capture::enabled() {
                 match std::env::var("TM_CAPTURE_STATE").as_deref() {
-                    Ok("settings-general") => {
+                    Ok(
+                        "settings-general"
+                        | "settings-diagnostics-saved"
+                        | "settings-diagnostics-error"
+                        | "settings-diagnostics-busy",
+                    ) => {
                         app.view = View::Settings;
                         app.settings_tab = SettingsTab::General;
+                        app.diagnostics_result = crate::ui_capture::diagnostics_result(lang);
                     }
                     Ok("settings-statusbar" | "settings-color-download" | "settings-color-gpu") => {
                         app.view = View::Settings;
@@ -1135,6 +1153,8 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        crate::windows_panel::prepare(_frame);
         // 排查「点了托盘没反应」用的：确认收起之后 update 还在跑。
         // 收缩面板如果把窗口真隐藏了，这个计数就会停在收起的那一刻。
         if std::env::var_os("TM_TRACE_FRAMES").is_some() {
@@ -1790,6 +1810,43 @@ impl App {
                     }
                 });
             });
+            settings_separator(ui, p);
+            let mut page = None;
+            ui.horizontal(|ui| {
+                ui.set_height(30.0);
+                ui.add_space(2.0);
+                ui.visuals_mut().hyperlink_color = p.accent;
+                if ui
+                    .link(
+                        RichText::new(lang.t("GitHub 开源仓库 ↗", "GitHub repository ↗"))
+                            .size(10.5),
+                    )
+                    .on_hover_text(crate::update::REPOSITORY_URL)
+                    .clicked()
+                {
+                    page = Some(crate::update::REPOSITORY_URL);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .link(
+                            RichText::new(lang.t("手动下载更新 ↗", "Download manually ↗"))
+                                .size(10.5),
+                        )
+                        .on_hover_text(lang.t(
+                            "下载遇到问题时，在浏览器中打开 GitHub 发布页选择安装包。",
+                            "If the download fails, open GitHub Releases in your browser to choose an installer.",
+                        ))
+                        .clicked()
+                    {
+                        page = Some(crate::update::RELEASES_URL);
+                    }
+                });
+            });
+            if let Some(url) = page {
+                if let Err(error) = crate::update::open_url(url) {
+                    self.toast = Some((error, Instant::now()));
+                }
+            }
         });
         ui.add_space(8.0);
         settings_group(
@@ -1797,72 +1854,170 @@ impl App {
             p,
             lang.t("日志与故障反馈", "Diagnostics & feedback"),
             |ui| {
-                settings_note(ui, p, lang.t(
-                "自动保存最近错误与崩溃信息。导出报告，将文件和复现步骤发给开发者。",
-                "Recent errors and panic details are saved automatically. Send a report and steps to reproduce to the developer.",
-            ));
                 self.diagnostics_controls(ui, p, lang);
-                settings_note(ui, p, lang.t(
-                "报告含系统、助手状态及日志，不含流量历史。日志可能含程序路径，发送前可查看；不会自动上传。",
-                "Includes system details, helper status and logs, without traffic history. Logs may contain app paths. Review before sharing; no automatic uploads.",
-            ));
+                ui.add_space(8.0);
+                settings_separator(ui, p);
+                ui.add_space(4.0);
+                settings_note(
+                    ui,
+                    p,
+                    lang.t(
+                        "报告仅保存到本机，不会自动上传。",
+                        "Saved on this device. No automatic uploads.",
+                    ),
+                );
+                egui::CollapsingHeader::new(
+                    RichText::new(lang.t("报告内容与反馈说明", "Report contents & sharing"))
+                        .size(10.5)
+                        .color(p.subtext),
+                )
+                .id_salt("diagnostics-contents")
+                .show(ui, |ui| {
+                    settings_note(ui, p, lang.t(
+                        "包含系统信息、助手状态和最近日志，不含流量历史。日志可能含程序路径，发送前可查看。",
+                        "Includes system details, helper status and recent logs, without traffic history. Logs may contain app paths; review before sharing.",
+                    ));
+                    settings_note(ui, p, lang.t(
+                        "反馈时，将报告文件与复现步骤一起发给开发者。",
+                        "Send the report and steps to reproduce to the developer.",
+                    ));
+                });
             },
         );
     }
 
     fn diagnostics_controls(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
+        let busy = self.diagnostics_job.is_some();
+        #[cfg(debug_assertions)]
+        let busy = busy || crate::ui_capture::diagnostics_busy();
+        let export_label = match (&self.diagnostics_result, busy) {
+            (_, true) => lang.t("正在导出…", "Exporting…"),
+            (Some(Ok(_)), false) => lang.t("重新导出", "Export again"),
+            (Some(Err(_)), false) => lang.t("重试导出", "Try again"),
+            (None, false) => lang.t("导出报告", "Export report"),
+        };
+        let mut export = false;
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.set_min_height(42.0);
+            export = ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(RichText::new(export_label).size(11.0).color(p.on_selection))
+                        .min_size(Vec2::new(96.0, 32.0))
+                        .fill(p.selection)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(8),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked();
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 42.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    diagnostics_report_icon(ui, p);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(lang.t("诊断报告", "Diagnostic report"))
+                                .font(theme::display_font(12.0))
+                                .color(p.text),
+                        );
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    lang.t("汇总日志与系统运行状态", "Logs and system details"),
+                                )
+                                .size(10.5)
+                                .color(p.subtext),
+                            )
+                            .wrap(),
+                        );
+                    });
+                },
+            );
+        });
         if tm_diagnostics::log_path().is_none() || tm_diagnostics::write_error().is_some() {
+            ui.add_space(6.0);
             ui.add(egui::Label::new(RichText::new(lang.t(
                 "日志无法写入，请导出诊断并检查存储权限。",
                 "Logs could not be saved. Export diagnostics and check storage permissions.",
             )).small().color(p.warn)).wrap());
         }
-        ui.horizontal(|ui| {
-            if settings_action(
-                ui,
-                p,
-                lang.t("导出诊断", "Export diagnostics"),
-                self.diagnostics_job.is_none(),
-            )
-            .clicked()
-            {
-                self.export_diagnostics(ui.ctx());
-            }
-            if let Some(Ok(path)) = &self.diagnostics_result {
-                if settings_action(ui, p, lang.t("显示文件", "Show file"), true).clicked() {
-                    if let Err(error) = crate::diagnostics::reveal(path) {
-                        log::error!(target: "tramoing::diagnostics", "打开报告位置失败：{error}");
-                        self.toast = Some((error, Instant::now()));
-                    }
+        if busy {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(13.0).color(p.accent));
+                ui.label(
+                    RichText::new(lang.t("正在收集诊断信息…", "Collecting diagnostics…"))
+                        .size(10.5)
+                        .color(p.subtext),
+                );
+            });
+        } else if let Some(result) = &self.diagnostics_result {
+            ui.add_space(8.0);
+            match result {
+                Ok(path) => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(lang.t("报告已保存", "Report saved"))
+                                .size(11.0)
+                                .color(p.download),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if settings_action(
+                                ui,
+                                p,
+                                lang.t("打开文件位置", "Show file"),
+                                true,
+                            )
+                            .clicked()
+                            {
+                                if let Err(error) = crate::diagnostics::reveal(path) {
+                                    log::error!(target: "tramoing::diagnostics", "打开报告位置失败：{error}");
+                                    self.toast = Some((error, Instant::now()));
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(path.file_name().unwrap_or_default().to_string_lossy())
+                                .size(10.5)
+                                .color(p.subtext),
+                        )
+                        .truncate()
+                        .selectable(true),
+                    )
+                    .on_hover_text(path.display().to_string());
+                }
+                Err(error) => {
+                    ui.label(
+                        RichText::new(
+                            lang.t("导出失败，请重试", "Export failed. Please try again."),
+                        )
+                        .size(11.0)
+                        .color(p.warn),
+                    );
+                    egui::CollapsingHeader::new(
+                        RichText::new(lang.t("查看错误详情", "Error details"))
+                            .size(10.5)
+                            .color(p.subtext),
+                    )
+                    .id_salt("diagnostics-export-error")
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(error).size(10.5).color(p.warn))
+                                .wrap()
+                                .selectable(true),
+                        );
+                    });
                 }
             }
-        });
-        if self.diagnostics_job.is_some() {
-            ui.label(
-                RichText::new(lang.t("正在收集诊断信息…", "Collecting diagnostics…"))
-                    .small()
-                    .color(p.subtext),
-            );
-        } else if let Some(result) = &self.diagnostics_result {
-            let (text, color) = match result {
-                Ok(path) => (
-                    format!(
-                        "{} {}",
-                        lang.t("已保存：", "Saved:"),
-                        tildify(&path.to_string_lossy())
-                    ),
-                    p.subtext,
-                ),
-                Err(error) => (
-                    format!("{}: {error}", lang.t("导出失败", "Export failed")),
-                    p.warn,
-                ),
-            };
-            ui.add(
-                egui::Label::new(RichText::new(text).small().color(color))
-                    .wrap()
-                    .selectable(true),
-            );
+        }
+        if export {
+            self.export_diagnostics(ui.ctx());
         }
     }
 
@@ -1880,6 +2035,12 @@ impl App {
             None => "No sampler snapshot received\n".into(),
         };
         // Do not include app lists, traffic totals, or update URLs in the report.
+        let viewport = ctx.input(|i| i.viewport().clone());
+        status.push_str(&format!(
+            "ui_pixels_per_point={}\nui_native_pixels_per_point={:?}\nui_content_size={:?}\nui_inner_rect={:?}\nui_outer_rect={:?}\n",
+            ctx.pixels_per_point(), viewport.native_pixels_per_point,
+            ctx.content_rect().size(), viewport.inner_rect, viewport.outer_rect
+        ));
         if let Some(prompt) = &self.error_prompt {
             status.push_str(&format!("\n[触发提示的错误]\n{}\n", prompt.context()));
         }
@@ -2175,7 +2336,28 @@ impl App {
                 if self.settings.performance_temperature {
                     settings_note(ui, p, lang.t("温度取可用核心/芯片传感器的最高值；--°C 表示暂不可用。", "Temperature is the hottest available core/die sensor; --°C means unavailable."));
                     #[cfg(windows)]
-                    settings_note(ui, p, lang.t("CPU 温度需要运行 LibreHardwareMonitor 或 OpenHardwareMonitor；GPU 温度需驱动支持，也可从上述工具读取。", "CPU temperature requires LibreHardwareMonitor or OpenHardwareMonitor running. GPU temperature uses a supported driver or either tool."));
+                    {
+                        settings_note(ui, p, lang.t("CPU 温度由内置采集组件读取；GPU 温度使用显卡驱动。可用性取决于硬件与驱动支持。", "CPU temperature uses the built-in sensor component; GPU temperature uses the graphics driver. Availability depends on hardware and driver support."));
+                        if let Some(thermal) = reading
+                            .as_ref()
+                            .map(|r| &r.temperatures)
+                            .filter(|r| r.cpu.is_none())
+                        {
+                            use tm_core::temperature::CpuUnavailable as Reason;
+                            let message = match thermal.cpu_unavailable {
+                                Some(Reason::Starting) => lang.t("正在读取 CPU 温度…", "Reading CPU temperature…"),
+                                Some(Reason::HelperUnavailable) => lang.t("CPU 温度采集助手未连接，请安装或启动当前版本的采集助手。", "CPU sensor helper is unavailable. Install or start the current collector helper."),
+                                Some(Reason::ComponentMissing) => lang.t("缺少 CPU 温度采集组件，请使用完整安装包修复安装。", "CPU sensor component is missing. Repair using the complete installer."),
+                                Some(Reason::DriverMissing) => lang.t("CPU 温度驱动未安装或版本过旧，请在安装程序中启用“CPU 温度支持”。", "CPU sensor driver is missing or outdated. Enable CPU temperature support in the installer."),
+                                Some(Reason::DriverUnavailable) => lang.t("CPU 温度驱动无法访问，请检查驱动安装状态；安装后可能需要重启 Windows。", "CPU sensor driver is unavailable. Check its installation; Windows may need to restart."),
+                                Some(Reason::PermissionDenied) => lang.t("CPU 温度采集助手缺少管理员权限，请修复助手安装。", "CPU sensor helper needs administrator privileges. Repair the helper installation."),
+                                Some(Reason::UnsupportedPlatform) => lang.t("此架构暂不支持内置 CPU 温度采集，正在尝试其他已运行的传感器来源。", "Built-in CPU sensors do not support this architecture yet. Checking other running sensor providers."),
+                                Some(Reason::Failed) => lang.t("CPU 温度读取失败，将自动重试；可导出日志查看原因。", "CPU temperature reading failed and will retry automatically. Export diagnostics for details."),
+                                _ => lang.t("未找到可用的 CPU 温度传感器；也可从已运行的 LibreHardwareMonitor / OpenHardwareMonitor 读取。", "No CPU temperature sensor is available. A running LibreHardwareMonitor / OpenHardwareMonitor can also provide readings."),
+                            };
+                            settings_note(ui, p, message).on_hover_text(&thermal.source);
+                        }
+                    }
                 }
             } else {
                 settings_note(
@@ -3130,10 +3312,6 @@ impl App {
         if response.clicked() {
             if let Some(ip) = address {
                 ui.ctx().copy_text(ip.to_string());
-                self.toast = Some((
-                    lang.t("IP 地址已复制", "IP address copied").to_owned(),
-                    Instant::now(),
-                ));
             }
         }
     }
@@ -3616,6 +3794,19 @@ fn theme_options(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Theme
         }
     }
     before != *current
+}
+
+fn diagnostics_report_icon(ui: &mut egui::Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 8.0, mix(p.surface, p.accent, 0.10));
+    let page = egui::Rect::from_center_size(rect.center(), Vec2::new(14.0, 18.0));
+    let stroke = Stroke::new(1.1_f32, p.accent);
+    painter.rect_stroke(page, 2.5, stroke, egui::StrokeKind::Inside);
+    for (offset, width) in [(5.0, 7.0), (9.0, 7.0), (13.0, 4.5)] {
+        let start = page.min + egui::vec2(3.5, offset);
+        painter.line_segment([start, start + egui::vec2(width, 0.0)], stroke);
+    }
 }
 
 fn settings_action(ui: &mut egui::Ui, p: &Palette, text: &str, enabled: bool) -> egui::Response {

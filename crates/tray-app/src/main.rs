@@ -35,6 +35,8 @@ mod theme;
 #[cfg(debug_assertions)]
 mod ui_capture;
 mod update;
+#[cfg(windows)]
+mod windows_panel;
 
 use eframe::egui;
 
