@@ -29,7 +29,8 @@ log = "0.4"
 # TLS 走系统实现：Windows 是 SChannel、macOS 是 Security.framework。
 # **不能**用默认的 rustls：它带 ring，Windows 上要 nasm/CMake 才能编 asm，
 # 直接把「装个 Rust 就能编」这条底线破掉。native-tls 只多一个薄封装。
-ureq = { version = "3", default-features = false, features = ["native-tls", "platform-verifier", "gzip"] }
+# Range offsets refer to the transferred bytes: keep response decompression disabled.
+ureq = { version = "3", default-features = false, features = ["native-tls", "platform-verifier"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 版本比较不用自己写：`1.10` > `1.9` 这种按字典序会判反，pre-release 也要按规则排。

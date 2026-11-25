@@ -190,7 +190,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.8` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.9` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -207,15 +207,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.1.8` 为例）：
+发布步骤（以当前 `0.1.9` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.8.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.9.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.8 -m "Release v0.1.8"
-   git push opensource v0.1.8
+   git tag -a v0.1.9 -m "Release v0.1.9"
+   git push opensource v0.1.9
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -243,7 +243,9 @@ Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 
 
 新安装默认 `update_check=on`；旧配置已有的 `update_check=off` 会保留，可在设置 → 通用 → 启动与更新中开启。自动检查有 10 秒启动延迟和 24 小时间隔；macOS 收起后不驱动界面帧，检查可能延迟至面板展开。手动检查使用该区域的“检查更新”按钮或 `--check-update`，不受自动检查开关和间隔限制。`--mock` 不自动联网，但仍可显式手动检查。
 
-发现新版本后，点击提示下载本平台安装包。下载在后台进行，核对文件大小及 SHA-256 后才显示安装入口；检查间隔到期也不会清除待下载提示或已就绪的安装包。Windows 点击“更新并重启”后以 `/UPDATE /APP_PID=<当前进程> /D=<当前程序目录>` 启动安装器。NSIS 要求 `/D=` 为最后一个参数，含空格时也不加引号。UAC 取消或启动失败时保留当前程序和下载包，界面显示重试入口；启动成功后程序正常退出并提交历史，安装器最多等待 15 秒，超时不改动安装文件。随后更新主程序及助手，只显示进度页，成功后通过 Explorer 以普通权限重新启动，保留配置、历史和自启设置。
+发现新版本后，点击提示下载本平台安装包。下载在后台进行，核对文件大小及 SHA-256 后才显示安装入口；检查间隔到期也不会清除待下载提示或已就绪的安装包。下载没有总时限，连接和读写分别设置超时；断网及临时 HTTP 错误按 2、4、8、16、30 秒退避重试。下载缓存按版本、平台和预期 SHA-256 隔离，使用独占文件锁、HTTP Range / If-Range 和强 ETag 续传；拒绝压缩响应和错误的范围，服务端返回完整文件时从零写入。用户可暂停/继续，已请求的任务通过 `update/pending.json` 恢复为暂停状态，重启不自动联网下载。完整校验后才原子替换可安装文件。
+
+Windows 点击“更新并重启”后以 `/UPDATE /APP_PID=<当前进程> /D=<当前程序目录>` 启动安装器。NSIS 要求 `/D=` 为最后一个参数，含空格时也不加引号。UAC 取消或启动失败时保留当前程序和下载包，界面显示重试入口；启动成功后程序正常退出并提交历史，安装器最多等待 15 秒，超时不改动安装文件。随后更新主程序及助手，只显示进度页，成功后通过 Explorer 以普通权限重新启动，保留配置、历史和自启设置。
 
 macOS 点击“更新并重启”后在后台只读挂载 DMG，不打开 Finder。安装模块校验 bundle ID、清单版本、代码签名及已签名安装的 Team ID，将完整应用复制到原安装目录旁的独立暂存目录，再次校验后启动独立助手。助手确认就绪后才让主程序正常退出；以 PID 和进程启动时间等待旧进程结束，20 秒超时则停止替换。旧 bundle 重命名为备份，再将新 bundle 放到原路径；替换或 `open` 命令失败时尝试恢复旧 bundle。新应用通过 LaunchServices 打开，原路径、自启设置、用户配置和历史不变。准备失败不退出旧程序；启动请求成功不等于应用不会稍后崩溃，不以此宣称覆盖所有运行故障。若恢复失败，错误中保留备份路径供恢复。
 

@@ -11,12 +11,14 @@
 //! 默认读取官方 GitHub Release 的 latest.json 附件，不依赖 GitHub API 配额。
 //! 可通过 TRAMOING_UPDATE_URL 覆盖地址或用空值禁用，见 docs/development.md。
 
-use std::io::{Read, Write};
+mod download;
+
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 pub const RELEASES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
@@ -69,7 +71,7 @@ pub struct Manifest {
     pub platforms: std::collections::BTreeMap<String, Asset>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Asset {
     pub url: String,
     /// 小写十六进制。为空表示清单没给，这时只提示不下载——
@@ -81,7 +83,7 @@ pub struct Asset {
 }
 
 /// 发现的新版本。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Available {
     pub version: String,
     pub notes: String,
@@ -98,6 +100,10 @@ pub enum Event {
     Checked(Option<Available>),
     Failed(String),
     Progress(f32),
+    DownloadRetrying {
+        delay: Duration,
+    },
+    DownloadPaused,
     Downloaded {
         version: String,
         path: PathBuf,
@@ -115,6 +121,8 @@ pub struct Updater {
     /// `phase` 最近一次变化的时刻。`Latest` / `Error` 靠它自动消退——
     /// 「已是最新」赖在页脚不走，用户会以为下次检查也是这个结论。
     phase_at: Instant,
+    download_stop: Option<Sender<()>>,
+    pending_download: Option<(Available, PathBuf)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +136,20 @@ pub enum Phase {
     Downloading {
         version: String,
         pct: f32,
+    },
+    Retrying {
+        version: String,
+        pct: f32,
+        retry_at: Instant,
+    },
+    Pausing {
+        version: String,
+        pct: f32,
+    },
+    Paused {
+        version: String,
+        pct: f32,
+        error: Option<String>,
     },
     /// 下载并校验完了，等用户确认更新
     Ready {
@@ -158,6 +180,8 @@ impl Updater {
             rx,
             phase: Phase::Idle,
             phase_at: Instant::now(),
+            download_stop: None,
+            pending_download: None,
         }
     }
 
@@ -181,6 +205,8 @@ impl Updater {
             self.phase,
             Phase::Checking
                 | Phase::Downloading { .. }
+                | Phase::Retrying { .. }
+                | Phase::Pausing { .. }
                 | Phase::Installing { .. }
                 | Phase::Restarting
         )
@@ -236,24 +262,108 @@ impl Updater {
         let Some(asset) = avail.asset.clone() else {
             return;
         };
+        let saved = serde_json::to_vec(avail)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| tm_store::files::atomic_write(&root.join("pending.json"), &bytes));
+        if let Err(error) = saved {
+            self.set(Phase::Error(format!("无法保存下载任务：{error}")));
+            return;
+        }
         let version = avail.version.clone();
+        self.pending_download = Some((avail.clone(), root.clone()));
+        let (stop, stopped) = channel();
+        self.download_stop = Some(stop);
         self.set(Phase::Downloading {
             version: version.clone(),
-            pct: 0.0,
+            pct: download::saved_progress(&asset, &version, &root).unwrap_or(0.0),
         });
         let tx = self.tx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("update-download".into())
-            .spawn(move || match download_to(&asset, &version, &tx, &root) {
-                Ok(path) => {
-                    let _ = tx.send(Event::Downloaded { version, path });
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::DownloadFailed(e));
-                }
-            })
+            .spawn(
+                move || match download::run(&asset, &version, &tx, &root, &stopped) {
+                    Ok(Some(path)) => {
+                        let _ = tx.send(Event::Downloaded { version, path });
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(Event::DownloadPaused);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::DownloadFailed(e));
+                    }
+                },
+            )
         {
+            self.download_stop = None;
             self.set(Phase::Error(format!("无法启动下载：{e}")));
+        }
+    }
+
+    pub fn pause_download(&mut self) {
+        if let Phase::Downloading { version, pct } | Phase::Retrying { version, pct, .. } =
+            self.phase.clone()
+        {
+            if let Some(stop) = &self.download_stop {
+                let _ = stop.send(());
+            }
+            self.set(Phase::Pausing { version, pct });
+        }
+    }
+
+    pub fn resume_download(&mut self) {
+        if matches!(self.phase, Phase::Paused { .. }) {
+            if let Some((available, root)) = self.pending_download.clone() {
+                self.download_into(&available, root);
+            }
+        }
+    }
+
+    /// Restore the explicitly requested download without starting network traffic.
+    /// The user can continue from the footer even if today's update check already ran.
+    pub fn restore_download(&mut self) {
+        self.restore_download_from(tm_store::data_dir().join("update"));
+    }
+
+    fn restore_download_from(&mut self, root: PathBuf) {
+        let Ok(file) = std::fs::File::open(root.join("pending.json")) else {
+            return;
+        };
+        let Ok(available) = serde_json::from_reader::<_, Available>(file.take(1024 * 1024)) else {
+            return;
+        };
+        let Ok(version) = parse_version(&available.version) else {
+            return;
+        };
+        if !version
+            .cmp_precedence(&parse_version(CURRENT).expect("valid package version"))
+            .is_gt()
+        {
+            let _ = std::fs::remove_file(root.join("pending.json"));
+            return;
+        }
+        let Some(asset) = &available.asset else {
+            return;
+        };
+        if http_url(&asset.url).is_err() {
+            return;
+        }
+        let Some(pct) = download::saved_progress(asset, &available.version, &root) else {
+            return;
+        };
+        self.set(Phase::Paused {
+            version: available.version.clone(),
+            pct,
+            error: None,
+        });
+        self.pending_download = Some((available, root));
+    }
+
+    fn download_progress(&self) -> Option<(String, f32)> {
+        match &self.phase {
+            Phase::Downloading { version, pct }
+            | Phase::Retrying { version, pct, .. }
+            | Phase::Pausing { version, pct } => Some((version.clone(), *pct)),
+            _ => None,
         }
     }
 
@@ -331,12 +441,40 @@ impl Updater {
                     self.set(Phase::Error(e));
                 }
                 Event::Progress(pct) => {
-                    if let Phase::Downloading { version, .. } = &self.phase {
-                        let version = version.clone();
-                        self.set(Phase::Downloading { version, pct });
+                    if let Some((version, _)) = self.download_progress() {
+                        if matches!(self.phase, Phase::Pausing { .. }) {
+                            self.set(Phase::Pausing { version, pct });
+                        } else {
+                            self.set(Phase::Downloading { version, pct });
+                        }
+                    }
+                }
+                Event::DownloadRetrying { delay } => {
+                    if !matches!(self.phase, Phase::Pausing { .. }) {
+                        if let Some((version, pct)) = self.download_progress() {
+                            self.set(Phase::Retrying {
+                                version,
+                                pct,
+                                retry_at: Instant::now() + delay,
+                            });
+                        }
+                    }
+                }
+                Event::DownloadPaused => {
+                    self.download_stop = None;
+                    if let Some((version, pct)) = self.download_progress() {
+                        self.set(Phase::Paused {
+                            version,
+                            pct,
+                            error: None,
+                        });
                     }
                 }
                 Event::Downloaded { version, path } => {
+                    self.download_stop = None;
+                    if let Some((_, root)) = self.pending_download.take() {
+                        let _ = std::fs::remove_file(root.join("pending.json"));
+                    }
                     log_line(&format!("已下载 {}：{}", version, path.display()));
                     self.set(Phase::Ready {
                         version,
@@ -345,8 +483,17 @@ impl Updater {
                     });
                 }
                 Event::DownloadFailed(e) => {
+                    self.download_stop = None;
                     log::error!(target: "tramoing::update", "下载失败：{e}");
-                    self.set(Phase::Error(e));
+                    if let Some((version, pct)) = self.download_progress() {
+                        self.set(Phase::Paused {
+                            version,
+                            pct,
+                            error: Some(e),
+                        });
+                    } else {
+                        self.set(Phase::Error(e));
+                    }
                 }
                 Event::InstallPrepared(result) => {
                     if let Phase::Installing { version, path } = self.phase.clone() {
@@ -403,7 +550,7 @@ fn http_url(raw: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
+fn agent_config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     // native-tls + 系统证书库：企业环境里自签的根证书也能认，
     // 不用把根证书列表打进二进制。
     let tls = ureq::tls::TlsConfig::builder()
@@ -411,16 +558,17 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
         .build();
     ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
         .user_agent(concat!("Tramoing/", env!("CARGO_PKG_VERSION")))
         .tls_config(tls)
-        .build()
-        .into()
 }
 
 fn fetch_manifest(source: &str) -> Result<Manifest, String> {
     let url = http_url(source)?;
-    let text = agent(Duration::from_secs(8))
+    let client: ureq::Agent = agent_config()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .build()
+        .into();
+    let text = client
         .get(url.as_str())
         .call()
         .map_err(|e| match e {
@@ -439,98 +587,17 @@ fn fetch_manifest(source: &str) -> Result<Manifest, String> {
     serde_json::from_str(text).map_err(|e| format!("清单格式不对：{e}"))
 }
 
-fn download_to(
-    asset: &Asset,
-    version: &str,
-    tx: &Sender<Event>,
-    root: &Path,
-) -> Result<PathBuf, String> {
-    let hash = asset.sha256.trim();
-    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("清单没有提供有效的 sha256，已跳过下载".to_owned());
-    }
-    let version = parse_version(version)?.to_string();
-    let url = http_url(&asset.url)?;
-    // 每个版本单独一个目录：既不会和上个版本的残留包撞名，
-    // 清理时也可以整目录删掉，不用猜文件名规则。
-    let dir = root.join(version);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败：{e}"))?;
-    // 文件名由本平台决定。签名网址的查询参数、重定向端点和反斜杠
-    // 不能变成本地文件名，也不能改变安装包扩展名或逃出版本目录。
-    let dest = dir.join(if cfg!(windows) {
-        "Tramoing-setup.exe"
-    } else {
-        "Tramoing.dmg"
-    });
-
-    // 按安装包大小给慢速网络留出总下载时间，最多等待半小时。
-    let timeout_secs = (asset.size / 102_400).clamp(120, 1800);
-    let mut resp = agent(Duration::from_secs(timeout_secs))
-        .get(url.as_str())
-        .call()
-        .map_err(|e| format!("下载失败：{e}"))?;
-
-    let total = if asset.size > 0 {
-        asset.size
-    } else {
-        resp.headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-
-    // 每次下载有独立临时文件，所有错误路径由 Drop 清理；成功校验后才提交。
-    let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|e| format!("写文件失败：{e}"))?;
-    let mut reader = resp.body_mut().as_reader();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    let mut last_pct = -1.0f32;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("读流出错：{e}"))?;
-        if n == 0 {
-            break;
-        }
-        written += n as u64;
-        if total > 0 && written > total {
-            return Err(format!("下载大小超过清单声明（{written}/{total} 字节）"));
-        }
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("写文件失败：{e}"))?;
-        if total > 0 {
-            let pct = (written as f32 / total as f32).clamp(0.0, 1.0);
-            // 每 1% 发一次就够了，否则 channel 每 64KB 被塞满，界面白重画。
-            if pct - last_pct >= 0.01 {
-                last_pct = pct;
-                let _ = tx.send(Event::Progress(pct));
-            }
-        }
-    }
-    if total > 0 && written != total {
-        return Err(format!("下载不完整（{written}/{total} 字节）"));
-    }
-
-    file.as_file()
-        .sync_all()
-        .map_err(|e| format!("保存下载失败：{e}"))?;
-    let actual = sha256_file(file.path()).map_err(|e| format!("校验失败：{e}"))?;
-    if !actual.eq_ignore_ascii_case(hash) {
-        return Err(format!("sha256 不匹配（得到 {actual}）"));
-    }
-
-    file.persist(&dest).map_err(|e| format!("落盘失败：{e}"))?;
-    Ok(dest)
+#[cfg(test)]
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    sha256_reader(std::fs::File::open(path)?)
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+fn sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    let mut f = std::fs::File::open(path)?;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -617,7 +684,9 @@ pub fn log_line(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::download::{download_agent, download_to, download_to_with_agent};
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn preparing_an_update_only_requests_exit_after_the_worker_is_ready() {
@@ -940,11 +1009,13 @@ mod tests {
         // A corrupt retry must never offer installation or replace the verified file.
         updater.download_into(&available, root.path().to_owned());
         wait_for_result(&mut updater);
-        assert!(matches!(&updater.phase, Phase::Error(error) if error.contains("sha256")));
+        assert!(
+            matches!(&updater.phase, Phase::Paused { error: Some(error), .. } if error.contains("sha256"))
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
+            3
         );
         server.join().unwrap();
     }
@@ -982,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn downloads_use_safe_names_and_clean_up_all_failure_paths() {
+    fn downloads_use_safe_names_and_preserve_partial_files_after_disconnects() {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1049,7 +1120,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
+            3
         );
         assert!(download_to(&asset, "../escape", &tx, dir.path()).is_err());
         let bad_hash = Asset {
@@ -1059,6 +1130,263 @@ mod tests {
         assert!(download_to(&bad_hash, "2.0.0", &tx, dir.path()).is_err());
         assert!(!dir.path().join("2.0.0").exists());
         server.join().unwrap();
+    }
+
+    fn serve_download(
+        respond: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "download request timed out");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_nodelay(true).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192, "oversized request headers");
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            respond(stream);
+        });
+        (format!("http://{address}/setup.exe"), server)
+    }
+
+    #[test]
+    fn slow_downloads_keep_running_while_bytes_arrive() {
+        use sha2::{Digest, Sha256};
+        let body = b"abcdefghijklmnop";
+        let timeout = Duration::from_millis(500);
+        // Cover both release manifests with a size and sources with no known length.
+        for known_size in [true, false] {
+            let (url, server) = serve_download(move |mut stream| {
+                let length = if known_size {
+                    format!("Content-Length: {}\r\n", body.len())
+                } else {
+                    String::new()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n"
+                )
+                .unwrap();
+                // Total transfer time exceeds the timeout, but each network read progresses.
+                for byte in body {
+                    std::thread::sleep(Duration::from_millis(75));
+                    if stream.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let asset = Asset {
+                url,
+                sha256: format!("{:x}", Sha256::digest(body)),
+                size: if known_size { body.len() as u64 } else { 0 },
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let (tx, _rx) = channel();
+            let started = Instant::now();
+            let result =
+                download_to_with_agent(&asset, "1.2.3", &tx, dir.path(), &download_agent(timeout));
+            let elapsed = started.elapsed();
+            server.join().unwrap();
+            let path = result.expect("a progressing download must not hit a total timeout");
+            assert!(elapsed > timeout);
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_downloads_time_out_and_preserve_the_verified_installer() {
+        let (release, wait) = channel();
+        let (url, server) = serve_download(move |mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            // Hold the connection open until the client finishes; EOF must not cause the error.
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        let asset = Asset {
+            url,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size: 3,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let version_dir = dir.path().join("1.2.3");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let dest = version_dir.join(if cfg!(windows) {
+            "Tramoing-setup.exe"
+        } else {
+            "Tramoing.dmg"
+        });
+        std::fs::write(&dest, b"abc").unwrap();
+        let (tx, _rx) = channel();
+        let result = download_to_with_agent(
+            &asset,
+            "1.2.3",
+            &tx,
+            dir.path(),
+            &download_agent(Duration::from_millis(250)),
+        );
+        let _ = release.send(());
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("timeout"), "{error}");
+        assert!(error.contains("timeout: per read"), "{error}");
+        assert!(error.contains("1/3 字节"), "{error}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        assert_eq!(std::fs::read_dir(&version_dir).unwrap().count(), 3);
+        let partial = std::fs::read_dir(&version_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "part"))
+            .unwrap();
+        assert_eq!(std::fs::read(partial).unwrap(), b"a");
+    }
+
+    #[test]
+    fn downloads_time_out_when_the_server_never_sends_headers() {
+        let (release, wait) = channel();
+        let (url, server) = serve_download(move |_stream| {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        let asset = Asset {
+            url,
+            sha256: "a".repeat(64),
+            size: 3,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = channel();
+        let result = download_to_with_agent(
+            &asset,
+            "1.2.3",
+            &tx,
+            dir.path(),
+            &download_agent(Duration::from_millis(250)),
+        );
+        let _ = release.send(());
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("timeout"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("1.2.3")).unwrap().count(),
+            2
+        );
+    }
+
+    #[test]
+    fn pausing_waits_for_the_worker_and_resume_does_not_overlap_downloads() {
+        let mut updater = Updater::new();
+        let (stop, stopped) = channel();
+        updater.download_stop = Some(stop);
+        updater.set(Phase::Downloading {
+            version: "999.0.0".into(),
+            pct: 0.4,
+        });
+        updater
+            .tx
+            .send(Event::DownloadRetrying {
+                delay: Duration::from_secs(30),
+            })
+            .unwrap();
+        updater.poll();
+        assert!(matches!(updater.phase, Phase::Retrying { pct, .. } if pct == 0.4));
+        assert!(updater.is_busy());
+        assert!(!updater.can_auto_check());
+        updater.pause_download();
+        stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(updater.phase, Phase::Pausing { .. }));
+        assert!(updater.is_busy());
+        updater.resume_download();
+        assert!(matches!(updater.phase, Phase::Pausing { .. }));
+        // A late progress/retry event must not undo the pause request.
+        updater.tx.send(Event::Progress(0.5)).unwrap();
+        updater
+            .tx
+            .send(Event::DownloadRetrying {
+                delay: Duration::from_secs(30),
+            })
+            .unwrap();
+        updater.tx.send(Event::DownloadPaused).unwrap();
+        updater.poll();
+        assert!(matches!(updater.phase, Phase::Paused { pct, error: None, .. } if pct == 0.5));
+        assert!(!updater.is_busy());
+        assert!(!updater.can_auto_check());
+        updater.phase_at = Instant::now() - Duration::from_secs(10);
+        updater.tick();
+        assert!(matches!(updater.phase, Phase::Paused { .. }));
+    }
+
+    #[test]
+    fn restarting_restores_the_pending_update_and_a_completed_resume_clears_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (url, server) = serve_download(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+                .unwrap();
+        });
+        let available = Available {
+            version: "999.0.0".into(),
+            notes: String::new(),
+            pub_date: String::new(),
+            homepage: String::new(),
+            asset: Some(Asset {
+                url,
+                size: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            }),
+        };
+        tm_store::files::atomic_write(
+            &root.path().join("pending.json"),
+            &serde_json::to_vec(&available).unwrap(),
+        )
+        .unwrap();
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        assert!(matches!(updater.phase, Phase::Paused { .. }));
+        updater.resume_download();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updater.is_busy() {
+            updater.poll();
+            assert!(Instant::now() < deadline, "resume did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.join().unwrap();
+        assert!(matches!(updater.phase, Phase::Ready { .. }));
+        assert!(!root.path().join("pending.json").exists());
+
+        let already_installed = Available {
+            version: CURRENT.into(),
+            ..available
+        };
+        tm_store::files::atomic_write(
+            &root.path().join("pending.json"),
+            &serde_json::to_vec(&already_installed).unwrap(),
+        )
+        .unwrap();
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        assert_eq!(updater.phase, Phase::Idle);
+        assert!(!root.path().join("pending.json").exists());
     }
 
     #[test]

@@ -25,7 +25,7 @@ These screenshots show a Windows demo instance. macOS shares the panel layout; p
 - **Traffic history:** local SQLite storage, configurable retention, CSV export, and per-app traffic alerts.
 - **Windows application firewall controls:** block or restore network access for a selected executable, including connections through local proxies. Requires the bundled administrator helper.
 - **Error reporting:** errors offer to export diagnostic logs through a dialog; reports stay on your device and are not uploaded automatically.
-- **Desktop integration:** light/dark/system themes, Chinese and English UI, animated settings tabs, optional launch at login, and in-app updates.
+- **Desktop integration:** light/dark/system themes, Chinese and English UI, animated settings tabs, optional launch at login, and in-app updates. Downloads support pause/resume, automatic retries after disconnections, and saved progress across app restarts; the complete installer must pass SHA-256 verification.
 
 ## Download and install
 

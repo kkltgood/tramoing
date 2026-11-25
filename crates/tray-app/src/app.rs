@@ -512,7 +512,13 @@ impl App {
             diagnostics_job: None,
             diagnostics_result: None,
             error_prompt: None,
-            update: crate::update::Updater::new(),
+            update: {
+                let mut updater = crate::update::Updater::new();
+                if std::env::var_os("TM_FORCE_MOCK").is_none() {
+                    updater.restore_download();
+                }
+                updater
+            },
             started_at: Instant::now(),
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
@@ -3336,11 +3342,41 @@ impl App {
             ),
             Phase::Downloading { version, pct } => (
                 if zh {
-                    format!("正在下载 v{} · {:.0}%", version, pct * 100.0)
+                    format!("下载 v{} · {:.0}% · 点此暂停", version, pct * 100.0)
                 } else {
-                    format!("Downloading v{} · {:.0}%", version, pct * 100.0)
+                    format!("v{} · {:.0}% · pause", version, pct * 100.0)
                 },
+                true,
+            ),
+            Phase::Retrying { pct, retry_at, .. } => {
+                let seconds = retry_at.saturating_duration_since(Instant::now()).as_secs();
+                (
+                    if zh {
+                        format!("已下载 {:.0}% · {seconds} 秒后重试 · 点此暂停", pct * 100.0)
+                    } else {
+                        format!("{:.0}% saved · retry in {seconds}s · pause", pct * 100.0)
+                    },
+                    true,
+                )
+            }
+            Phase::Pausing { .. } => (
+                lang.t("正在暂停，保留下载进度…", "Pausing, saving progress…")
+                    .into(),
                 false,
+            ),
+            Phase::Paused {
+                error: Some(error), ..
+            } => (
+                format!("{error} · {}", lang.t("点此重试", "click to retry")),
+                true,
+            ),
+            Phase::Paused { pct, .. } => (
+                if zh {
+                    format!("已暂停 · {:.0}% · 点此继续", pct * 100.0)
+                } else {
+                    format!("Paused · {:.0}% · resume", pct * 100.0)
+                },
+                true,
             ),
             Phase::Ready {
                 launch_error: Some(error),
@@ -3380,6 +3416,8 @@ impl App {
                 }
             }
             Phase::Available(a) => self.update.download(a),
+            Phase::Downloading { .. } | Phase::Retrying { .. } => self.update.pause_download(),
+            Phase::Paused { .. } => self.update.resume_download(),
             Phase::Ready { .. } if self.update.install() && cfg!(windows) => {
                 crate::update::log_line("升级程序已启动，正在保存历史并退出");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3394,8 +3432,7 @@ impl App {
     /// 面板高度是写死的，在列表上方加横幅会把最后一行挤出去；页脚中间本来是
     /// 临时提示的位置，复用最安全。
     ///
-    /// 可点的两种状态（可下载、可安装）才注册 click；其余用 `Sense::hover`，
-    /// 免得用户点「正在下载」反而把状态搅乱。
+    /// 下载和等待重试时可暂停，暂停后可继续；准备安装时不接受重复点击。
     fn update_strip(
         &mut self,
         ui: &mut egui::Ui,
@@ -3417,13 +3454,15 @@ impl App {
         };
         let mut resp = ui.allocate_rect(rect, sense).on_hover_text(&text);
         if actionable {
-            resp = resp.on_hover_text(lang.t("点击继续", "Click to continue"));
+            resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         }
-        let color = if matches!(&self.update.phase, Phase::Error(_)) {
+        let color = if matches!(
+            &self.update.phase,
+            Phase::Error(_) | Phase::Paused { error: Some(_), .. }
+        ) {
             p.warn
         } else if actionable && resp.hovered() {
-            // 可点的那两种状态用强调色：页脚平时全是灰字，
-            // 只有这里需要用户动手，值得抢一次注意力。
+            // 可点击的更新操作在悬停时使用强调色。
             p.accent
         } else {
             p.subtext
@@ -3467,15 +3506,16 @@ impl App {
             .interact(rect, ui.id().with("settings-status"), sense)
             .on_hover_text(text);
         if actionable {
-            resp = resp
-                .on_hover_text(lang.t("点击继续", "Click to continue"))
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             resp.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text)
             });
             surface::focus(ui.painter(), rect, &resp, p);
         }
-        let color = if matches!(&self.update.phase, crate::update::Phase::Error(_)) {
+        let color = if matches!(
+            &self.update.phase,
+            crate::update::Phase::Error(_) | crate::update::Phase::Paused { error: Some(_), .. }
+        ) {
             p.warn
         } else if actionable {
             p.accent
