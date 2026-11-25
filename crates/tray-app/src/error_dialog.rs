@@ -57,7 +57,7 @@ impl Prompt {
             .frame(
                 egui::Frame::NONE
                     .fill(p.surface)
-                    .stroke(Stroke::new(1.0, p.border))
+                    .stroke(Stroke::new(1.0_f32, p.border))
                     .corner_radius(14)
                     .inner_margin(18),
             )
