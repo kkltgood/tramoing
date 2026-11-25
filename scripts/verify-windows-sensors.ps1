@@ -13,14 +13,25 @@ $start.RedirectStandardError = $true
 $process = [Diagnostics.Process]::new()
 $process.StartInfo = $start
 try {
-    if (-not $process.Start()) { throw 'Cannot start sensor worker' }
+    # .NET Framework creates StandardInput with Console.InputEncoding and
+    # flushes its BOM during Process.Start. Match the Rust supervisor's BOM-free
+    # wire format, then restore the caller's encoding immediately.
+    $inputEncoding = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+        if (-not $process.Start()) { throw 'Cannot start sensor worker' }
+    } finally {
+        [Console]::InputEncoding = $inputEncoding
+    }
     # The worker must wait for the supervisor handshake.
     $stream = $process.StandardOutput.BaseStream
     $header = New-Object byte[] 4
     $read = $stream.ReadAsync($header, 0, 4)
     if ($read.Wait(500)) { throw 'Worker emitted data before the start handshake' }
-    $process.StandardInput.WriteLine('start')
-    $process.StandardInput.Flush()
+    # Send exactly the same ASCII handshake as the Rust supervisor.
+    $handshake = [Text.Encoding]::ASCII.GetBytes("start`n")
+    $process.StandardInput.BaseStream.Write($handshake, 0, $handshake.Length)
+    $process.StandardInput.BaseStream.Flush()
     if (-not $read.Wait(15000)) { throw 'Sensor worker did not respond in 15 seconds' }
     $count = $read.Result
     while ($count -lt 4) {

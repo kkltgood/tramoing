@@ -38,6 +38,12 @@ jobs:
           ./packaging/windows/build-sensors.ps1 -Architecture x64
           ./packaging/windows/build-sensors.ps1 -Architecture arm64
           ./scripts/verify-windows-sensors.ps1
+      - name: Verify sensor handshake with Windows PowerShell UTF-8
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          [Console]::InputEncoding = [Text.Encoding]::UTF8
+          ./scripts/verify-windows-sensors.ps1
       - name: Check macOS packaging script syntax
         if: runner.os == 'macOS'
         run: |
