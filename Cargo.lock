@@ -3808,14 +3808,23 @@ dependencies = [
 
 [[package]]
 name = "tm-core"
-version = "0.1.6"
+version = "0.1.7"
+
+[[package]]
+name = "tm-diagnostics"
+version = "0.1.7"
+dependencies = [
+ "log",
+ "tempfile",
+]
 
 [[package]]
 name = "tm-macos"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "core-foundation-sys",
  "libc",
+ "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -3827,14 +3836,14 @@ dependencies = [
 
 [[package]]
 name = "tm-sampler"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tm-core",
 ]
 
 [[package]]
 name = "tm-store"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3843,12 +3852,14 @@ dependencies = [
 
 [[package]]
 name = "tm-windows"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
+ "log",
  "serde",
  "serde_json",
  "tempfile",
  "tm-core",
+ "tm-diagnostics",
  "tm-sampler",
  "windows-sys 0.59.0",
  "winresource",
@@ -3993,9 +4004,10 @@ dependencies = [
 
 [[package]]
 name = "tray-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "eframe",
+ "libc",
  "log",
  "semver",
  "serde",
@@ -4003,6 +4015,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tm-core",
+ "tm-diagnostics",
  "tm-macos",
  "tm-sampler",
  "tm-store",
@@ -4010,6 +4023,7 @@ dependencies = [
  "tray-icon",
  "ureq",
  "url",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

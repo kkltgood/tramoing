@@ -58,7 +58,14 @@ Add-Section 'Installed binaries' {
 Add-Section 'Collector task' {
     $task = Get-ScheduledTask -TaskName 'TramoingHelper'
     $info = $task | Get-ScheduledTaskInfo
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $ownerSid = $task.Principal.UserId
+    if ($ownerSid -notmatch '^S-1-') {
+        try { $ownerSid = ([Security.Principal.NTAccount]::new($ownerSid)).Translate([Security.Principal.SecurityIdentifier]).Value }
+        catch { $ownerSid = 'unresolved' }
+    }
     [pscustomobject]@{
+        TaskAccountMatchesCurrentUser = $(if ($ownerSid -eq 'unresolved') { 'unknown' } else { $ownerSid -eq $currentSid })
         State = $task.State
         LastRunTime = $info.LastRunTime
         LastTaskResult = ('0x{0:X8}' -f $info.LastTaskResult)
@@ -69,6 +76,7 @@ Add-Section 'Collector task' {
         ExecutionTimeLimit = $task.Settings.ExecutionTimeLimit
         RestartCount = $task.Settings.RestartCount
         Command = ($task.Actions.Execute -join '; ')
+        CommandExists = (($task.Actions | ForEach-Object { Test-Path -LiteralPath $_.Execute -PathType Leaf }) -join '; ')
     } | Format-List
 }
 
@@ -81,7 +89,7 @@ Add-Section 'Task Scheduler service' {
     Get-Service -Name Schedule | Select-Object Name,Status,StartType | Format-List
 }
 
-foreach ($name in @('ui.log', 'helper.log')) {
+foreach ($name in @('ui.log.3', 'ui.log.2', 'ui.log.1', 'ui.log', 'helper.log.3', 'helper.log.2', 'helper.log.1', 'helper.log')) {
     Add-Section $name {
         $path = Join-Path (Join-Path $env:LOCALAPPDATA 'Tramoing') $name
         'Path: ' + $path

@@ -9,6 +9,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod appid;
+#[cfg(target_os = "macos")]
+pub mod dialog;
 pub mod flows;
 #[cfg(target_os = "macos")]
 pub mod icon;
@@ -21,6 +23,8 @@ pub mod pty;
 pub mod sampler;
 #[cfg(target_os = "macos")]
 pub mod status_item;
+#[cfg(target_os = "macos")]
+pub mod temperature;
 #[cfg(target_os = "macos")]
 pub mod utilization;
 

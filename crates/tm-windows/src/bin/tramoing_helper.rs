@@ -27,9 +27,8 @@ fn main() {
 
 #[cfg(windows)]
 mod win {
-    use std::io::Write;
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     use tm_windows::agg::{Aggregator, AppAccumulator};
     use tm_windows::etw::{self, EtwSession};
@@ -40,6 +39,18 @@ mod win {
     pub const LOG_HINT: &str = r"%LOCALAPPDATA%\Tramoing\helper.log";
 
     pub fn main() {
+        let directory = std::env::var_os("TM_DATA_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(
+                    std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into()),
+                )
+                .join(tm_core::identity::APP_NAME)
+            });
+        if let Err(error) = tm_diagnostics::init(&directory, "helper", env!("CARGO_PKG_VERSION")) {
+            eprintln!("无法初始化助手日志：{error}");
+        }
         let args: Vec<String> = std::env::args().skip(1).collect();
         let has = |f: &str| args.iter().any(|a| a == f);
 
@@ -229,31 +240,8 @@ mod win {
         }
     }
 
-    /// 追加一行日志。窗口是隐藏的，只能写文件。
+    /// Shared bounded file logger; helper and UI have separate files.
     pub fn log(msg: &str) {
-        let path = log_path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "[{secs}] {msg}");
-        }
-        // 开发时从终端直接跑也能看到
-        eprintln!("[tramoing-helper] {msg}");
-    }
-
-    fn log_path() -> std::path::PathBuf {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_owned());
-        std::path::Path::new(&base)
-            .join(tm_core::identity::APP_NAME)
-            .join("helper.log")
+        log::info!(target: "tramoing::helper", "{msg}");
     }
 }

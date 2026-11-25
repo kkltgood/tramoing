@@ -9,6 +9,11 @@ use std::path::PathBuf;
 use tm_core::color::{DisplayColors, Rgb};
 use tm_core::taskbar::{TaskbarItem, TaskbarOrder};
 
+/// Windows 手动输入的 exe 路径可能与采集器返回的大小写不同。
+pub(crate) fn same_app(a: &str, b: &str) -> bool {
+    a == b || (cfg!(windows) && a.to_lowercase() == b.to_lowercase())
+}
+
 /// 状态栏显示内容。
 ///
 /// 只有三档：图标 + 两行速率 / 只要两行速率 / 只要图标。
@@ -64,6 +69,8 @@ pub struct Settings {
     /// CPU / GPU 共用一个双行区块（macOS 菜单栏 / Windows 任务栏）。
     pub performance_enabled: bool,
     pub performance_color: bool,
+    /// Hidden temperatures also stop sensor polling; utilization remains enabled.
+    pub performance_temperature: bool,
     /// 性能采样间隔，只提供 1 / 2 / 5 秒。
     pub performance_interval: u64,
     /// 两个平台共用的四项显示色；未配置时继续跟随系统明暗主题。
@@ -95,6 +102,7 @@ impl Default for Settings {
             taskbar_order: TaskbarOrder::default(),
             performance_enabled: false,
             performance_color: true,
+            performance_temperature: true,
             performance_interval: 2,
             display_colors: DisplayColors::default(),
             update_check: true,
@@ -112,7 +120,12 @@ impl Settings {
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path()) {
             Ok(text) => Self::parse(&text),
-            Err(_) => Self::default(),
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::error!(target: "tramoing::settings", "读取设置失败，使用默认值：{error}");
+                }
+                Self::default()
+            }
         }
     }
 
@@ -120,18 +133,18 @@ impl Settings {
         let path = Self::path();
         if let Err(e) = tm_store::files::atomic_write(&path, self.serialize().as_bytes()) {
             eprintln!("[settings] 保存失败（{}）：{e}", path.display());
-            crate::update::log_line(&format!("保存设置失败（{}）：{e}", path.display()));
+            log::error!(target: "tramoing::settings", "保存设置失败（{}）：{e}", path.display());
         }
     }
 
     pub fn is_pinned(&self, app: &str) -> bool {
-        self.pinned_apps.iter().any(|key| key == app)
+        self.pinned_apps.iter().any(|key| same_app(key, app))
     }
 
     /// 切换置顶，返回切换后的状态。已有置顶项的相对顺序保持不变。
     pub fn toggle_pin(&mut self, app: &str) -> bool {
         if self.is_pinned(app) {
-            self.pinned_apps.retain(|key| key != app);
+            self.pinned_apps.retain(|key| !same_app(key, app));
             false
         } else if !app.trim().is_empty() {
             self.pinned_apps.push(app.to_owned());
@@ -180,7 +193,14 @@ impl Settings {
                         let mut seen = std::collections::HashSet::new();
                         s.pinned_apps = apps
                             .into_iter()
-                            .filter(|app| !app.trim().is_empty() && seen.insert(app.clone()))
+                            .filter(|app| {
+                                !app.trim().is_empty()
+                                    && seen.insert(if cfg!(windows) {
+                                        app.to_lowercase()
+                                    } else {
+                                        app.clone()
+                                    })
+                            })
                             .collect();
                     }
                 }
@@ -229,6 +249,11 @@ impl Settings {
                 "performance_enabled" => {
                     if let Some(value) = parse_bool(v) {
                         s.performance_enabled = value;
+                    }
+                }
+                "performance_temperature" => {
+                    if let Some(value) = parse_bool(v) {
+                        s.performance_temperature = value;
                     }
                 }
                 "performance_color" => {
@@ -302,6 +327,7 @@ impl Settings {
              tray_badge={}\n\
              taskbar_order={}\n\
              performance_enabled={}\n\
+             performance_temperature={}\n\
              performance_color={}\n\
              performance_interval={}\n\
              download_color={}\n\
@@ -318,6 +344,11 @@ impl Settings {
             if self.tray_badge { "on" } else { "off" },
             self.taskbar_order.serialize(),
             if self.performance_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if self.performance_temperature {
                 "on"
             } else {
                 "off"
@@ -416,6 +447,7 @@ mod tests {
             taskbar_order: TaskbarOrder::new([TaskbarItem::Performance, TaskbarItem::Speed]),
             performance_enabled: true,
             performance_color: false,
+            performance_temperature: false,
             performance_interval: 5,
             display_colors: DisplayColors {
                 download: Some(Rgb(255, 123, 0)),
@@ -537,6 +569,27 @@ mod tests {
     }
 
     #[test]
+    fn saved_pins_use_the_same_path_identity_as_pin_actions() {
+        let first = r"C:\Apps\app.exe";
+        let alias = r"c:\apps\APP.exe";
+        let other = r"D:\Apps\app.exe";
+        let mut settings = Settings::parse(&format!(
+            "pinned_apps={}",
+            serde_json::to_string(&[first, alias, other]).unwrap()
+        ));
+        let expected = if cfg!(windows) {
+            vec![first, other]
+        } else {
+            vec![first, alias, other]
+        };
+        assert_eq!(settings.pinned_apps, expected);
+        assert!(!settings.toggle_pin(alias));
+        assert_eq!(settings.is_pinned(first), !cfg!(windows));
+        assert!(settings.is_pinned(other));
+        assert_eq!(Settings::parse(&settings.serialize()), settings);
+    }
+
+    #[test]
     fn update_check_defaults_on_and_preserves_an_explicit_opt_out() {
         assert!(Settings::default().update_check);
         assert!(Settings::parse("theme=dark").update_check);
@@ -563,6 +616,21 @@ mod tests {
             );
         }
         assert!(!Settings::parse("performance_enabled=maybe").performance_enabled);
+    }
+
+    #[test]
+    fn temperature_visibility_migrates_and_preserves_an_independent_opt_out() {
+        let legacy = Settings::parse("performance_enabled=on");
+        assert!(legacy.performance_temperature);
+        for value in ["off", "false", "0"] {
+            let settings = Settings::parse(&format!(
+                "performance_enabled=on\nperformance_temperature={value}"
+            ));
+            assert!(settings.performance_enabled);
+            assert!(!settings.performance_temperature);
+            assert_eq!(Settings::parse(&settings.serialize()), settings);
+        }
+        assert!(Settings::parse("performance_temperature=invalid").performance_temperature);
     }
 
     #[test]

@@ -95,7 +95,7 @@ impl NettopSampler {
             }
             Err(e) => {
                 // 拿不到 pty 也别直接罢工：管道能跑，只是刷新会慢到 3 秒一批
-                eprintln!("[nettop] 伪终端打不开（{e}），退回管道：刷新率会降到 3 秒");
+                log::warn!(target: "tm_macos::sampler", "伪终端打不开（{e}），退回管道：刷新率会降到 3 秒");
                 cmd.stdout(Stdio::piped());
                 let mut child = cmd.spawn().map_err(SamplerError::Spawn)?;
                 let out = child

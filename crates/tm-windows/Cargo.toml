@@ -17,6 +17,8 @@ winresource = "0.1"
 
 [dependencies]
 tm-core = { path = "../tm-core" }
+tm-diagnostics = { path = "../tm-diagnostics" }
+log = "0.4"
 tm-sampler = { path = "../tm-sampler" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +29,7 @@ tempfile = "3"
 # windows-sys 就是 1:1 的 FFI 声明，没有 Result 包装和智能指针，写起来更直观；
 # 而且它已经是 winit 的依赖，本地有缓存，不用再下一坨几百 MB 的 crate。
 windows-sys = { version = "0.59", features = [
+    "Wdk_Graphics_Direct3D",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_WindowsFilteringPlatform",

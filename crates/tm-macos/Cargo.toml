@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 tm-core = { path = "../tm-core" }
+log = "0.4"
 tm-sampler = { path = "../tm-sampler" }
 
 # 图标要走 AppKit 的 NSWorkspace；这几个 crate 本来就在 eframe/winit 的依赖树里，

@@ -269,6 +269,9 @@ where
                 if let Some(s) = sampler.as_mut() {
                     match s.sample() {
                         Ok(samples) => {
+                            if error.is_some() {
+                                log::info!(target: "tramoing::sampler", "采集已恢复");
+                            }
                             if s.take_reset() {
                                 calc.reset_baseline();
                                 trend.clear();
@@ -412,7 +415,7 @@ fn set_error(slot: &mut Option<String>, message: String) {
 }
 
 fn log_error(message: &str) {
-    crate::update::log_line(&format!("[sampler] {message}"));
+    log::error!(target: "tramoing::sampler", "{message}");
 }
 
 fn to_rates(rows: Vec<(AppKey, f64, f64)>) -> Vec<AppRate> {

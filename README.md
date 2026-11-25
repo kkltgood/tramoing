@@ -1,10 +1,14 @@
-# Tramoing
+# Tramoing — 实时网速与流量监控
 
-轻量的 Windows 任务栏 / macOS 菜单栏流量监控工具，使用 Rust 和 egui 构建。
+[简体中文](README.md) · [English](README.en.md)
 
-查看哪些应用正在使用网络、各自的上传和下载速率，以及可选的 CPU / GPU 使用率。数据保存在本机，运行时无需 Electron、Python 或其他外部运行环境。
+**Tramoing 是一款开源、轻量的 Windows 任务栏 / macOS 菜单栏网速与流量监控工具。** 实时查看上传下载速度、应用带宽占用、流量历史，以及 CPU / GPU 使用率和温度。
 
-[下载 Releases](https://github.com/kkltgood/tramoing/releases) · [开发与打包](docs/development.md) · [配置与故障排查](docs/troubleshooting.md) · [MIT 许可证](LICENSE)
+An open-source network speed and traffic monitor for the Windows taskbar and macOS menu bar, with per-app bandwidth usage, local traffic history, and optional CPU/GPU monitoring. Built with Rust and egui.
+
+查看哪些应用正在使用网络、各自的上传和下载速率，以及可选的 CPU / GPU 使用率和温度。数据保存在本机，运行时无需 Electron、Python 或其他外部运行环境。
+
+[下载最新版](https://github.com/kkltgood/tramoing/releases/latest) · [版本记录](https://github.com/kkltgood/tramoing/releases) · [问题反馈](https://github.com/kkltgood/tramoing/issues) · [开发与打包](docs/development.md) · [配置与故障排查](docs/troubleshooting.md) · [MIT 许可证](LICENSE)
 
 ## 界面
 
@@ -21,13 +25,15 @@
 ## 功能
 
 - **实时流量**：按应用汇总上传 / 下载速率，提供实时、1 分钟、5 分钟和 1 小时视图，以及近期流量曲线。
+- **本机 IP**：主面板底部显示当前网络的本机 IP 地址，自动刷新，点击即可复制。
 - **应用置顶**：点击每行末尾的图钉，按置顶顺序固定在列表顶部；没有流量时仍保留，重启后记住选择，再次点击即可取消。
 - **Windows 应用断网**：点击列表右侧网络图标，按所选 exe 路径阻止网络连接（包含本机代理连接）；断网后图标带斜线，再次点击恢复联网，悬停可查看操作提示。规则跨重启保留，受限程序始终保留恢复入口；列表标题旁的添加应用图标可打开独立面板，输入程序完整路径后添加并置顶，也可查看联网控制状态。需要配套新版管理员助手，macOS 暂未提供此功能。
-- **任务栏和菜单栏**：双行网速，可选 CPU / GPU 使用率；支持彩色、单色和自定义颜色。Windows 可在任务栏直接拖拽统计项排序，顺序自动保存。
+- **任务栏和菜单栏**：双行网速，可选 CPU / GPU 使用率和温度，温度可独立显示或隐藏；支持彩色、单色和自定义颜色。Windows 可在任务栏直接拖拽统计项排序，顺序自动保存。
 - **本地历史**：SQLite 按分钟保存流量，默认保留 30 天，支持 CSV 导出和单应用流量提醒。
-- **界面**：深色、浅色、跟随系统；中文和英文；失焦自动收起。每次从任务栏或菜单栏展开都回到主展示页，设置从面板右上角进入，依次为任务栏（macOS 为菜单栏）、统计、通用，首次进入默认显示任务栏设置，修改后自动保存。
+- **界面**：深色、浅色、跟随系统；中文和英文；失焦自动收起。每次从任务栏或菜单栏展开都回到主展示页，设置从面板右上角进入，依次为任务栏（macOS 为菜单栏）、统计、通用，首次进入默认显示任务栏设置，修改后自动保存，页签切换带选中背景滑动与内容淡入动画。
 - **后台运行**：可选登录自启，网络与性能采样在后台线程执行。
 - **应用更新**：自动检查 GitHub Releases，下载后校验 SHA-256；Windows 和已安装的 macOS 应用确认更新后自动替换并重启，保留设置和历史；设置中可关闭自动检查。
+- **故障诊断**：自动记录启动、采集、更新等错误及 Rust panic 堆栈，日志按大小轮换。发生错误时弹框询问是否导出日志，完成后可直接打开文件位置；启动失败和 Rust 崩溃提供独立原生提示。重复的同一错误在 5 分钟内合并。设置 → 通用 → 日志与故障反馈也可导出，报告仅保存在本机。
 
 ## 支持平台
 
@@ -37,7 +43,7 @@
 | Windows 11 ARM64 | ETW 采集助手 | 使用 ARM64 原生安装包，助手需要管理员权限 |
 | macOS 11+，Apple Silicon / Intel | 系统 `nettop` | 建议通过 `.app` 包运行并验证菜单栏行为 |
 
-CPU / GPU 显示不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
+CPU / GPU 显示不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。温度显示在对应使用率旁，关闭“显示温度”会停止温度采集，保留使用率。macOS 从 AppleSMC 读取已适配的 Intel / Apple Silicon 传感器；Windows GPU 优先读取 WDDM 驱动温度，CPU 需要运行并开放 WMI 的 LibreHardwareMonitor / OpenHardwareMonitor（GPU 也可从这些工具读取）。不自动安装驱动或上述工具；传感器不可用时显示 `--°C`。温度取可用核心/芯片传感器中的最高值，多 GPU 的温度和使用率可能来自不同设备。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
 
 ## 从源码运行
 
@@ -111,6 +117,7 @@ open dist/macos-arm64/Tramoing.app # Intel 使用 dist/macos-x64/Tramoing.app
 | `--show` | 启动后展开面板，适合界面调试 |
 | `--settings` | 直接打开设置 |
 | `--export` | 导出已有历史为 CSV 后退出；失败返回非零退出码 |
+| `--export-diagnostics` | 无需启动界面或连接采集助手，导出系统信息、助手状态及最近日志后退出 |
 | `--autostart on\|off\|status` | 设置或查询界面程序登录自启 |
 | `--check-update` | 立即检查 GitHub Releases 中的新版本 |
 

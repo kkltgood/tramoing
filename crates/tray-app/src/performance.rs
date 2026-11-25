@@ -3,11 +3,13 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tm_core::temperature::Temperatures;
 
 #[derive(Clone, Debug)]
 pub struct Reading {
     pub cpu: Option<f64>,
     pub gpu: Option<f64>,
+    pub temperatures: Temperatures,
     at: Instant,
 }
 
@@ -25,7 +27,7 @@ struct Worker {
 impl Worker {
     fn spawn(
         interval: Duration,
-        mut sample: impl FnMut() -> (Option<f64>, Option<f64>) + Send + 'static,
+        mut sample: impl FnMut() -> Reading + Send + 'static,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
         let (command, commands) = mpsc::channel();
@@ -35,13 +37,8 @@ impl Worker {
             .name("performance".into())
             .spawn(move || {
                 let mut interval = interval;
-                let publish = |sample: &mut dyn FnMut() -> (Option<f64>, Option<f64>)| {
-                    let (cpu, gpu) = sample();
-                    *output.lock().unwrap() = Some(Reading {
-                        cpu,
-                        gpu,
-                        at: Instant::now(),
-                    });
+                let publish = |sample: &mut dyn FnMut() -> Reading| {
+                    *output.lock().unwrap() = Some(sample());
                     wake();
                 };
                 publish(&mut sample);
@@ -82,6 +79,7 @@ pub struct Monitor {
     interval: Duration,
     wake: Arc<dyn Fn() + Send + Sync>,
     pub error: Option<String>,
+    temperatures: bool,
 }
 
 impl Monitor {
@@ -91,10 +89,11 @@ impl Monitor {
             interval: Duration::from_secs(2),
             wake: Arc::new(wake),
             error: None,
+            temperatures: false,
         }
     }
 
-    pub fn configure(&mut self, enabled: bool, seconds: u64) {
+    pub fn configure(&mut self, enabled: bool, seconds: u64, temperatures: bool) {
         if !enabled {
             self.worker = None;
             self.error = None;
@@ -104,6 +103,10 @@ impl Monitor {
             1 | 2 | 5 => seconds,
             _ => 2,
         });
+        if self.temperatures != temperatures {
+            self.worker = None;
+            self.temperatures = temperatures;
+        }
         if let Some(worker) = &self.worker {
             if self.interval != interval {
                 let _ = worker.command.send(Command::Interval(interval));
@@ -116,12 +119,17 @@ impl Monitor {
         let mut cpu = tm_macos::utilization::CpuSampler::default();
         #[cfg(windows)]
         let mut native = tm_windows::utilization::Sampler::default();
+        #[cfg(target_os = "macos")]
+        let mut thermal = temperatures.then(tm_macos::temperature::Sampler::default);
+        #[cfg(windows)]
+        let mut thermal = temperatures.then(tm_windows::temperature::Sampler::default);
+        let mut last_source = String::new();
         let mock = std::env::var_os("TM_FORCE_MOCK").is_some();
         let started = Instant::now();
         match Worker::spawn(
             interval,
             move || {
-                if mock {
+                let (cpu, gpu) = if mock {
                     let t = started.elapsed().as_secs_f64();
                     (
                         Some(28.0 + 9.0 * (t * 0.4).sin()),
@@ -136,6 +144,27 @@ impl Monitor {
                     {
                         native.sample()
                     }
+                };
+                let temperatures = if !temperatures {
+                    Temperatures::default()
+                } else if mock {
+                    Temperatures {
+                        cpu: Some(54.0),
+                        gpu: Some(48.0),
+                        source: "Demo data".into(),
+                    }
+                } else {
+                    thermal.as_mut().unwrap().sample()
+                };
+                if !temperatures.source.is_empty() && temperatures.source != last_source {
+                    log::info!(target: "tramoing::temperature", "{}", temperatures.source);
+                    last_source = temperatures.source.clone();
+                }
+                Reading {
+                    cpu,
+                    gpu,
+                    temperatures,
+                    at: Instant::now(),
                 }
             },
             self.wake.clone(),
@@ -145,7 +174,7 @@ impl Monitor {
                 self.error = None;
             }
             Err(error) => {
-                crate::update::log_line(&format!("[performance] {error}"));
+                log::warn!(target: "tramoing::performance", "{error}");
                 self.error = Some(error.to_string());
             }
         }
@@ -177,9 +206,39 @@ pub fn menu_percent(value: Option<f64>) -> String {
     }
 }
 
+pub fn menu_temperature(value: Option<f64>) -> String {
+    match value.and_then(tm_core::temperature::valid) {
+        Some(value) => format!("{value:>3.0}°C"),
+        None => " --°C".into(),
+    }
+}
+
+pub fn menu_reading(
+    usage: Option<f64>,
+    temperature: Option<f64>,
+    show_temperature: bool,
+) -> String {
+    let usage = menu_percent(usage);
+    if show_temperature {
+        format!("{usage} {}", menu_temperature(temperature))
+    } else {
+        usage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temperatures_can_be_hidden_without_hiding_utilization() {
+        assert_eq!(menu_reading(Some(28.0), Some(54.0), true), " 28%  54°C");
+        assert_eq!(menu_reading(Some(28.0), None, true), " 28%  --°C");
+        assert_eq!(menu_reading(Some(28.0), Some(54.0), false), " 28%");
+        assert_eq!(menu_temperature(Some(f64::NAN)), " --°C");
+        assert_eq!(menu_temperature(Some(151.0)), " --°C");
+        assert_eq!(menu_temperature(Some(150.0)), "150°C");
+    }
 
     #[test]
     fn menu_percent_has_constant_width_and_distinguishes_unavailable() {
@@ -207,7 +266,12 @@ mod tests {
             Duration::from_secs(5),
             move || {
                 count += 1.0;
-                (Some(count), None)
+                Reading {
+                    cpu: Some(count),
+                    gpu: None,
+                    temperatures: Temperatures::default(),
+                    at: Instant::now(),
+                }
             },
             Arc::new(move || {
                 let _ = changed.send(());
@@ -236,12 +300,17 @@ mod tests {
     fn disable_removes_worker_and_stale_readings_are_hidden() {
         let (changed, changes) = mpsc::channel();
         let mut monitor = Monitor::new(|| {});
-        monitor.configure(false, 2);
+        monitor.configure(false, 2, true);
         assert!(monitor.worker.is_none());
         monitor.worker = Some(
             Worker::spawn(
                 Duration::from_secs(5),
-                || (Some(12.0), Some(34.0)),
+                || Reading {
+                    cpu: Some(12.0),
+                    gpu: Some(34.0),
+                    temperatures: Temperatures::default(),
+                    at: Instant::now(),
+                },
                 Arc::new(move || {
                     let _ = changed.send(());
                 }),
@@ -261,7 +330,7 @@ mod tests {
             .unwrap()
             .at = Instant::now() - Duration::from_secs(30);
         assert!(monitor.reading().is_none());
-        monitor.configure(false, 2);
+        monitor.configure(false, 2, true);
         assert!(monitor.worker.is_none());
         assert!(monitor.reading().is_none());
     }

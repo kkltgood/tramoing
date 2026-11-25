@@ -5,7 +5,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use tm_core::{AppKey, AppRate};
 use tm_windows::network_policy::{same_path, validate_path, Request, Rule};
 
 pub struct NetworkAccess {
@@ -111,6 +110,7 @@ impl NetworkAccess {
                 self.job = Some(rx);
             }
             Err(error) => {
+                log::error!(target: "tramoing::network", "启动控制任务失败：{error}");
                 self.error = Some(error.to_string());
                 self.verified = false;
                 self.pending_path = None;
@@ -130,11 +130,15 @@ impl NetworkAccess {
             let changed = self.pending_path.take();
             match result {
                 Ok(rules) => {
+                    if self.error.is_some() {
+                        log::info!(target: "tramoing::network", "网络控制助手已恢复连接");
+                    }
                     self.rules = rules;
                     self.verified = true;
                     self.error = None;
                     self.save_cache();
                     if let Some(path) = changed {
+                        log::info!(target: "tramoing::network", "网络规则已核验，blocked={}", self.rule(&path).is_some());
                         message = Some(format!(
                             "{}：{}",
                             tm_core::pretty_name(&path),
@@ -147,6 +151,9 @@ impl NetworkAccess {
                     }
                 }
                 Err(error) => {
+                    if self.error.as_deref() != Some(error.as_str()) || changed.is_some() {
+                        log::error!(target: "tramoing::network", "网络控制失败：{error}");
+                    }
                     self.verified = false;
                     if changed.is_some() {
                         message = Some(error.clone());
@@ -190,58 +197,9 @@ fn cache_path() -> std::path::PathBuf {
     tm_store::data_dir().join("network-rules-cache.json")
 }
 
-/// 即使采集失败/无流量，受限程序仍有恢复入口，不改变真实采样/历史。
-pub fn keep_restricted_visible(mut rates: Vec<AppRate>, rules: &[Rule]) -> Vec<AppRate> {
-    let mut restricted = Vec::new();
-    for rule in rules {
-        if let Some(index) = rates
-            .iter()
-            .position(|r| same_path(r.app.as_str(), &rule.path))
-        {
-            restricted.push(rates.remove(index));
-        } else {
-            restricted.push(AppRate {
-                app: AppKey::new(&rule.path),
-                rx_bps: 0.0,
-                tx_bps: 0.0,
-                rx_session: 0,
-                tx_session: 0,
-            });
-        }
-    }
-    restricted.extend(rates);
-    restricted
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn blocked_programs_remain_recoverable_without_samples_and_do_not_duplicate_pins() {
-        let rules = vec![
-            Rule {
-                path: r"C:\A\app.exe".into(),
-                complete: true,
-            },
-            Rule {
-                path: r"C:\B\app.exe".into(),
-                complete: false,
-            },
-        ];
-        let input = vec![AppRate {
-            app: AppKey::new(r"c:\a\APP.exe"),
-            rx_bps: 123.0,
-            tx_bps: 5.0,
-            rx_session: 8,
-            tx_session: 9,
-        }];
-        let rates = keep_restricted_visible(input, &rules);
-        assert_eq!(rates.len(), 2);
-        assert_eq!(rates[0].rx_bps, 123.0);
-        assert_eq!(rates[1].app.as_str(), r"C:\B\app.exe");
-        assert_eq!(keep_restricted_visible(Vec::new(), &rules).len(), 2);
-    }
 
     #[test]
     fn failed_change_preserves_restore_entry_but_invalidates_confirmed_state() {

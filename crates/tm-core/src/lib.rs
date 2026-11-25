@@ -8,6 +8,7 @@ pub mod color;
 pub mod identity;
 pub mod rate;
 pub mod taskbar;
+pub mod temperature;
 pub mod types;
 pub mod window;
 

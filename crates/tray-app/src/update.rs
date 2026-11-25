@@ -14,7 +14,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -296,7 +296,7 @@ impl Updater {
                 true
             }
             Err(error) => {
-                log_line(&format!("启动更新失败：{error}"));
+                log::error!(target: "tramoing::update", "启动更新失败：{error}");
                 *launch_error = Some(error);
                 false
             }
@@ -323,7 +323,7 @@ impl Updater {
                 Event::Failed(e) => {
                     // 失败必须落盘：release 是 GUI 子系统，没有 stderr，
                     // 线上「怎么从来不提示」只能靠这个文件查。
-                    log_line(&format!("检查更新失败：{e}"));
+                    log::error!(target: "tramoing::update", "检查更新失败：{e}");
                     self.set(Phase::Error(e));
                 }
                 Event::Progress(pct) => {
@@ -341,7 +341,7 @@ impl Updater {
                     });
                 }
                 Event::DownloadFailed(e) => {
-                    log_line(&format!("下载失败：{e}"));
+                    log::error!(target: "tramoing::update", "下载失败：{e}");
                     self.set(Phase::Error(e));
                 }
                 Event::InstallPrepared(result) => {
@@ -349,7 +349,7 @@ impl Updater {
                         match result {
                             Ok(()) => self.set(Phase::Restarting),
                             Err(error) => {
-                                log_line(&format!("准备更新失败：{error}"));
+                                log::error!(target: "tramoing::update", "准备更新失败：{error}");
                                 self.set(Phase::Ready {
                                     version,
                                     path,
@@ -606,24 +606,9 @@ fn open_on_macos(target: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
-/// 追加一行到 `%LOCALAPPDATA%\Tramoing\ui.log`。
-///
-/// 不走 `log` crate：那个只在 `TM_LOG=1` 时接 stderr，release 的 GUI 子系统
-/// 根本没有 stderr。更新检测是「静默失败」最典型的地方，必须自己留痕。
+/// 保留更新生命周期信息；日志由统一记录器限量保存。
 pub fn log_line(msg: &str) {
-    let dir = tm_store::data_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("ui.log"))
-    {
-        let _ = writeln!(f, "[{stamp}] [update] {msg}");
-    }
+    log::info!(target: "tramoing::update", "{msg}");
 }
 
 #[cfg(test)]

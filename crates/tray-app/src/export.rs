@@ -2,19 +2,19 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 
-pub struct ExportJob {
-    result: Receiver<String>,
+pub struct ExportJob<T = String> {
+    result: Receiver<T>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl ExportJob {
+impl<T: Send + 'static> ExportJob<T> {
     pub fn start(
-        export: impl FnOnce() -> String + Send + 'static,
+        export: impl FnOnce() -> T + Send + 'static,
         wake: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Self> {
         let (tx, result) = mpsc::channel();
         let worker = thread::Builder::new()
-            .name("history-export".into())
+            .name("file-export".into())
             .spawn(move || {
                 let message = export();
                 let _ = tx.send(message);
@@ -26,12 +26,12 @@ impl ExportJob {
         })
     }
 
-    pub fn try_result(&self) -> Result<String, TryRecvError> {
+    pub fn try_result(&self) -> Result<T, TryRecvError> {
         self.result.try_recv()
     }
 }
 
-impl Drop for ExportJob {
+impl<T> Drop for ExportJob<T> {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -48,7 +48,7 @@ mod tests {
     fn slow_export_keeps_caller_available_and_wakes_it_after_completion() {
         let (release, blocked) = mpsc::channel();
         let (ready, woke) = mpsc::channel();
-        let job = ExportJob::start(
+        let job = ExportJob::<String>::start(
             move || {
                 blocked.recv().unwrap();
                 "exported".into()
@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn shutdown_waits_for_the_export_to_finish() {
         let (done, completed) = mpsc::channel();
-        let job = ExportJob::start(
+        let job = ExportJob::<String>::start(
             move || {
                 done.send(()).unwrap();
                 "done".into()

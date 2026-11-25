@@ -16,7 +16,8 @@ fn export_reports_failure_to_scripts_without_overwriting_a_damaged_database() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(std::fs::read(database).unwrap(), damaged);
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    let log = std::fs::read_to_string(dir.path().join("ui.log")).unwrap();
+    assert!(log.contains("ERROR") && log.contains("导出失败"));
 }
 
 #[test]
@@ -31,7 +32,39 @@ fn exporting_without_history_succeeds_without_creating_a_database() {
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(!database.exists());
+    assert!(dir.path().join("ui.log").is_file());
+}
+
+#[test]
+fn diagnostics_can_be_exported_even_when_the_history_database_is_damaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("history.db");
+    std::fs::write(&database, "damaged private history").unwrap();
+    std::fs::write(
+        dir.path().join("helper.log"),
+        "ETW startup failed: access denied\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tramoing"))
+        .arg("--export-diagnostics")
+        .env("TM_DATA_DIR", dir.path())
+        .env("TM_DB_PATH", &database)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let reports: Vec<_> = std::fs::read_dir(dir.path().join("diagnostics"))
+        .unwrap()
+        .collect();
+    assert_eq!(reports.len(), 1);
+    let report = std::fs::read_to_string(reports[0].as_ref().unwrap().path()).unwrap();
+    assert!(report.contains("ETW startup failed: access denied"));
+    assert!(report.contains("Version: 0.1."));
+    assert!(!report.contains("damaged private history"));
+    assert_eq!(
+        std::fs::read_to_string(database).unwrap(),
+        "damaged private history"
+    );
 }
 
 #[cfg(any(windows, target_os = "macos"))]

@@ -134,6 +134,7 @@ const VIEW_ANIM: Duration = Duration::from_millis(190);
 /// 不按整页宽推：一小段位移配淡入淡出
 /// 就够读出「换了一页」，也和这个弹窗的体量相称。
 const VIEW_SLIDE: f32 = 64.0;
+const SETTINGS_TAB_ANIM: Duration = Duration::from_millis(180);
 
 /// 时间窗口。界面上的分段控件就是它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +160,16 @@ enum SettingsTab {
     StatusBar,
     Statistics,
     General,
+}
+
+impl SettingsTab {
+    fn index(self) -> usize {
+        match self {
+            Self::StatusBar => 0,
+            Self::Statistics => 1,
+            Self::General => 2,
+        }
+    }
 }
 
 impl Window {
@@ -216,6 +227,7 @@ static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 pub struct App {
     rx: engine::Engine,
+    device_ip: crate::device_ip::Monitor,
     tray_rx: Receiver<TrayEvent>,
     latest: Option<Snapshot>,
     visible: bool,
@@ -266,6 +278,7 @@ pub struct App {
     /// 当前是主面板还是设置页
     view: View,
     settings_tab: SettingsTab,
+    settings_transition: Option<(SettingsTab, Instant)>,
     /// 切页动画：`(从哪一页切过来的, 开始时刻)`，播完就清空。
     ///
     /// 只有 `view` 停不住的地方才需要它：切页那一帧两页都得画 ——
@@ -275,6 +288,9 @@ pub struct App {
     toast: Option<(String, Instant)>,
     /// 同一时刻只运行一个后台导出，避免重复点击覆盖同一文件。
     export_job: Option<crate::export::ExportJob>,
+    diagnostics_job: Option<crate::export::ExportJob<Result<std::path::PathBuf, String>>>,
+    diagnostics_result: Option<Result<std::path::PathBuf, String>>,
+    error_prompt: Option<crate::error_dialog::Prompt>,
     /// 更新检测。网络动作全在后台线程，这里只是把事件攒成可画的状态。
     update: crate::update::Updater,
     /// 进程启动时刻。
@@ -346,6 +362,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let _ = CTX.set(ctx.clone());
+        tm_diagnostics::set_error_waker({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
 
         let settings = Settings::load();
         ctx.set_theme(theme_pref(settings.theme));
@@ -369,11 +389,11 @@ impl App {
 
         let font_lang = match theme::install_cjk(&ctx) {
             Some(path) => {
-                eprintln!("[ui] 已加载中文字体：{path}");
+                log::info!(target: "tramoing::ui", "已加载中文字体：{path}");
                 Lang::Zh
             }
             None => {
-                eprintln!("[ui] 没找到可用的中文字体，界面退回英文");
+                log::warn!(target: "tramoing::ui", "没找到可用的中文字体，界面退回英文");
                 Lang::En
             }
         };
@@ -402,12 +422,20 @@ impl App {
         let performance = {
             let wake = ctx.clone();
             let mut monitor = crate::performance::Monitor::new(move || wake.request_repaint());
-            monitor.configure(settings.performance_enabled, settings.performance_interval);
+            monitor.configure(
+                settings.performance_enabled,
+                settings.performance_interval,
+                settings.performance_temperature,
+            );
             monitor
         };
 
         let app = Self {
             rx,
+            device_ip: crate::device_ip::Monitor::new({
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            }),
             tray_rx,
             latest: None,
             visible: false,
@@ -453,6 +481,7 @@ impl App {
                 View::Main
             },
             settings_tab: SettingsTab::default(),
+            settings_transition: None,
             // 首帧不播过渡：从托盘点开就直接是目标页
             transition: None,
             settings,
@@ -468,6 +497,9 @@ impl App {
                 .ok()
                 .map(|msg| (msg, Instant::now())),
             export_job: None,
+            diagnostics_job: None,
+            diagnostics_result: None,
+            error_prompt: None,
             update: crate::update::Updater::new(),
             started_at: Instant::now(),
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
@@ -533,6 +565,9 @@ impl App {
                     Ok("settings-statistics") => {
                         app.view = View::Settings;
                         app.settings_tab = SettingsTab::Statistics;
+                    }
+                    Ok("error-prompt") => {
+                        log::error!(target: "tramoing::preview", "采集连接暂时中断，正在尝试重新连接。");
                     }
                     _ => {}
                 }
@@ -600,7 +635,7 @@ impl App {
         match build_tray() {
             Ok(t) => self.tray = Some(t),
             Err(e) => {
-                eprintln!("[ui] 状态栏图标创建失败：{e}");
+                log::error!(target: "tramoing::tray", "状态栏图标创建失败：{e}");
                 self.tray_build_at = Instant::now() + Duration::from_secs(5);
             }
         }
@@ -712,6 +747,9 @@ impl App {
     }
 
     pub fn close(&mut self, ctx: &egui::Context) {
+        if self.error_prompt.is_some() {
+            return;
+        }
         if matches!(
             self.update.phase,
             crate::update::Phase::Installing { .. } | crate::update::Phase::Restarting
@@ -783,14 +821,17 @@ impl App {
                 snapshot.trend.clear();
                 snapshot.rates.clear();
                 snapshot.windowed = Default::default();
-                snapshot.error = Some(
-                    self.lang
-                        .t(
-                            "采样线程已停止，请重新启动应用",
-                            "Sampler stopped; restart the app",
-                        )
-                        .into(),
-                );
+                let message = self
+                    .lang
+                    .t(
+                        "采样线程已停止，请重新启动应用",
+                        "Sampler stopped; restart the app",
+                    )
+                    .to_owned();
+                if snapshot.error.as_ref() != Some(&message) {
+                    log::error!(target: "tramoing::sampler", "{message}");
+                }
+                snapshot.error = Some(message);
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -817,8 +858,16 @@ impl App {
             let reading = self.performance.reading();
             format!(
                 "{tip}\nCPU {}    GPU {}{}",
-                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.cpu)),
-                crate::performance::menu_percent(reading.as_ref().and_then(|r| r.gpu)),
+                crate::performance::menu_reading(
+                    reading.as_ref().and_then(|r| r.cpu),
+                    reading.as_ref().and_then(|r| r.temperatures.cpu),
+                    self.settings.performance_temperature
+                ),
+                crate::performance::menu_reading(
+                    reading.as_ref().and_then(|r| r.gpu),
+                    reading.as_ref().and_then(|r| r.temperatures.gpu),
+                    self.settings.performance_temperature
+                ),
                 if std::env::var_os("TM_FORCE_MOCK").is_some() {
                     self.lang.t("\n演示数据", "\nDemo data")
                 } else {
@@ -930,8 +979,16 @@ impl App {
         let reading = self.performance.reading();
         let cpu = reading.as_ref().and_then(|r| r.cpu);
         let gpu = reading.as_ref().and_then(|r| r.gpu);
-        let cpu_text = crate::performance::menu_percent(cpu);
-        let gpu_text = crate::performance::menu_percent(gpu);
+        let cpu_text = crate::performance::menu_reading(
+            cpu,
+            reading.as_ref().and_then(|r| r.temperatures.cpu),
+            self.settings.performance_temperature,
+        );
+        let gpu_text = crate::performance::menu_reading(
+            gpu,
+            reading.as_ref().and_then(|r| r.temperatures.gpu),
+            self.settings.performance_temperature,
+        );
         let key = format!(
             "{cpu_text}|{gpu_text}|{}|{}",
             self.settings.performance_color,
@@ -958,6 +1015,22 @@ impl App {
             self.lang.t("刷新间隔", "Refresh"),
             self.settings.performance_interval
         );
+        if self.settings.performance_temperature {
+            tooltip.push_str(&format!(
+                "\n{}: CPU {} / GPU {}\n{}",
+                self.lang.t("温度", "Temperature"),
+                crate::performance::menu_temperature(
+                    reading.as_ref().and_then(|r| r.temperatures.cpu)
+                ),
+                crate::performance::menu_temperature(
+                    reading.as_ref().and_then(|r| r.temperatures.gpu)
+                ),
+                self.lang.t(
+                    "显示可用核心/芯片传感器中的最高温度；--°C 表示不可用",
+                    "Hottest available core/die sensor; --°C means unavailable"
+                )
+            ));
+        }
         if gpu.is_none() && reading.is_some() {
             tooltip.push_str(self.lang.t(
                 "\nGPU 驱动未提供利用率",
@@ -1002,12 +1075,9 @@ impl App {
                     .as_ref()
                     .filter(|_| self.settings.tray_badge)
                     .map(|s| (s.total_rx, s.total_tx)),
-                performance: self.settings.performance_enabled.then(|| {
-                    (
-                        reading.as_ref().and_then(|r| r.cpu),
-                        reading.as_ref().and_then(|r| r.gpu),
-                    )
-                }),
+                performance: self.settings.performance_enabled,
+                reading,
+                temperatures: self.settings.performance_temperature,
                 light: self.taskbar_light,
                 colored: self.settings.tray_color,
                 performance_colored: self.settings.performance_color,
@@ -1106,6 +1176,27 @@ impl eframe::App for App {
             }
         }
 
+        if let Some(job) = &self.diagnostics_job {
+            let result = match job.try_result() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(self
+                    .lang
+                    .t("诊断导出任务意外结束", "Diagnostic export interrupted")
+                    .into())),
+            };
+            if let Some(result) = result {
+                if let Err(error) = &result {
+                    log::error!(target: "tramoing::diagnostics", "{error}");
+                }
+                self.diagnostics_job = None;
+                self.diagnostics_result = Some(result);
+            }
+        }
+        if self.diagnostics_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
         if let Some(settings) = crate::instance::take_activation() {
             self.view = if settings { View::Settings } else { View::Main };
             self.transition = None;
@@ -1118,8 +1209,7 @@ impl eframe::App for App {
 
         // ---- 更新检测 ----
         //
-        // 网络动作全在后台线程，这里只吸收结果。失败是静默的（落 ui.log），
-        // 断网、公司防火墙这类事用户处理不了，弹出来只会让人以为程序坏了。
+        // 网络动作全在后台线程，这里吸收结果；错误交给统一的日志导出提示。
         self.update.tick();
         if self.update.poll() {
             ctx.request_repaint();
@@ -1137,7 +1227,9 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
 
-        // 调试模式：摆到屏幕右上角，方便截图核对排版
+        self.poll_error_prompt(ctx);
+
+        // 调试模式或没有托盘锚点时：摆到屏幕右上角。
         if self.show_on_start && !self.visible {
             self.show_on_start = false;
             let ppp = ctx.pixels_per_point().max(1.0);
@@ -1249,6 +1341,7 @@ impl eframe::App for App {
                 // `--show` 是给调试/截图用的：那种情况下窗口本来就不是用户点开的，
                 // 一失焦就收起会导致「刚起来就没了」，根本没法核对界面。
                 && !self.keep_open_on_blur
+                && self.error_prompt.is_none()
                 && !matches!(self.update.phase, crate::update::Phase::Installing { .. } | crate::update::Phase::Restarting)
                 && self.shown_at.elapsed() > HIDE_DEBOUNCE
             {
@@ -1361,11 +1454,7 @@ impl App {
                 self.network_panel
                     .show(ctx, &mut self.network_access, &palette, lang)
             {
-                let exists = self
-                    .settings
-                    .pinned_apps
-                    .iter()
-                    .any(|key| tm_windows::network_policy::same_path(key, &path));
+                let exists = self.settings.is_pinned(&path);
                 if !exists {
                     self.settings.toggle_pin(&path);
                     self.settings.save();
@@ -1383,6 +1472,54 @@ impl App {
                     ),
                     Instant::now(),
                 ));
+            }
+        }
+        self.show_error_prompt(ctx, &palette, lang);
+    }
+
+    fn poll_error_prompt(&mut self, ctx: &egui::Context) {
+        let errors = tm_diagnostics::take_errors();
+        if !errors.is_empty() {
+            if let Some(prompt) = &mut self.error_prompt {
+                prompt.append(errors);
+            } else {
+                if self.diagnostics_job.is_none() {
+                    self.diagnostics_result = None;
+                }
+                self.error_prompt = Some(crate::error_dialog::Prompt::new(errors));
+            }
+        }
+        if self.error_prompt.is_some() && !self.visible {
+            if let Some(rect) = self.tray_icon_rect(ctx) {
+                self.open(ctx, rect);
+            } else {
+                self.show_on_start = true;
+            }
+        }
+    }
+
+    fn show_error_prompt(&mut self, ctx: &egui::Context, p: &Palette, lang: Lang) {
+        use crate::error_dialog::Action;
+        let Some(prompt) = &self.error_prompt else {
+            return;
+        };
+        match prompt.show(
+            ctx,
+            p,
+            lang,
+            self.diagnostics_job.is_some(),
+            self.diagnostics_result.as_ref(),
+        ) {
+            Action::None => {}
+            Action::Export => self.export_diagnostics(ctx),
+            Action::Dismiss => self.error_prompt = None,
+            Action::Reveal => {
+                if let Some(Ok(path)) = &self.diagnostics_result {
+                    if let Err(error) = crate::diagnostics::reveal(path) {
+                        log::error!(target: "tramoing::diagnostics", "打开报告位置失败：{error}");
+                        self.diagnostics_result = Some(Err(error));
+                    }
+                }
             }
         }
     }
@@ -1515,25 +1652,60 @@ impl App {
             egui::pos2(header.right() - 2.0, header.bottom()),
         );
         ui.add_space(6.0);
+        let previous_tab = self.settings_tab;
         settings_tabs(ui, p, lang, &mut self.settings_tab);
+        if previous_tab != self.settings_tab {
+            self.settings_transition = Some((previous_tab, Instant::now()));
+        }
         ui.add_space(6.0);
 
         let options_height = (bounds.bottom() - ui.cursor().top()).max(1.0);
+        let content_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            Vec2::new(ui.available_width(), options_height),
+        );
+        let mut opacity = 1.0;
+        let mut offset = 0.0;
+        if let Some((from, started)) = self.settings_transition {
+            let progress = started.elapsed().as_secs_f32() / SETTINGS_TAB_ANIM.as_secs_f32();
+            if progress < 1.0 {
+                opacity = ease_out_cubic(progress);
+                let direction = if self.settings_tab.index() > from.index() {
+                    1.0
+                } else {
+                    -1.0
+                };
+                offset = (1.0 - opacity) * 18.0 * direction;
+                ui.ctx().request_repaint();
+            } else {
+                self.settings_transition = None;
+            }
+        }
+        let mut content = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("settings-content")
+                .max_rect(content_rect.translate(egui::vec2(offset, 0.0))),
+        );
+        content.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+        if opacity < 0.95 {
+            content.disable();
+        }
+        content.multiply_opacity(opacity);
         // 分页各自保留滚动位置，滚动条独占空隙，不覆盖颜色输入与开关。
-        let scroll = &mut ui.spacing_mut().scroll;
+        let scroll = &mut content.spacing_mut().scroll;
         scroll.floating = false;
         scroll.bar_width = 3.0;
         scroll.bar_inner_margin = 7.0;
         scroll.bar_outer_margin = 0.0;
         scroll.foreground_color = false;
-        let visuals = ui.visuals_mut();
+        let visuals = content.visuals_mut();
         visuals.extreme_bg_color = Color32::TRANSPARENT;
         visuals.widgets.inactive.bg_fill = mix(p.border, p.subtext, 0.25);
         visuals.widgets.hovered.bg_fill = mix(p.border, p.accent, 0.45);
         visuals.widgets.active.bg_fill = p.accent;
         settings_scroll_area(options_height, self.initial_settings_scroll.take())
             .id_salt(("settings-options", self.settings_tab))
-            .show(ui, |ui| {
+            .show(&mut content, |ui| {
                 ui.set_width(ui.available_width());
                 match self.settings_tab {
                     SettingsTab::General => self.general_options(ui, p, lang, &mut changed),
@@ -1579,7 +1751,10 @@ impl App {
                             Instant::now(),
                         ));
                     }
-                    Err(error) => self.toast = Some((error, Instant::now())),
+                    Err(error) => {
+                        log::error!(target: "tramoing::autostart", "{error}");
+                        self.toast = Some((error, Instant::now()));
+                    }
                 }
             }
             settings_separator(ui, p);
@@ -1616,6 +1791,127 @@ impl App {
                 });
             });
         });
+        ui.add_space(8.0);
+        settings_group(
+            ui,
+            p,
+            lang.t("日志与故障反馈", "Diagnostics & feedback"),
+            |ui| {
+                settings_note(ui, p, lang.t(
+                "自动保存最近错误与崩溃信息。导出报告，将文件和复现步骤发给开发者。",
+                "Recent errors and panic details are saved automatically. Send a report and steps to reproduce to the developer.",
+            ));
+                self.diagnostics_controls(ui, p, lang);
+                settings_note(ui, p, lang.t(
+                "报告含系统、助手状态及日志，不含流量历史。日志可能含程序路径，发送前可查看；不会自动上传。",
+                "Includes system details, helper status and logs, without traffic history. Logs may contain app paths. Review before sharing; no automatic uploads.",
+            ));
+            },
+        );
+    }
+
+    fn diagnostics_controls(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
+        if tm_diagnostics::log_path().is_none() || tm_diagnostics::write_error().is_some() {
+            ui.add(egui::Label::new(RichText::new(lang.t(
+                "日志无法写入，请导出诊断并检查存储权限。",
+                "Logs could not be saved. Export diagnostics and check storage permissions.",
+            )).small().color(p.warn)).wrap());
+        }
+        ui.horizontal(|ui| {
+            if settings_action(
+                ui,
+                p,
+                lang.t("导出诊断", "Export diagnostics"),
+                self.diagnostics_job.is_none(),
+            )
+            .clicked()
+            {
+                self.export_diagnostics(ui.ctx());
+            }
+            if let Some(Ok(path)) = &self.diagnostics_result {
+                if settings_action(ui, p, lang.t("显示文件", "Show file"), true).clicked() {
+                    if let Err(error) = crate::diagnostics::reveal(path) {
+                        log::error!(target: "tramoing::diagnostics", "打开报告位置失败：{error}");
+                        self.toast = Some((error, Instant::now()));
+                    }
+                }
+            }
+        });
+        if self.diagnostics_job.is_some() {
+            ui.label(
+                RichText::new(lang.t("正在收集诊断信息…", "Collecting diagnostics…"))
+                    .small()
+                    .color(p.subtext),
+            );
+        } else if let Some(result) = &self.diagnostics_result {
+            let (text, color) = match result {
+                Ok(path) => (
+                    format!(
+                        "{} {}",
+                        lang.t("已保存：", "Saved:"),
+                        tildify(&path.to_string_lossy())
+                    ),
+                    p.subtext,
+                ),
+                Err(error) => (
+                    format!("{}: {error}", lang.t("导出失败", "Export failed")),
+                    p.warn,
+                ),
+            };
+            ui.add(
+                egui::Label::new(RichText::new(text).small().color(color))
+                    .wrap()
+                    .selectable(true),
+            );
+        }
+    }
+
+    fn export_diagnostics(&mut self, ctx: &egui::Context) {
+        if self.diagnostics_job.is_some() {
+            return;
+        }
+        let mut status = match &self.latest {
+            Some(snapshot) => format!(
+                "sampler_error={}\nstore_error={}\nmock={}\n",
+                snapshot.error.as_deref().unwrap_or("none"),
+                snapshot.store_error.as_deref().unwrap_or("none"),
+                snapshot.mock
+            ),
+            None => "No sampler snapshot received\n".into(),
+        };
+        // Do not include app lists, traffic totals, or update URLs in the report.
+        if let Some(prompt) = &self.error_prompt {
+            status.push_str(&format!("\n[触发提示的错误]\n{}\n", prompt.context()));
+        }
+        status.push_str(&format!("update_busy={}\n", self.update.is_busy()));
+        if let Some(reading) = self.performance.reading() {
+            status.push_str(&format!(
+                "temperature_cpu_c={:?}\ntemperature_gpu_c={:?}\ntemperature_source={}\n",
+                reading.temperatures.cpu, reading.temperatures.gpu, reading.temperatures.source
+            ));
+        }
+        status.push_str(&format!(
+            "performance_error={}\n",
+            self.performance.error.as_deref().unwrap_or("none")
+        ));
+        #[cfg(windows)]
+        status.push_str(&format!(
+            "network_verified={}\nnetwork_error={}\n",
+            self.network_access.verified,
+            self.network_access.error.as_deref().unwrap_or("none")
+        ));
+        let wake = ctx.clone();
+        self.diagnostics_result = None;
+        match crate::export::ExportJob::start(
+            move || crate::diagnostics::export_report(&status),
+            move || wake.request_repaint(),
+        ) {
+            Ok(job) => self.diagnostics_job = Some(job),
+            Err(error) => {
+                log::error!(target: "tramoing::diagnostics", "启动诊断导出失败：{error}");
+                self.diagnostics_result = Some(Err(error.to_string()));
+            }
+        }
     }
 
     fn status_bar_options(
@@ -1803,6 +2099,12 @@ impl App {
             );
             if self.settings.performance_enabled {
                 settings_separator(ui, p);
+                *changed |= toggle_row(
+                    ui,
+                    p,
+                    lang.t("显示温度", "Show temperature"),
+                    &mut self.settings.performance_temperature,
+                );
                 *changed |= option_row(
                     ui,
                     p,
@@ -1852,8 +2154,16 @@ impl App {
                 } else {
                     format!(
                         "CPU {}    ·    GPU {}",
-                        crate::performance::menu_percent(reading.as_ref().and_then(|r| r.cpu)),
-                        crate::performance::menu_percent(reading.as_ref().and_then(|r| r.gpu))
+                        crate::performance::menu_reading(
+                            reading.as_ref().and_then(|r| r.cpu),
+                            reading.as_ref().and_then(|r| r.temperatures.cpu),
+                            self.settings.performance_temperature
+                        ),
+                        crate::performance::menu_reading(
+                            reading.as_ref().and_then(|r| r.gpu),
+                            reading.as_ref().and_then(|r| r.temperatures.gpu),
+                            self.settings.performance_temperature
+                        )
                     )
                 };
                 let hint = if cfg!(windows) {
@@ -1862,13 +2172,18 @@ impl App {
                     lang.t("CPU 为整机平均占用；多 GPU 显示最忙设备，不可用时显示 --%。", "CPU is the system average; GPU shows the busiest device. --% means unavailable.")
                 };
                 settings_note(ui, p, &text).on_hover_text(hint);
+                if self.settings.performance_temperature {
+                    settings_note(ui, p, lang.t("温度取可用核心/芯片传感器的最高值；--°C 表示暂不可用。", "Temperature is the hottest available core/die sensor; --°C means unavailable."));
+                    #[cfg(windows)]
+                    settings_note(ui, p, lang.t("CPU 温度需要运行 LibreHardwareMonitor 或 OpenHardwareMonitor；GPU 温度需驱动支持，也可从上述工具读取。", "CPU temperature requires LibreHardwareMonitor or OpenHardwareMonitor running. GPU temperature uses a supported driver or either tool."));
+                }
             } else {
                 settings_note(
                     ui,
                     p,
                     lang.t(
-                        "在网速旁显示 CPU 与 GPU 使用率。",
-                        "Show CPU and GPU usage beside network speed.",
+                        "在网速旁显示 CPU 与 GPU 使用率，可选显示温度。",
+                        "Show CPU and GPU usage beside network speed, with optional temperatures.",
                     ),
                 );
             }
@@ -1889,6 +2204,7 @@ impl App {
         self.performance.configure(
             self.settings.performance_enabled,
             self.settings.performance_interval,
+            self.settings.performance_temperature,
         );
         #[cfg(target_os = "macos")]
         {
@@ -2039,11 +2355,21 @@ impl App {
     }
 
     fn listed_rates(&self) -> Vec<AppRate> {
-        let rates = app_list_rates(self.latest.as_ref(), self.window, &self.settings);
         #[cfg(windows)]
-        let rates =
-            crate::network_access::keep_restricted_visible(rates, &self.network_access.rules);
-        rates
+        let restricted: Vec<_> = self
+            .network_access
+            .rules
+            .iter()
+            .map(|rule| rule.path.as_str())
+            .collect();
+        #[cfg(not(windows))]
+        let restricted = Vec::new();
+        app_list_rates_with_restrictions(
+            self.latest.as_ref(),
+            self.window,
+            &self.settings,
+            &restricted,
+        )
     }
 
     fn list(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, reveal: f32, has_alert: bool) {
@@ -2094,7 +2420,28 @@ impl App {
                 |ui| self.skeleton(ui, p, rows),
             );
         } else if let Some(text) = note.filter(|_| rates.is_empty()) {
-            empty_note(ui, text, avail, p);
+            let text = text.to_owned();
+            if self.latest.as_ref().is_some_and(|s| s.error.is_some()) {
+                egui::ScrollArea::vertical()
+                    .id_salt("collector-error")
+                    .max_height(avail)
+                    .show(ui, |ui| {
+                        ui.add_space(24.0);
+                        ui.add(egui::Label::new(RichText::new(&text).small().color(p.warn)).wrap());
+                        ui.add_space(12.0);
+                        self.diagnostics_controls(ui, p, lang);
+                        settings_note(
+                            ui,
+                            p,
+                            lang.t(
+                                "将报告和复现步骤发送给开发者。",
+                                "Send the report and steps to reproduce to the developer.",
+                            ),
+                        );
+                    });
+            } else {
+                empty_note(ui, &text, avail, p);
+            }
         } else {
             let note = note.map(str::to_owned);
             let out = app_list_scroll_area(avail, self.next_list_scroll.take()).show(ui, |ui| {
@@ -2104,6 +2451,7 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 if let Some(text) = note.as_deref() {
                     ui.label(RichText::new(text).small().color(p.warn));
+                    self.diagnostics_controls(ui, p, lang);
                     ui.add_space(ROW_GAP);
                 }
                 let n = rates.len();
@@ -2610,7 +2958,7 @@ impl App {
         })
     }
 
-    /// 页脚：一条淡分隔线 + 两个图标按钮（导出历史 / 退出），临时提示画在中间。
+    /// 页脚：导出 / 退出之间常驻本机 IP，有更新或临时提示时上下分行。
     ///
     /// **整条带子只按面板底边定位、内容全靠 painter 落笔**。以前是一条流式的
     /// `add_space(8) + hairline + add_space(4) + 两个 Button`：每次 `allocate_*`
@@ -2647,7 +2995,6 @@ impl App {
 
         // 图标那一行：分隔线下面空 4pt 起，到面板底边为止
         let row = egui::Rect::from_min_max(egui::pos2(band.left(), line_y + 1.0 + 7.0), band.max);
-        let cy = row.center().y;
 
         let export_width = if self.export_job.is_some() {
             106.0
@@ -2672,29 +3019,39 @@ impl App {
             self.export_history(zh, ui.ctx());
         }
 
-        // 页脚中间这一条：有更新相关的事就显示更新，否则退回临时提示。
-        //
-        // 更新优先——用户点「检查更新」就是为了看结果，被一条三秒前的
-        // 「已导出 12 行」盖住，会像是点了没反应。
-        let left = export_rect.right() + 8.0;
-        let right = row.right() - 64.0 - 8.0;
-        if !self.update_strip(ui, p, lang, left, right, cy) {
-            if let Some(msg) = &toast {
-                if right - left > 40.0 {
+        // IP 常驻。提示放在上半行，避免待下载/待安装状态长期遮住地址。
+        // 更新仍优先于普通提示。
+        // 两侧按钮宽度不同，取较大边距保持 IP 对齐整个面板的水平中心。
+        let center_inset = export_width.max(64.0) + 8.0;
+        let left = row.left() + center_inset;
+        let right = row.right() - center_inset;
+        let center_rect =
+            egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()));
+        let mut ip_rect = center_rect;
+        if self.update_text(lang).is_some() || toast.is_some() {
+            let mut status_rect = center_rect;
+            status_rect.max.y = center_rect.center().y;
+            ip_rect.min.y = status_rect.bottom();
+            if !self.update_strip(ui, p, lang, status_rect) {
+                if let Some(msg) = &toast {
                     ellipsis_text(
                         ui.painter(),
-                        egui::Rect::from_min_max(
-                            egui::pos2(left, row.top()),
-                            egui::pos2(right, row.bottom()),
-                        ),
+                        status_rect,
                         msg,
                         10.0,
                         p.subtext,
                         Align::Center,
                     );
+                    ui.interact(
+                        status_rect,
+                        ui.id().with("footer-toast"),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text(msg);
                 }
             }
         }
+        self.device_ip_strip(ui, p, lang, ip_rect);
 
         let quit_rect = egui::Rect::from_min_size(
             egui::pos2(row.right() - 64.0, row.top()),
@@ -2711,6 +3068,73 @@ impl App {
         .on_hover_text(lang.t("退出", "Quit"));
         if quit.clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn device_ip_strip(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang, rect: egui::Rect) {
+        let address = self.device_ip.address();
+        let loading = self.device_ip.is_loading();
+        let label = address.map_or_else(
+            || {
+                if loading {
+                    lang.t("IP 获取中…", "IP loading…")
+                } else {
+                    lang.t("IP 未连接", "IP unavailable")
+                }
+                .to_owned()
+            },
+            |ip| format!("IP {ip}"),
+        );
+        let response = ui
+            .interact(
+                rect,
+                ui.id().with("footer-device-ip"),
+                if address.is_some() {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                },
+            )
+            .on_hover_text(address.map_or_else(
+                || {
+                    if loading {
+                        lang.t("正在读取本机 IP 地址", "Reading local IP address")
+                    } else {
+                        lang.t(
+                            "当前没有可用的本机 IP 地址",
+                            "No local IP address available",
+                        )
+                    }
+                    .to_owned()
+                },
+                |ip| {
+                    format!(
+                        "{}: {ip}\n{}",
+                        lang.t("本机 IP", "Local IP"),
+                        lang.t("点击复制", "Click to copy")
+                    )
+                },
+            ));
+        let color = if address.is_some() && response.hovered() {
+            p.accent
+        } else {
+            p.subtext
+        };
+        ellipsis_text(ui.painter(), rect, &label, 11.5, color, Align::Center);
+        if address.is_some() {
+            surface::focus(ui.painter(), rect, &response, p);
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        if response.clicked() {
+            if let Some(ip) = address {
+                ui.ctx().copy_text(ip.to_string());
+                self.toast = Some((
+                    lang.t("IP 地址已复制", "IP address copied").to_owned(),
+                    Instant::now(),
+                ));
+            }
         }
     }
 
@@ -2799,21 +3223,15 @@ impl App {
         ui: &mut egui::Ui,
         p: &Palette,
         lang: Lang,
-        left: f32,
-        right: f32,
-        cy: f32,
+        rect: egui::Rect,
     ) -> bool {
         use crate::update::Phase;
         let Some((text, actionable)) = self.update_text(lang) else {
             return false;
         };
-        if right - left < 40.0 {
+        if rect.width() < 40.0 {
             return true;
         }
-        let rect = egui::Rect::from_min_max(
-            egui::pos2(left, cy - FOOTER_H / 2.0),
-            egui::pos2(right, cy + FOOTER_H / 2.0),
-        );
         let sense = if actionable {
             egui::Sense::click()
         } else {
@@ -2991,7 +3409,10 @@ pub fn export_history_csv(zh: bool) -> Result<String, String> {
     };
     // 终端里也留一份，方便排查
     let (Ok(message) | Err(message)) = &msg;
-    eprintln!("[export] {message}");
+    match &msg {
+        Ok(_) => log::info!(target: "tramoing::export", "{message}"),
+        Err(_) => log::error!(target: "tramoing::export", "{message}"),
+    }
     msg
 }
 
@@ -3046,34 +3467,55 @@ fn settings_tabs(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Setti
         (SettingsTab::General, lang.t("通用", "General")),
     ];
     let width = (bar.width() - 6.0) / options.len() as f32;
-    for (i, (tab, label)) in options.into_iter().enumerate() {
-        let rect = egui::Rect::from_min_size(
-            bar.min + egui::vec2(3.0 + i as f32 * width, 3.0),
-            Vec2::new(width, 28.0),
-        );
-        let response = ui
-            .interact(
-                rect,
-                ui.id().with(("settings-tab", tab)),
-                egui::Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // 先处理选择，再画一个连续滑动的选中背景；快速连点从当前位置续接。
+    let responses: Vec<_> = options
+        .iter()
+        .enumerate()
+        .map(|(i, (tab, label))| {
+            let rect = egui::Rect::from_min_size(
+                bar.min + egui::vec2(3.0 + i as f32 * width, 3.0),
+                Vec2::new(width, 28.0),
+            );
+            let response = ui
+                .interact(
+                    rect,
+                    ui.id().with(("settings-tab", *tab)),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                *current = *tab;
+            }
+            (rect, response, *tab, *label)
+        })
+        .collect();
+    let position = ui.ctx().animate_value_with_time(
+        ui.id().with("settings-tab-position"),
+        current.index() as f32,
+        SETTINGS_TAB_ANIM.as_secs_f32(),
+    );
+    for (rect, response, tab, _) in &responses {
+        if *tab != *current && response.hovered() {
+            ui.painter()
+                .rect_filled(*rect, 8.0, mix(p.chip, p.surface, 0.5));
+        }
+    }
+    let selection = egui::Rect::from_min_size(
+        bar.min + egui::vec2(3.0 + position * width, 3.0),
+        Vec2::new(width, 28.0),
+    );
+    ui.painter().rect(
+        selection,
+        8.0,
+        p.surface,
+        Stroke::new(0.7_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+    for (rect, response, tab, label) in responses {
         let selected = *current == tab;
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, label)
         });
-        if selected {
-            ui.painter().rect(
-                rect,
-                8.0,
-                p.surface,
-                Stroke::new(0.7_f32, p.border),
-                egui::StrokeKind::Inside,
-            );
-        } else if response.hovered() {
-            ui.painter()
-                .rect_filled(rect, 8.0, mix(p.chip, p.surface, 0.5));
-        }
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -3082,9 +3524,6 @@ fn settings_tabs(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Setti
             if selected { p.accent } else { p.subtext },
         );
         surface::focus(ui.painter(), rect, &response, p);
-        if response.clicked() {
-            *current = tab;
-        }
     }
 }
 
@@ -3706,48 +4145,70 @@ fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     ));
 }
 
-/// 展示层合并置顶项，不改动采样快照和历史统计。
+#[cfg(test)]
 fn app_list_rates(
     snapshot: Option<&Snapshot>,
     window: Window,
     settings: &Settings,
 ) -> Vec<AppRate> {
-    // 加载或采集失败时保持原来的骨架/错误提示，不能把未知数据伪装成零流量。
-    let Some(snapshot) = snapshot.filter(|s| s.error.is_none()) else {
-        return Vec::new();
-    };
-    let rates = match window {
-        Window::Live => &snapshot.rates,
+    app_list_rates_with_restrictions(snapshot, window, settings, &[])
+}
+
+/// 展示层合并置顶项和受限应用，不改动采样快照和历史统计。
+fn app_list_rates_with_restrictions(
+    snapshot: Option<&Snapshot>,
+    window: Window,
+    settings: &Settings,
+    restricted: &[&str],
+) -> Vec<AppRate> {
+    // 加载/采集失败时保留错误提示和受限应用的恢复入口，不展示普通置顶项的假零值。
+    let snapshot = snapshot.filter(|s| s.error.is_none());
+    let rates = snapshot.map_or(&[][..], |snapshot| match window {
+        Window::Live => snapshot.rates.as_slice(),
         Window::Min1 => &snapshot.windowed.min1,
         Window::Min5 => &snapshot.windowed.min5,
         Window::Hour1 => &snapshot.windowed.hour1,
-    };
-    let mut listed: Vec<AppRate> = settings
+    });
+    let pinned = settings
         .pinned_apps
         .iter()
-        .map(|key| {
+        .filter(|_| snapshot.is_some())
+        .map(String::as_str);
+    let mut listed: Vec<AppRate> = Vec::new();
+    // 必须从完整快照查找，然后应用展示上限；先截断会把受限应用的真实流量丢掉。
+    // 置顶顺序始终优先，受限项紧随其后，两者都保留且不重复占用名额。
+    for key in pinned.chain(restricted.iter().copied()) {
+        if listed
+            .iter()
+            .any(|rate| crate::settings::same_app(rate.app.as_str(), key))
+        {
+            continue;
+        }
+        listed.push(
             rates
                 .iter()
-                .find(|rate| rate.app.as_str() == key)
+                .find(|rate| crate::settings::same_app(rate.app.as_str(), key))
                 .cloned()
                 .unwrap_or_else(|| AppRate {
-                    app: AppKey::new(key.clone()),
+                    app: AppKey::new(key),
                     rx_bps: 0.0,
                     tx_bps: 0.0,
                     rx_session: 0,
                     tx_session: 0,
-                })
-        })
-        .collect();
-    // 置顶项占用展示名额，但无论上限如何调整，都不能把它们截掉。
-    let remaining = settings.max_apps.max(1).saturating_sub(listed.len());
-    listed.extend(
-        rates
+                }),
+        );
+    }
+    for rate in rates {
+        if listed.len() >= settings.max_apps.max(1) {
+            break;
+        }
+        if !listed
             .iter()
-            .filter(|rate| !settings.is_pinned(rate.app.as_str()))
-            .take(remaining)
-            .cloned(),
-    );
+            .any(|existing| crate::settings::same_app(existing.app.as_str(), rate.app.as_str()))
+        {
+            listed.push(rate.clone());
+        }
+    }
     listed
 }
 
@@ -4502,6 +4963,105 @@ mod tests {
         assert_eq!(listed_keys(&listed), ["b", "c", "d", "a"]);
         assert_eq!(listed[0], snapshot.rates[3]);
         assert_eq!(listed[1], snapshot.rates[2]);
+    }
+
+    #[test]
+    fn restricted_apps_preserve_pin_order_and_rates_beyond_the_display_limit() {
+        let settings = Settings {
+            max_apps: 1,
+            pinned_apps: vec!["pinned".into()],
+            ..Default::default()
+        };
+        let rates = vec![sample_rate("pinned", 100.0), sample_rate("blocked", 42.0)];
+        let snapshot = Snapshot {
+            rates: rates.clone(),
+            windowed: engine::WindowedRates {
+                min1: rates.clone(),
+                min5: rates.clone(),
+                hour1: rates.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for window in Window::all() {
+            let listed = app_list_rates_with_restrictions(
+                Some(&snapshot),
+                window,
+                &settings,
+                &["blocked", "pinned"],
+            );
+            assert_eq!(listed_keys(&listed), ["pinned", "blocked"]);
+            assert_eq!(listed[1], rates[1], "受限应用必须保留所选窗口的真实流量");
+            assert_eq!(snapshot.rates, rates);
+        }
+    }
+
+    #[test]
+    fn restricted_apps_keep_restore_entries_without_samples() {
+        let settings = Settings {
+            pinned_apps: vec!["pinned".into()],
+            ..Default::default()
+        };
+        let error = Snapshot {
+            error: Some("disconnected".into()),
+            ..Default::default()
+        };
+        for snapshot in [None, Some(&error)] {
+            let listed = app_list_rates_with_restrictions(
+                snapshot,
+                Window::Live,
+                &settings,
+                &["blocked", "blocked"],
+            );
+            assert_eq!(listed_keys(&listed), ["blocked"]);
+        }
+    }
+
+    #[test]
+    fn restricted_apps_share_the_display_limit_without_hiding_restore_entries() {
+        let mut settings = Settings {
+            max_apps: 3,
+            pinned_apps: vec!["pinned".into()],
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            rates: vec![sample_rate("fast", 100.0), sample_rate("slow", 50.0)],
+            ..Default::default()
+        };
+        let listed = app_list_rates_with_restrictions(
+            Some(&snapshot),
+            Window::Live,
+            &settings,
+            &["blocked", "blocked"],
+        );
+        assert_eq!(listed_keys(&listed), ["pinned", "blocked", "fast"]);
+        settings.max_apps = 1;
+        let listed = app_list_rates_with_restrictions(
+            Some(&snapshot),
+            Window::Live,
+            &settings,
+            &["blocked", "blocked"],
+        );
+        assert_eq!(listed_keys(&listed), ["pinned", "blocked"]);
+    }
+
+    #[test]
+    fn manually_entered_pin_uses_platform_path_identity() {
+        let mut settings = Settings::default();
+        settings.toggle_pin(r"c:\apps\APP.exe");
+        let snapshot = Snapshot {
+            rates: vec![sample_rate(r"C:\Apps\app.exe", 42.0)],
+            ..Default::default()
+        };
+        let listed = app_list_rates(Some(&snapshot), Window::Live, &settings);
+        if cfg!(windows) {
+            assert_eq!(listed, snapshot.rates);
+            assert!(settings.is_pinned(listed[0].app.as_str()));
+            assert!(!settings.toggle_pin(listed[0].app.as_str()));
+            assert!(settings.pinned_apps.is_empty());
+        } else {
+            assert_eq!(listed.len(), 2, "其他平台保持大小写敏感的应用标识");
+        }
     }
 
     #[test]

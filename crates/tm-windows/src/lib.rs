@@ -49,6 +49,8 @@ pub mod scheduled_task;
 #[cfg(windows)]
 pub mod screen;
 #[cfg(windows)]
+pub mod temperature;
+#[cfg(windows)]
 pub mod theme;
 #[cfg(windows)]
 pub mod utilization;

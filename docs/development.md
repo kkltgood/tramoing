@@ -23,6 +23,7 @@ CI 在 Windows 和 macOS 执行这些检查，并检查 Windows ARM64 以及 mac
 | 目录 | 职责 |
 | --- | --- |
 | `crates/tm-core` | 累计值差分、速率平滑、时间窗口聚合与共享颜色 |
+| `crates/tm-diagnostics` | 主程序与助手共用的限量文件日志、UTC 时间和 panic 记录 |
 | `crates/tm-sampler` | 采样接口与演示数据 |
 | `crates/tm-macos` | nettop、应用归属、AppKit 菜单栏及性能采集 |
 | `crates/tm-windows` | ETW 助手、命名管道、任务栏控件及性能采集 |
@@ -31,6 +32,8 @@ CI 在 Windows 和 macOS 执行这些检查，并检查 Windows ARM64 以及 mac
 | `assets` | 图标源文件与生成器 |
 | `packaging` | Windows / macOS 打包和更新清单脚本 |
 | `scripts` | macOS 打包、Windows 诊断及原生运行验证 |
+
+诊断日志在打开窗口和数据库之前初始化；主程序和 Windows 助手分别写 `ui.log`、`helper.log`，每份最多 1 MiB 并保留三份备份。日志不依赖 SQLite，后台线程 panic 也经过同一个 hook。`--export-diagnostics` 在迁移、单实例锁和窗口创建之前执行；UI 导出运行在后台线程，系统检查有超时，Windows 检查脚本通过 `include_str!` 编入程序，不要求用户另行下载脚本。回归测试覆盖轮换、并发、子进程 panic、数据库损坏时导出及报告内容限制。ERROR 记录进入有界通知队列，5 分钟内相同来源和内容去重；界面线程展示确认弹框，导出失败仅更新当前界面，避免递归通知。启动失败使用原生提示；GUI 进程的 panic hook 在同步日志后启动 `--report-error` 独立报告进程，绕过安装、迁移和单实例锁，启动失败则保留崩溃标记供下次打开提示。命令行导出/自启操作不弹框。
 
 采样器向核心层提供累计值，核心层计算速率并按应用归并。采样线程保留最新快照供界面读取，每 5 秒将增量写入历史库。导出和更新下载在独立后台任务中执行。
 
@@ -79,7 +82,7 @@ TM_DATA_DIR="$PWD/target/demo-data" \
 | --- | --- |
 | `TM_DATA_DIR` | 覆盖配置、历史、日志和实例锁目录 |
 | `TM_DB_PATH` | 单独覆盖历史数据库路径 |
-| `TM_LOG=1` | 将 eframe / winit 日志写入 stderr |
+| `TM_LOG=1` | 在默认持久错误日志之外，启用依赖库 INFO 日志并同步输出到 stderr |
 | `TM_TRACE_FRAMES=1` | 查看窗口收起后的重绘情况 |
 | `TM_TRACE_ICONS=1` | 查看图标加载情况 |
 | `TM_NETTOP_BIN` | 覆盖 macOS nettop 可执行文件 |
@@ -94,6 +97,7 @@ TM_DATA_DIR="$PWD/target/demo-data" \
 | `TM_CAPTURE_STATE=list\|empty\|timeout\|disconnected` | 配合截图模式验证无底部提示的列表、空状态和错误布局 |
 | `TM_CAPTURE_STATE=network-add\|network-add-invalid\|network-add-offline` | Windows 添加应用面板：默认表单、路径错误、联网助手离线；仅注入演示状态，不修改系统网络规则 |
 | `TM_CAPTURE_STATE=settings-general\|settings-statusbar\|settings-statistics` | 设置页三个页签；可配合 `TM_SETTINGS_SCROLL` 检查长内容，Windows 截图实例不创建任务栏统计项 |
+| `TM_CAPTURE_STATE=error-prompt` | 隔离演示实例注入可恢复错误，验证弹框及导出交互 |
 | `TM_CAPTURE_STATE=settings-color-download\|settings-color-gpu` | 打开下载或 GPU 选色面板，检查深浅主题和中英文布局 |
 
 截图来自应用自身渲染，不代表真实桌面点击或焦点行为已通过验证。
@@ -182,7 +186,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.6` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.1.7` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -199,15 +203,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.1.6` 为例）：
+发布步骤（以当前 `0.1.7` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.6.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.7.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.6 -m "Release v0.1.6"
-   git push opensource v0.1.6
+   git tag -a v0.1.7 -m "Release v0.1.7"
+   git push opensource v0.1.7
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -272,3 +276,5 @@ powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
 ## 提交改动
 
 一个 Pull Request 聚焦一个问题，说明复现方式、修改后的行为和实际运行的检查。涉及平台功能时区分单元测试、编译检查与真机验证；平台限制应同步写入故障排查文档。不要提交本机数据库、诊断日志、临时截图、凭证或构建输出。
+
+温度回归：`cargo test -p tm-macos temperature -- --include-ignored --nocapture` 可读取真实 AppleSMC（只读）。检查 CPU/GPU 使用率旁的 °C、独立“显示温度”开关和重启保留、无传感器时的 `--°C`、Windows 96–192 DPI 温度列。Windows GPU 使用 D3DKMT_ADAPTER_PERFDATA（0.1°C 单位）；可选 WMI 桥在独立 PowerShell 进程查询已有 LHM/OHM，使用限长快照与 15 秒超时，避免 WMI 卡住界面。需要 Windows 实机覆盖无提供程序、运行/退出监控工具、驱动不支持以及收起温度后进程回收。

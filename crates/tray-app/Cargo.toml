@@ -17,6 +17,7 @@ winresource = "0.1"
 
 [dependencies]
 tm-core = { path = "../tm-core" }
+tm-diagnostics = { path = "../tm-diagnostics" }
 tm-sampler = { path = "../tm-sampler" }
 tm-store = { path = "../tm-store" }
 eframe = "0.33"
@@ -42,9 +43,17 @@ url = "2"
 # 不能都当普通依赖，否则在 Windows 上会把 macOS 的 libproc FFI 也编进去。
 [target.'cfg(target_os = "macos")'.dependencies]
 tm-macos = { path = "../tm-macos" }
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 tm-windows = { path = "../tm-windows" }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_UI_WindowsAndMessaging",
+] }
 # macOS 改用原生 NSStatusItem（见 tm-macos/src/status_item.rs），
 # 这个 crate 只留给 Windows 的托盘实现
 tray-icon = "0.24"

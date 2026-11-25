@@ -15,7 +15,10 @@ mod autostart;
 #[cfg(windows)]
 mod badge_window;
 mod color_picker;
+mod device_ip;
+mod diagnostics;
 mod engine;
+mod error_dialog;
 mod export;
 mod icon;
 mod icons;
@@ -35,42 +38,79 @@ mod update;
 
 use eframe::egui;
 
-/// `TM_LOG=1` 时把 eframe/winit 的内部日志接到 stderr。
-///
-/// 平时不能接：release 是 GUI 子系统，这些日志没人看还多一层开销。
-/// 排查「窗口不对/画不出来」这类问题时它是第一现场——eframe 把
-/// `swap_buffers failed`、`was not created on main thread` 这类关键信息
-/// 全打在 log 里，没装 logger 就等于没发生过。
-struct StderrLogger;
-
-impl log::Log for StderrLogger {
-    fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.level() <= log::Level::Info
+fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let reporter = args
+        .first()
+        .is_some_and(|arg| arg == error_dialog::REPORT_FLAG);
+    if let Err(error) = tm_diagnostics::init(
+        &tm_store::data_dir(),
+        if reporter { "reporter" } else { "ui" },
+        update::CURRENT,
+    ) {
+        eprintln!("无法初始化诊断日志：{error}");
+        tm_diagnostics::report_error("tramoing::logging", &format!("无法初始化诊断日志：{error}"));
     }
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!(
-                "[{}] {}: {}",
-                record.level(),
-                record.target(),
-                record.args()
-            );
+    // 报告进程绕过采样、安装、数据迁移和单实例锁，不再安装崩溃启动器。
+    if reporter {
+        let pending = error_dialog::take_pending_crash();
+        error_dialog::report_fatal(
+            args.get(1)
+                .map(String::as_str)
+                .or(pending.as_deref())
+                .unwrap_or("应用运行失败 / Application failed"),
+        );
+        return Ok(());
+    }
+    let interactive = !args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--export" | "--export-diagnostics" | "--autostart"
+        )
+    });
+    if interactive {
+        error_dialog::install_crash_reporter();
+        if let Some(message) = error_dialog::take_pending_crash() {
+            tm_diagnostics::report_error("tramoing::panic", &message);
         }
     }
-    fn flush(&self) {}
+    let result = run(&args);
+    match &result {
+        Ok(()) => {
+            log::info!(target: "tramoing::startup", "正常退出");
+            if interactive {
+                let errors = tm_diagnostics::take_errors();
+                if !errors.is_empty() {
+                    error_dialog::report_fatal(&error_dialog::Prompt::new(errors).context());
+                }
+            }
+        }
+        Err(error) => {
+            let message = format!("程序启动或运行失败：{error}");
+            log::error!(target: "tramoing::startup", "{message}");
+            if interactive {
+                error_dialog::report_fatal(&message);
+            }
+        }
+    }
+    result
 }
 
-static LOGGER: StderrLogger = StderrLogger;
-
-fn main() -> eframe::Result<()> {
-    if std::env::var_os("TM_LOG").is_some() {
-        let _ = log::set_logger(&LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
+fn run(args: &[String]) -> eframe::Result<()> {
+    // This path works even if migration, the collector, or window creation fails.
+    if args.iter().any(|arg| arg == "--export-diagnostics") {
+        match diagnostics::export_report("命令行诊断；实时状态请参考下方日志") {
+            Ok(path) => println!("诊断报告：{}", path.display()),
+            Err(error) => {
+                log::error!(target: "tramoing::diagnostics", "导出失败：{error}");
+                eprintln!("导出诊断失败：{error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
     }
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(target_os = "macos")]
-    if let Some(result) = tm_macos::installation::finish_if_requested(&args) {
+    if let Some(result) = tm_macos::installation::finish_if_requested(args) {
         if let Err(error) = result {
             eprintln!("{error}");
             update::log_line(&error);
@@ -79,7 +119,7 @@ fn main() -> eframe::Result<()> {
                 .get(1)
                 .is_some_and(|path| std::path::Path::new(path).join("ready").is_file())
             {
-                tm_macos::installation::show_error(&error);
+                error_dialog::report_fatal(&error);
             }
             std::process::exit(1);
         }
@@ -110,6 +150,7 @@ fn main() -> eframe::Result<()> {
     // 无界面导出，方便脚本或定时任务调用：tramoing --export
     if args.iter().any(|a| a == "--export") {
         if let Err(error) = tm_store::prepare_data_dir() {
+            log::error!(target: "tramoing::migration", "导入旧数据失败：{error}");
             eprintln!("导入旧数据失败：{error}");
             std::process::exit(1);
         }
@@ -141,6 +182,7 @@ fn main() -> eframe::Result<()> {
         match r {
             Ok(msg) => println!("{msg}"),
             Err(e) => {
+                log::error!(target: "tramoing::autostart", "登录自启操作失败：{e}");
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -155,7 +197,7 @@ fn main() -> eframe::Result<()> {
             Ok(false) => {}
             Err(error) => {
                 update::log_line(&error);
-                tm_macos::installation::show_error(&error);
+                error_dialog::report_fatal(&error);
                 return Ok(());
             }
         }
@@ -187,7 +229,7 @@ fn main() -> eframe::Result<()> {
         && std::env::var_os("TM_DB_PATH").is_none()
     {
         if let Err(error) = autostart::migrate_legacy() {
-            update::log_line(&format!("迁移登录自启项失败：{error}"));
+            log::error!(target: "tramoing::autostart", "迁移登录自启项失败：{error}");
         }
     }
 

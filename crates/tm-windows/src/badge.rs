@@ -50,6 +50,7 @@ pub struct Speed {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Performance {
+    pub temperatures: Option<(String, String)>,
     pub cpu: String,
     pub gpu: String,
     pub colored: bool,
@@ -685,6 +686,7 @@ mod tests {
                 colored: true,
             }),
             performance: Some(Performance {
+                temperatures: None,
                 cpu: "3%".into(),
                 gpu: "1%".into(),
                 colored: true,
@@ -837,6 +839,7 @@ mod tests {
             assert_eq!(CLICKS.load(Ordering::Relaxed), 1);
             let mut combined = content.clone();
             combined.performance = Some(Performance {
+                temperatures: None,
                 cpu: "100%".into(),
                 gpu: " --%".into(),
                 colored: true,

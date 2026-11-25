@@ -4,7 +4,9 @@ use tm_windows::badge::{Content, Performance, Speed, TaskbarBadge};
 
 pub struct BadgeState {
     pub speed: Option<(f64, f64)>,
-    pub performance: Option<(Option<f64>, Option<f64>)>,
+    pub performance: bool,
+    pub reading: Option<crate::performance::Reading>,
+    pub temperatures: bool,
     pub light: bool,
     pub colored: bool,
     pub performance_colored: bool,
@@ -32,9 +34,19 @@ impl Badge {
                 up: crate::app::menu_speed(tx),
                 colored: s.colored,
             }),
-            performance: s.performance.map(|(cpu, gpu)| Performance {
-                cpu: crate::performance::menu_percent(cpu),
-                gpu: crate::performance::menu_percent(gpu),
+            performance: s.performance.then(|| Performance {
+                cpu: crate::performance::menu_percent(s.reading.as_ref().and_then(|r| r.cpu)),
+                gpu: crate::performance::menu_percent(s.reading.as_ref().and_then(|r| r.gpu)),
+                temperatures: s.temperatures.then(|| {
+                    (
+                        crate::performance::menu_temperature(
+                            s.reading.as_ref().and_then(|r| r.temperatures.cpu),
+                        ),
+                        crate::performance::menu_temperature(
+                            s.reading.as_ref().and_then(|r| r.temperatures.gpu),
+                        ),
+                    )
+                }),
                 colored: s.performance_colored,
             }),
             light: s.light,
@@ -44,7 +56,7 @@ impl Badge {
         let error = result.err();
         if error != self.error {
             if let Some(e) = error {
-                crate::update::log_line(&format!("[taskbar] {e}"));
+                log::error!(target: "tramoing::taskbar", "{e}");
             }
             self.error = error;
         }
