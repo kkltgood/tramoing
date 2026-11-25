@@ -14,7 +14,9 @@
 mod download;
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+#[cfg(any(not(target_os = "macos"), test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
