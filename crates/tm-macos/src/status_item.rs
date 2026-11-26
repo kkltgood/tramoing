@@ -611,7 +611,7 @@ impl StatusItem {
         };
         format!(
             "标识={} 按钮 {:.0}×{:.0} 标题 {len} 字 窗口可见={wvis} 活跃Space={osp} alpha={alpha:.1} occlusion=0x{occl:x}",
-            &*self.item.autosaveName(),
+            *self.item.autosaveName(),
             bf.size.width, bf.size.height,
         )
     }

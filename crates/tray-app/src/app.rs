@@ -3975,9 +3975,9 @@ fn language_row(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut LangMo
     let visuals = child.visuals_mut();
     visuals.override_text_color = Some(p.text);
     visuals.selection.bg_fill = mix(p.surface, p.accent, 0.16);
-    visuals.selection.stroke = Stroke::new(1.0, p.accent);
+    visuals.selection.stroke = Stroke::new(1.0_f32, p.accent);
     visuals.window_fill = p.surface;
-    visuals.window_stroke = Stroke::new(1.0, p.border);
+    visuals.window_stroke = Stroke::new(1.0_f32, p.border);
     visuals.window_corner_radius = CornerRadius::same(10);
     for widget in [
         &mut visuals.widgets.inactive,
@@ -3987,11 +3987,11 @@ fn language_row(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut LangMo
     ] {
         widget.corner_radius = CornerRadius::same(8);
         widget.weak_bg_fill = p.surface;
-        widget.bg_stroke = Stroke::new(0.8, p.border);
-        widget.fg_stroke = Stroke::new(1.0, p.text);
+        widget.bg_stroke = Stroke::new(0.8_f32, p.border);
+        widget.fg_stroke = Stroke::new(1.0_f32, p.text);
     }
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent);
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, p.accent);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.accent);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, p.accent);
     // Popup areas begin from the global style, so explicitly carry this palette
     // into the menu rather than inheriting egui's default black/white popup.
     let mut menu_style = child.style().as_ref().clone();
@@ -4005,7 +4005,7 @@ fn language_row(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut LangMo
     };
     menu_style.visuals.selection.bg_fill =
         mix(p.surface, p.accent, if p.dark { 0.14 } else { 0.08 });
-    menu_style.visuals.selection.stroke = Stroke::new(0.8, p.accent);
+    menu_style.visuals.selection.stroke = Stroke::new(0.8_f32, p.accent);
     for widget in [
         &mut menu_style.visuals.widgets.inactive,
         &mut menu_style.visuals.widgets.hovered,
@@ -4020,7 +4020,8 @@ fn language_row(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut LangMo
     }
     menu_style.visuals.widgets.hovered.weak_bg_fill = mix(p.surface, p.accent, 0.06);
     menu_style.visuals.widgets.active.weak_bg_fill = mix(p.surface, p.accent, 0.10);
-    menu_style.visuals.widgets.active.bg_stroke = Stroke::new(0.8, mix(p.border, p.accent, 0.5));
+    menu_style.visuals.widgets.active.bg_stroke =
+        Stroke::new(0.8_f32, mix(p.border, p.accent, 0.5));
     let combo_id = child.make_persistent_id(egui::Id::new("language"));
     let popup_id = combo_id.with("popup");
     let options: Vec<_> = std::iter::once((LangMode::System, system_label.as_str()))
@@ -4051,7 +4052,7 @@ fn language_row(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut LangMo
                     center + Vec2::new(0.0, 2.0 * direction),
                     center + Vec2::new(3.5, -1.5 * direction),
                 ],
-                Stroke::new(1.3, visuals.fg_stroke.color),
+                Stroke::new(1.3_f32, visuals.fg_stroke.color),
             ));
         })
         .show_ui(&mut child, |ui| {
