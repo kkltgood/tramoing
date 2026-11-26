@@ -37,6 +37,9 @@ jobs:
           python-version: '3.12'
       - name: Check dependency publication logic
         run: node --test packaging/update/dependency-release.test.cjs
+      - name: Check dependency publisher validation
+        shell: powershell
+        run: ./scripts/test-dependency-signatures.ps1
       - name: Download pinned original installers and verify checksums
         shell: pwsh
         run: |

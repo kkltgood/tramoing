@@ -5,6 +5,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $root 'crates/tray-app/src/component_install/signature.ps1')
 if (-not $CacheDirectory) { $CacheDirectory = Join-Path $root 'target/dependency-cache' }
 $cache = [IO.Path]::GetFullPath($CacheDirectory).TrimEnd('\', '/')
 $manifest = Get-Content -LiteralPath (Join-Path $root 'static/dependencies/manifest.json') -Raw | ConvertFrom-Json
@@ -22,9 +23,6 @@ foreach ($item in $selected) {
         throw "Official SHA-512 verification failed: $($item.id)"
     }
     $signature = Get-AuthenticodeSignature -LiteralPath $path
-    $publisher = '(^|,\s*)CN=' + [regex]::Escape($item.publisher) + '(,|$)'
-    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch $publisher) {
-        throw "Official signature verification failed: $($item.id)"
-    }
+    Assert-DependencySignature -Dependency $item.id -Signature $signature
     Write-Host "Verified official publisher and pinned bytes: $($item.id) $($item.version)"
 }

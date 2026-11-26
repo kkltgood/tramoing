@@ -32,8 +32,7 @@ try {
         if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne [string]$file.sha256) { throw ('Installer checksum mismatch: ' + $file.id) }
         if ($file.publisher) {
             $signature = Get-AuthenticodeSignature -LiteralPath $target
-            $publisher = '(^|,\s*)CN=' + [regex]::Escape([string]$file.publisher) + '(,|$)'
-            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch $publisher) { throw ('Invalid official publisher signature: ' + $file.id) }
+            Assert-DependencySignature -Dependency $file.id -Signature $signature
         }
         $verified += [pscustomobject]@{ id=$file.id; path=$target }
     }

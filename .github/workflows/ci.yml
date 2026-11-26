@@ -29,6 +29,10 @@ jobs:
         if: runner.os == 'Windows'
         with:
           dotnet-version: '10.0.x'
+      - name: Check dependency publisher validation
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-dependency-signatures.ps1
       - name: Verify Windows sensor component
         if: runner.os == 'Windows'
         shell: pwsh

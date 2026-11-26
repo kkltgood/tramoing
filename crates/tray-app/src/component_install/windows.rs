@@ -41,7 +41,7 @@ fn run_script(
     timeout: Option<Duration>,
 ) -> Result<std::process::Output, String> {
     let payload = STANDARD.encode(serde_json::to_vec(data).map_err(|e| e.to_string())?);
-    let script = format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $cfg=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}')));\n{}\n{script}", include_str!("security.ps1"));
+    let script = format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $cfg=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}')));\n{}\n{}\n{script}", include_str!("security.ps1"), include_str!("signature.ps1"));
     // Keep the Windows command line small. The embedded script/data travel over
     // a private pipe, not a script in a writable temporary directory.
     let bootstrap = "$ErrorActionPreference='Stop'; [Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $source=[Console]::In.ReadToEnd(); try { & ([ScriptBlock]::Create($source)) } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }";
