@@ -10,7 +10,7 @@ use crate::theme::{self, Lang, Palette};
 pub struct NetworkPanel {
     open: bool,
     path: String,
-    error: Option<String>,
+    error: Option<&'static str>,
     focus_path: bool,
 }
 
@@ -25,9 +25,9 @@ impl NetworkPanel {
     }
 
     #[cfg(debug_assertions)]
-    pub fn preview_invalid_path(&mut self, lang: Lang) {
+    pub fn preview_invalid_path(&mut self) {
         self.path = r"C:\Apps\missing-program.exe".into();
-        self.error = validated_path(&self.path, lang).err();
+        self.error = validated_path(&self.path).err();
     }
 
     pub fn entry(&mut self, ui: &mut egui::Ui, access: &NetworkAccess, p: &Palette, lang: Lang) {
@@ -56,7 +56,7 @@ impl NetworkPanel {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
                 true,
-                lang.t("添加应用", "Add application"),
+                lang.t("network_panel.add_application"),
             )
         });
         if response.clicked() {
@@ -64,7 +64,7 @@ impl NetworkPanel {
         }
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(lang.t("添加应用 · 联网管理", "Add application · Network access"));
+            .on_hover_text(lang.t("network_panel.add_application_network_access"));
     }
 
     /// 返回经校验的完整路径，由主界面添加到列表并保存。
@@ -117,70 +117,179 @@ impl NetworkPanel {
                 ui.visuals_mut().selection.bg_fill = p.selection;
                 ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, p.on_selection);
                 let widgets = &mut ui.visuals_mut().widgets;
-                for visuals in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active] {
+                for visuals in [
+                    &mut widgets.inactive,
+                    &mut widgets.hovered,
+                    &mut widgets.active,
+                ] {
                     visuals.corner_radius = CornerRadius::same(9);
                     visuals.bg_stroke = Stroke::NONE;
                     visuals.expansion = 0.0;
                 }
                 ui.horizontal(|ui| {
                     let (mark, _) = ui.allocate_exact_size(Vec2::splat(36.0), egui::Sense::hover());
-                    ui.painter().rect_filled(mark, 11.0, mix(p.surface, p.accent, 0.10));
+                    ui.painter()
+                        .rect_filled(mark, 11.0, mix(p.surface, p.accent, 0.10));
                     paint_add_app(ui.painter(), mark.center(), p.accent);
                     ui.add_space(3.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(lang.t("添加应用", "Add application")).font(theme::display_font(17.0)).color(p.text));
+                        ui.label(
+                            RichText::new(lang.t("network_panel.add_application"))
+                                .font(theme::display_font(17.0))
+                                .color(p.text),
+                        );
                         ui.add_space(3.0);
-                        ui.label(RichText::new(lang.t("让未显示的程序也能被管理", "Keep an app within reach")).size(11.0).color(p.subtext));
+                        ui.label(
+                            RichText::new(lang.t("network_panel.keep_an_app_within_reach"))
+                                .size(11.0)
+                                .color(p.subtext),
+                        );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        close = small_icon_button(ui, "close", lang.t("关闭", "Close"), true, p, paint_close).clicked();
+                        close = small_icon_button(
+                            ui,
+                            "close",
+                            lang.t("common.close"),
+                            true,
+                            p,
+                            paint_close,
+                        )
+                        .clicked();
                     });
                 });
                 ui.add_space(22.0);
-                egui::ScrollArea::vertical().id_salt("network-panel-body")
+                egui::ScrollArea::vertical()
+                    .id_salt("network-panel-body")
                     .max_height((ctx.content_rect().height() - 136.0).max(180.0))
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.label(RichText::new(lang.t("程序路径", "Application path")).size(12.0).strong().color(p.text));
+                        ui.label(
+                            RichText::new(lang.t("network_panel.application_path"))
+                                .size(12.0)
+                                .strong()
+                                .color(p.text),
+                        );
                         ui.add_space(8.0);
-                        let input = ui.add_sized([ui.available_width(), 40.0], egui::TextEdit::singleline(&mut self.path)
-                            .id_salt("application-path")
-                            .font(FontId::proportional(12.0))
-                            .text_color(p.text)
-                            .background_color(p.panel_bottom)
-                            .margin(egui::Margin::symmetric(12, 11))
-                            .hint_text(RichText::new(lang.t("粘贴完整的 .exe 路径", "Paste the full .exe path")).color(p.subtext)));
+                        let input = ui.add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::TextEdit::singleline(&mut self.path)
+                                .id_salt("application-path")
+                                .font(FontId::proportional(12.0))
+                                .text_color(p.text)
+                                .background_color(p.panel_bottom)
+                                .margin(egui::Margin::symmetric(12, 11))
+                                .hint_text(
+                                    RichText::new(lang.t("network_panel.paste_the_full_exe_path"))
+                                        .color(p.subtext),
+                                ),
+                        );
                         if self.focus_path {
                             input.request_focus();
                             self.focus_path = false;
                         }
-                        if input.changed() { self.error = None; }
-                        ui.painter().rect_stroke(input.rect, 9.0, Stroke::new(1.0_f32, if self.error.is_some() { p.warn } else if input.has_focus() { p.accent } else { p.border }), egui::StrokeKind::Inside);
-                        let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if input.changed() {
+                            self.error = None;
+                        }
+                        ui.painter().rect_stroke(
+                            input.rect,
+                            9.0,
+                            Stroke::new(
+                                1.0_f32,
+                                if self.error.is_some() {
+                                    p.warn
+                                } else if input.has_focus() {
+                                    p.accent
+                                } else {
+                                    p.border
+                                },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        let enter =
+                            input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.add_space(7.0);
-                        ui.add(egui::Label::new(RichText::new(lang.t("例如 C:\\Apps\\Douyin.exe，可直接粘贴带引号的路径。", "For example C:\\Apps\\App.exe. Quoted paths also work.")).size(10.5).color(p.subtext)).wrap());
-                        if let Some(error) = &self.error {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    lang.t("network_panel.for_example_c_apps_app_exe_quoted_paths"),
+                                )
+                                .size(10.5)
+                                .color(p.subtext),
+                            )
+                            .wrap(),
+                        );
+                        if let Some(error) = self.error.map(|key| lang.t(key)) {
                             ui.add_space(8.0);
-                            ui.add(egui::Label::new(RichText::new(error).size(11.0).color(p.warn)).wrap());
+                            ui.add(
+                                egui::Label::new(RichText::new(error).size(11.0).color(p.warn))
+                                    .wrap(),
+                            );
                         }
                         ui.add_space(16.0);
-                        let submit = primary_button(ui, lang.t("添加到列表", "Add to list"), !self.path.trim().is_empty(), p);
+                        let submit = primary_button(
+                            ui,
+                            lang.t("network_panel.add_to_list"),
+                            !self.path.trim().is_empty(),
+                            p,
+                        );
                         if submit.clicked() || enter {
-                            match validated_path(&self.path, lang) {
-                                Ok(path) => { added = Some(path); self.path.clear(); self.error = None; }
-                                Err(error) => { self.error = Some(error); self.focus_path = true; }
+                            match validated_path(&self.path) {
+                                Ok(path) => {
+                                    added = Some(path);
+                                    self.path.clear();
+                                    self.error = None;
+                                }
+                                Err(error) => {
+                                    self.error = Some(error);
+                                    self.focus_path = true;
+                                }
                             }
                         }
                         ui.add_space(9.0);
-                        ui.add(egui::Label::new(RichText::new(lang.t("添加后会置顶。使用右侧网络图标控制联网。", "The app will be pinned. Use its network icon to control access.")).size(11.0).color(p.subtext)).wrap());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    lang.t("network_panel.the_app_will_be_pinned_use_its_network"),
+                                )
+                                .size(11.0)
+                                .color(p.subtext),
+                            )
+                            .wrap(),
+                        );
                         ui.add_space(19.0);
-                        let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-                        ui.painter().line_segment([line.left_center(), line.right_center()], Stroke::new(0.7_f32, p.border));
+                        let (line, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 1.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().line_segment(
+                            [line.left_center(), line.right_center()],
+                            Stroke::new(0.7_f32, p.border),
+                        );
                         ui.add_space(14.0);
                         control_status(ui, access, p, lang);
                         ui.add_space(10.0);
-                        ui.add(egui::Label::new(RichText::new(lang.t("断网设置会保留，直到手动恢复联网。", "Blocks remain until you restore network access.")).size(10.5).color(p.subtext)).wrap());
-                        ui.add(egui::Label::new(RichText::new(lang.t("阻断代理会影响依赖它的应用；辅助程序需单独设置。", "Blocking a proxy affects apps using it. Set helper apps separately.")).size(10.5).color(p.subtext)).wrap());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(lang.t(
+                                    "network_panel.blocks_remain_until_you_restore_network_access",
+                                ))
+                                .size(10.5)
+                                .color(p.subtext),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    lang.t(
+                                        "network_panel.blocking_a_proxy_affects_apps_using_it_set",
+                                    ),
+                                )
+                                .size(10.5)
+                                .color(p.subtext),
+                            )
+                            .wrap(),
+                        );
                     });
             });
         if close || added.is_some() || modal.should_close() {
@@ -190,40 +299,30 @@ impl NetworkPanel {
     }
 }
 
-fn validated_path(input: &str, lang: Lang) -> Result<String, String> {
+fn validated_path(input: &str) -> Result<String, &'static str> {
     let path = input.trim().trim_matches('"');
     if tm_windows::network_policy::validate_path(path).is_err() {
-        return Err(lang
-            .t(
-                "请填写本机程序的完整 .exe 路径。",
-                "Enter a full path to a local .exe file.",
-            )
-            .into());
+        return Err("network_panel.enter_a_full_path_to_a_local_exe");
     }
     if !tm_windows::network_control::is_program(std::path::Path::new(path)) {
-        return Err(lang
-            .t(
-                "找不到这个程序，请检查路径后重试。",
-                "This file was not found. Check the path and try again.",
-            )
-            .into());
+        return Err("network_panel.this_file_was_not_found_check_the_path");
     }
     Ok(path.to_owned())
 }
 
 fn control_status(ui: &mut egui::Ui, access: &mut NetworkAccess, p: &Palette, lang: Lang) {
     let (status, color) = if access.error.is_some() {
-        (lang.t("暂不可用", "Unavailable"), p.warn)
+        (lang.t("common.unavailable"), p.warn)
     } else if access.is_demo() {
-        (lang.t("演示模式", "Demo mode"), p.subtext)
+        (lang.t("network_panel.demo_mode"), p.subtext)
     } else if access.busy() || !access.verified {
-        (lang.t("正在检查", "Checking"), p.accent)
+        (lang.t("network_panel.checking"), p.accent)
     } else {
-        (lang.t("已就绪", "Ready"), p.download)
+        (lang.t("network_panel.ready"), p.download)
     };
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(lang.t("联网控制", "Network access"))
+            RichText::new(lang.t("network_panel.network_access"))
                 .size(12.0)
                 .strong()
                 .color(p.text),
@@ -232,7 +331,7 @@ fn control_status(ui: &mut egui::Ui, access: &mut NetworkAccess, p: &Palette, la
             if small_icon_button(
                 ui,
                 "refresh",
-                lang.t("刷新联网状态", "Refresh network status"),
+                lang.t("network_panel.refresh_network_status"),
                 !access.busy() && !access.is_demo(),
                 p,
                 paint_refresh,
@@ -250,17 +349,14 @@ fn control_status(ui: &mut egui::Ui, access: &mut NetworkAccess, p: &Palette, la
         ui.add_space(5.0);
         ui.add(
             egui::Label::new(
-                RichText::new(lang.t(
-                    "可先添加应用，连接助手后再设置联网权限。",
-                    "You can add apps now and manage access once the helper connects.",
-                ))
-                .size(11.0)
-                .color(p.subtext),
+                RichText::new(lang.t("network_panel.you_can_add_apps_now_and_manage_access"))
+                    .size(11.0)
+                    .color(p.subtext),
             )
             .wrap(),
         );
         ui.collapsing(
-            RichText::new(lang.t("查看原因", "View details"))
+            RichText::new(lang.t("network_panel.view_details"))
                 .size(10.5)
                 .color(p.warn),
             |ui| {
@@ -270,10 +366,9 @@ fn control_status(ui: &mut egui::Ui, access: &mut NetworkAccess, p: &Palette, la
     } else if access.is_demo() {
         ui.add(
             egui::Label::new(
-                RichText::new(lang.t(
-                    "演示模式不会修改系统网络权限。",
-                    "Demo mode does not change network permissions.",
-                ))
+                RichText::new(
+                    lang.t("network_panel.demo_mode_does_not_change_network_permissions"),
+                )
                 .size(10.5)
                 .color(p.subtext),
             )
@@ -450,12 +545,12 @@ mod tests {
             let _ = self.ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.entry_at = ui.cursor().min + Vec2::splat(14.0);
-                    self.panel.entry(ui, &self.access, &p, Lang::En);
+                    self.panel.entry(ui, &self.access, &p, Lang::EN);
                     let background = ui.button("Background action");
                     self.background_at = background.rect.center();
                     self.background_clicks += usize::from(background.clicked());
                 });
-                if let Some(path) = self.panel.show(ctx, &mut self.access, &p, Lang::En) {
+                if let Some(path) = self.panel.show(ctx, &mut self.access, &p, Lang::EN) {
                     added = Some(path);
                 }
             });

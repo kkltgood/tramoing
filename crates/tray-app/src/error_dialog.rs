@@ -66,7 +66,7 @@ impl Prompt {
                 ui.set_width(310.0);
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
                 ui.label(
-                    RichText::new(lang.t("运行遇到问题", "Something went wrong"))
+                    RichText::new(lang.t("errors.something_went_wrong"))
                         .size(17.0)
                         .color(p.text),
                 );
@@ -85,29 +85,23 @@ impl Prompt {
                     });
                 ui.add(
                     egui::Label::new(
-                        RichText::new(lang.t(
-                            "是否导出日志，帮助排查问题？",
-                            "Export logs to help diagnose this problem?",
-                        ))
-                        .color(p.text),
+                        RichText::new(lang.t("errors.export_logs_to_help_diagnose_this_problem"))
+                            .color(p.text),
                     )
                     .wrap(),
                 );
                 ui.add(
                     egui::Label::new(
-                        RichText::new(lang.t(
-                            "报告只保存到本机，不会自动发送。",
-                            "The report is saved locally and is not sent automatically.",
-                        ))
-                        .size(11.0)
-                        .color(p.subtext),
+                        RichText::new(lang.t("errors.the_report_is_saved_locally_and_is_not"))
+                            .size(11.0)
+                            .color(p.subtext),
                     )
                     .wrap(),
                 );
                 if busy {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(lang.t("正在导出日志…", "Exporting logs…"));
+                        ui.label(lang.t("errors.exporting_logs"));
                     });
                 } else if let Some(result) = result {
                     egui::ScrollArea::vertical()
@@ -116,18 +110,14 @@ impl Prompt {
                         .show(ui, |ui| {
                             let (text, color) = match result {
                                 Ok(path) => (
-                                    format!(
-                                        "{}\n{}",
-                                        lang.t("日志已导出", "Logs exported"),
-                                        path.display()
+                                    lang.format(
+                                        "errors.export_result",
+                                        &[("path", &path.display().to_string())],
                                     ),
                                     p.subtext,
                                 ),
                                 Err(error) => (
-                                    format!(
-                                        "{}：{error}",
-                                        lang.t("导出失败，可重试", "Export failed; try again")
-                                    ),
+                                    lang.format("errors.export_failed_detail", &[("error", error)]),
                                     p.warn,
                                 ),
                             };
@@ -140,9 +130,9 @@ impl Prompt {
                 }
                 ui.horizontal(|ui| {
                     let dismiss = if result.is_some() {
-                        lang.t("关闭", "Close")
+                        lang.t("common.close")
                     } else {
-                        lang.t("暂不导出", "Not now")
+                        lang.t("common.not_now")
                     };
                     if ui
                         .add_enabled(
@@ -156,9 +146,9 @@ impl Prompt {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let saved = matches!(result, Some(Ok(_)));
                         let label = if saved {
-                            lang.t("打开文件位置", "Show file")
+                            lang.t("common.show_file")
                         } else {
-                            lang.t("导出日志", "Export logs")
+                            lang.t("diagnostics.export_logs")
                         };
                         if ui
                             .add_enabled(
@@ -220,44 +210,39 @@ fn native_dialog(title: &str, detail: &str, confirm: &str, cancel: Option<&str>)
 
 /// 主窗口创建失败时仍然可用。只在用户选择导出后收集系统信息。
 pub fn report_fatal(message: &str) {
-    let lang = match crate::settings::Settings::load().lang {
-        crate::settings::LangMode::En => Lang::En,
-        _ => Lang::Zh,
-    };
-    let detail = format!(
-        "{}\n\n{}",
-        message.chars().take(2048).collect::<String>(),
-        lang.t(
-            "是否导出日志，帮助排查问题？报告只保存到本机。",
-            "Export logs to help diagnose this problem? The report is saved locally.",
-        )
+    let lang = crate::i18n::resolve(crate::settings::Settings::load().lang);
+    let detail = lang.format(
+        "errors.fatal_detail",
+        &[("message", &message.chars().take(2048).collect::<String>())],
     );
     if !native_dialog(
-        lang.t("Tramoing 遇到错误", "Tramoing encountered an error"),
+        lang.t("errors.tramoing_encountered_an_error"),
         &detail,
-        lang.t("导出日志", "Export logs"),
-        Some(lang.t("暂不导出", "Not now")),
+        lang.t("diagnostics.export_logs"),
+        Some(lang.t("common.not_now")),
     ) {
         return;
     }
     match crate::diagnostics::export_report(message) {
         Ok(path) => {
-            let detail = format!(
-                "{}\n\n{}",
-                path.display(),
-                lang.t("是否打开文件位置？", "Show the report in its folder?")
+            let detail = lang.format(
+                "errors.report_saved_detail",
+                &[("path", &path.display().to_string())],
             );
             if native_dialog(
-                lang.t("日志已导出", "Logs exported"),
+                lang.t("diagnostics.logs_exported"),
                 &detail,
-                lang.t("打开文件位置", "Show file"),
-                Some(lang.t("关闭", "Close")),
+                lang.t("common.show_file"),
+                Some(lang.t("common.close")),
             ) {
                 if let Err(error) = crate::diagnostics::reveal(&path) {
                     native_dialog(
-                        lang.t("无法打开文件位置", "Could not show file"),
-                        &format!("{error}\n{}", path.display()),
-                        lang.t("关闭", "Close"),
+                        lang.t("errors.could_not_show_file"),
+                        &lang.format(
+                            "errors.show_file_detail",
+                            &[("error", &error), ("path", &path.display().to_string())],
+                        ),
+                        lang.t("common.close"),
                         None,
                     );
                 }
@@ -266,9 +251,9 @@ pub fn report_fatal(message: &str) {
         Err(error) => {
             log::error!(target: "tramoing::diagnostics", "导出失败：{error}");
             native_dialog(
-                lang.t("日志导出失败", "Log export failed"),
+                lang.t("errors.log_export_failed"),
                 &error,
-                lang.t("关闭", "Close"),
+                lang.t("common.close"),
                 None,
             );
         }
@@ -312,10 +297,8 @@ pub fn install_crash_reporter() {
         if STARTED.swap(true, Ordering::SeqCst) {
             return;
         }
-        let message: String = format!("程序发生崩溃 / Application crashed\n{info}")
-            .chars()
-            .take(2048)
-            .collect();
+        // Preserve raw panic details; the report process resolves the current language.
+        let message: String = info.to_string().chars().take(2048).collect();
         let _ = std::fs::write(&marker, &message);
         if let Ok(executable) = std::env::current_exe() {
             let mut command = std::process::Command::new(executable);
@@ -404,7 +387,7 @@ mod tests {
                         action = prompt.show(
                             ctx,
                             &crate::theme::palette(true),
-                            Lang::En,
+                            Lang::EN,
                             busy,
                             result.as_ref(),
                         );

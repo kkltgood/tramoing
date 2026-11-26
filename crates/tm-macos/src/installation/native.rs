@@ -141,7 +141,7 @@ fn with_progress<T: Send + 'static>(
     let alert = NSAlert::new(mtm);
     alert.setMessageText(&NSString::from_str("正在安装 Tramoing…"));
     alert.setInformativeText(&NSString::from_str(
-        "正在校验并复制应用。完成后自动打开，设置和历史记录会保留。",
+        "正在校验并复制应用。完成后自动启动，设置和历史记录会保留。",
     ));
     alert
         .addButtonWithTitle(&NSString::from_str("请稍候"))
@@ -401,11 +401,16 @@ pub fn offer_install() -> Result<bool, String> {
     let destination = installed_destination(&source)?;
     let updating = destination.exists();
     let action = if updating {
-        "更新并打开"
+        "更新并启动"
     } else {
         "安装并打开"
     };
-    let detail = format!("将 Tramoing {}到：\n{}\n\n完成后自动打开。你可以在屏幕顶部的菜单栏查看网速，设置和历史记录会保留。", if updating { "更新" } else { "安装" }, destination.display());
+    let completion = if updating {
+        "完成后在后台启动，不自动展开面板。"
+    } else {
+        "完成后自动打开主面板。"
+    };
+    let detail = format!("将 Tramoing {}到：\n{}\n\n{completion}你可以在屏幕顶部的菜单栏查看网速，设置和历史记录会保留。", if updating { "更新" } else { "安装" }, destination.display());
     if !dialog("欢迎使用 Tramoing", &detail, action, true) {
         return Ok(true);
     }
@@ -463,14 +468,62 @@ pub fn start_update(image: &Path, version: &str) -> Result<(), String> {
     prepared.handoff()
 }
 
-fn open_application(app: &Path, reveal: bool) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchReason {
+    FreshInstall,
+    Update,
+}
+
+fn application_command(app: &Path, reason: LaunchReason) -> Command {
     let mut command = Command::new("/usr/bin/open");
-    command.arg("-n").arg(app);
-    if reveal {
-        command.args(["--args", "--after-install"]);
+    if reason == LaunchReason::Update {
+        command.arg("-g");
     }
+    command.arg("-n").arg(app);
+    command.args([
+        "--args",
+        match reason {
+            LaunchReason::FreshInstall => "--after-install",
+            LaunchReason::Update => "--after-update",
+        },
+    ]);
+    command
+}
+
+fn open_application(app: &Path, reason: LaunchReason) -> Result<(), String> {
+    let mut command = application_command(app, reason);
     command_output(&mut command, "打开 Tramoing 失败")?;
     Ok(())
+}
+
+/// The saved previous version distinguishes a first installation from both an
+/// in-app update and replacing an existing application from a disk image.
+fn apply_and_launch(
+    directory: &Path,
+    destination: &Path,
+    previous: &str,
+    mut launch: impl FnMut(&Path, LaunchReason) -> Result<(), String>,
+) -> Result<(), String> {
+    let reason = if previous.is_empty() {
+        LaunchReason::FreshInstall
+    } else {
+        LaunchReason::Update
+    };
+    let result = replace_bundle(
+        &directory.join("Tramoing.app"),
+        destination,
+        &directory.join("previous.app"),
+        |app| launch(app, reason),
+    );
+    if result.is_err()
+        && !previous.is_empty()
+        && verify_existing_bundle(destination).is_ok_and(|version| version == previous)
+    {
+        // A restored older version is also a background restart. Never replay its
+        // first-install onboarding flag after a failed update.
+        let _ = launch(destination, LaunchReason::Update);
+    }
+    result
 }
 
 fn finish(directory: &Path, destination: &Path, pid: u32, start: (u64, u64)) -> Result<(), String> {
@@ -521,18 +574,8 @@ fn finish(directory: &Path, destination: &Path, pid: u32, start: (u64, u64)) -> 
     if current != previous {
         return Err("安装目录中的版本已改变，请重新检查更新".into());
     }
-    let result = replace_bundle(
-        &staged,
-        destination,
-        &directory.join("previous.app"),
-        |app| open_application(app, true),
-    );
+    let result = apply_and_launch(&directory, destination, &previous, open_application);
     if let Err(error) = result {
-        if !previous.is_empty()
-            && verify_existing_bundle(destination).is_ok_and(|version| version == previous)
-        {
-            let _ = open_application(destination, false);
-        }
         return Err(format!("{error}\n安装恢复文件：{}", directory.display()));
     }
     // Nothing in the user data directory is part of this cleanup.
@@ -640,6 +683,103 @@ mod tests {
         assert_eq!(
             prepared.directory.path().parent(),
             destination.parent().unwrap().canonicalize().ok().as_deref()
+        );
+    }
+
+    #[test]
+    fn fresh_installs_reveal_but_in_app_and_disk_image_updates_restart_in_background() {
+        for (previous, expected_version) in [
+            (None, None),
+            (Some("1.0.0"), Some("1.1.0")),
+            (Some("1.0.0"), None),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("Download.app");
+            let destination = root.path().join("Tramoing.app");
+            signed_fixture(&source, "1.1.0");
+            if let Some(version) = previous {
+                signed_fixture(&destination, version);
+            }
+            let prepared = prepare(&source, &destination, expected_version).unwrap();
+            let saved_previous =
+                std::fs::read_to_string(prepared.directory.path().join("previous-version"))
+                    .unwrap();
+            assert_eq!(saved_previous, previous.unwrap_or_default());
+            let mut launches = 0;
+            apply_and_launch(
+                prepared.directory.path(),
+                &prepared.destination,
+                &saved_previous,
+                |app, reason| {
+                    launches += 1;
+                    assert_eq!(verify_bundle(app).unwrap(), "1.1.0");
+                    let command = application_command(app, reason);
+                    assert_eq!(command.get_program(), "/usr/bin/open");
+                    let args: Vec<_> = command
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
+                    if previous.is_some() {
+                        assert_eq!(reason, LaunchReason::Update);
+                        assert_eq!(
+                            args,
+                            [
+                                "-g",
+                                "-n",
+                                app.to_str().unwrap(),
+                                "--args",
+                                "--after-update"
+                            ]
+                        );
+                    } else {
+                        assert_eq!(reason, LaunchReason::FreshInstall);
+                        assert_eq!(
+                            args,
+                            ["-n", app.to_str().unwrap(), "--args", "--after-install"]
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(launches, 1);
+        }
+    }
+
+    #[test]
+    fn a_failed_update_relaunches_the_restored_version_without_onboarding() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Download.app");
+        let destination = root.path().join("Tramoing.app");
+        signed_fixture(&source, "1.1.0");
+        signed_fixture(&destination, "1.0.0");
+        let prepared = prepare(&source, &destination, Some("1.1.0")).unwrap();
+        let mut launched_versions = Vec::new();
+        let result = apply_and_launch(
+            prepared.directory.path(),
+            &prepared.destination,
+            "1.0.0",
+            |app, reason| {
+                assert_eq!(reason, LaunchReason::Update);
+                let command = application_command(app, reason);
+                let args: Vec<_> = command.get_args().collect();
+                assert!(args.contains(&std::ffi::OsStr::new("-g")));
+                assert!(args.contains(&std::ffi::OsStr::new("--after-update")));
+                assert!(!args.contains(&std::ffi::OsStr::new("--after-install")));
+                launched_versions.push(verify_existing_bundle(app).unwrap());
+                if launched_versions.len() == 1 {
+                    Err("simulated launch failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err(), "simulated launch failure");
+        assert_eq!(launched_versions, ["1.1.0", "1.0.0"]);
+        assert_eq!(verify_bundle(&destination).unwrap(), "1.0.0");
+        assert_eq!(
+            verify_bundle(&prepared.directory.path().join("Tramoing.app")).unwrap(),
+            "1.1.0"
         );
     }
 

@@ -10,23 +10,128 @@
 //! 也就是说问题出在那层抽象上，不是系统限制。我们需要的能力其实只有三件事：
 //! 一个图标、一段文字、一个点击回调 —— 直接调 AppKit 更省心。
 
+use std::cell::Cell;
+
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{
-    NSAppearanceCustomization, NSBaselineOffsetAttributeName, NSBitmapImageFileType,
-    NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSFont, NSFontAttributeName,
-    NSFontWeightMedium, NSForegroundColorAttributeName, NSImage, NSMutableParagraphStyle,
-    NSParagraphStyleAttributeName, NSScreen, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
-    NSTextAlignment, NSVariableStatusItemLength,
+    NSAppearanceCustomization, NSApplication, NSBaselineOffsetAttributeName, NSBitmapImageFileType,
+    NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSEvent, NSEventType, NSFont,
+    NSFontAttributeName, NSFontWeightMedium, NSForegroundColorAttributeName, NSImage,
+    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSScreen, NSSquareStatusItemLength,
+    NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment, NSVariableStatusItemLength,
 };
 use objc2_foundation::{
-    NSDictionary, NSMutableAttributedString, NSNumber, NSObjectProtocol, NSRange, NSSize, NSString,
+    NSDictionary, NSMutableAttributedString, NSNumber, NSObjectProtocol, NSPoint, NSProcessInfo,
+    NSRange, NSRect, NSSize, NSString,
 };
 use tm_core::color::{DisplayColors, Rgb};
 
 struct ClickTargetIvars {
-    on_click: Box<dyn Fn() + Send + Sync>,
+    on_click: Box<dyn Fn(Option<ClickAnchor>) + Send + Sync>,
+    last_mouse_event: Cell<Option<(isize, f64)>>,
+}
+
+/// A mouse activation captured before AppKit returns from the status-item action.
+/// Both rectangles use global logical points with the origin at the top left,
+/// matching [`StatusItem::icon_rect`]. The narrow anchor is centered on the click
+/// and extends to the bottom of the clicked display's menu bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClickAnchor {
+    pub rect: (f64, f64, f64, f64),
+    pub work_area: (f64, f64, f64, f64),
+}
+
+fn is_mouse_activation(event_type: NSEventType) -> bool {
+    matches!(
+        event_type,
+        NSEventType::LeftMouseDown
+            | NSEventType::LeftMouseUp
+            | NSEventType::RightMouseDown
+            | NSEventType::RightMouseUp
+            | NSEventType::OtherMouseDown
+            | NSEventType::OtherMouseUp
+    )
+}
+
+fn mouse_event_is_current(
+    event_type: NSEventType,
+    event_window: isize,
+    sender_window: isize,
+    event_time: f64,
+    uptime: f64,
+) -> bool {
+    let age = uptime - event_time;
+    is_mouse_activation(event_type)
+        && event_window == sender_window
+        && event_window > 0
+        && (0.0..=1.0).contains(&age)
+}
+
+fn click_anchor_for_screens(
+    point: NSPoint,
+    screens: &[(NSRect, NSRect)],
+    status_bar_height: f64,
+) -> Option<ClickAnchor> {
+    let primary = screens.first()?.0;
+    let primary_top = primary.origin.y + primary.size.height;
+    let &(screen, work) = screens.iter().find(|(screen, _)| {
+        point.x >= screen.origin.x
+            && point.x < screen.origin.x + screen.size.width
+            && point.y >= screen.origin.y
+            && point.y < screen.origin.y + screen.size.height
+    })?;
+    let screen_top = screen.origin.y + screen.size.height;
+    let work_top = work.origin.y + work.size.height;
+    // visibleFrame includes the taller menu-bar inset on notched displays.
+    // With an auto-hidden menu bar there may be no inset; keep the revealed
+    // bar's native thickness, and never place the anchor above the mouse.
+    let menu_height = (screen_top - work_top)
+        .max(status_bar_height)
+        .max(screen_top - point.y)
+        .min(screen.size.height);
+    Some(ClickAnchor {
+        rect: (point.x - 0.5, primary_top - screen_top, 1.0, menu_height),
+        work_area: (
+            work.origin.x,
+            primary_top - work_top,
+            work.size.width,
+            work.size.height,
+        ),
+    })
+}
+
+fn current_click_anchor(
+    sender: &AnyObject,
+    last_mouse_event: &Cell<Option<(isize, f64)>>,
+) -> Option<ClickAnchor> {
+    let mtm = MainThreadMarker::new()?;
+    let window = sender.downcast_ref::<NSStatusBarButton>()?.window()?;
+    let event = NSApplication::sharedApplication(mtm).currentEvent()?;
+    // Keyboard and accessibility actions must not use an unrelated cursor.
+    // currentEvent can outlive dispatch, so also reject an old/different-window
+    // event and an event already consumed by this button's previous action.
+    if !mouse_event_is_current(
+        event.r#type(),
+        event.windowNumber(),
+        window.windowNumber(),
+        event.timestamp(),
+        NSProcessInfo::processInfo().systemUptime(),
+    ) {
+        return None;
+    }
+    let event_key = (event.eventNumber(), event.timestamp());
+    if last_mouse_event.get() == Some(event_key) {
+        return None;
+    }
+    last_mouse_event.set(Some(event_key));
+    let point = NSEvent::mouseLocation();
+    let screens: Vec<_> = NSScreen::screens(mtm)
+        .iter()
+        .map(|screen| (screen.frame(), screen.visibleFrame()))
+        .collect();
+    click_anchor_for_screens(point, &screens, NSStatusBar::systemStatusBar().thickness())
 }
 
 /// 菜单栏标题里一段文字的语义。
@@ -135,16 +240,18 @@ define_class!(
         /// `NSStatusBarButton` 的 action。`-` 结尾的 selector 记得带冒号，
         /// 少写一个冒号会静默地永远不触发。
         #[unsafe(method(toggle:))]
-        fn toggle(&self, _sender: &AnyObject) {
-            (self.ivars().on_click)();
+        fn toggle(&self, sender: &AnyObject) {
+            let anchor = current_click_anchor(sender, &self.ivars().last_mouse_event);
+            (self.ivars().on_click)(anchor);
         }
     }
 );
 
 impl ClickTarget {
-    fn new(on_click: impl Fn() + Send + Sync + 'static) -> Retained<Self> {
+    fn new(on_click: impl Fn(Option<ClickAnchor>) + Send + Sync + 'static) -> Retained<Self> {
         let allocated = Self::alloc().set_ivars(ClickTargetIvars {
             on_click: Box::new(on_click),
+            last_mouse_event: Cell::new(None),
         });
         // SAFETY: NSObject 的 init 签名和返回类型匹配，Rust ivars 已初始化。
         unsafe { msg_send![super(allocated), init] }
@@ -158,12 +265,57 @@ pub struct StatusItem {
     _target: Retained<ClickTarget>,
 }
 
+fn frame_is_on_screen(frame: NSRect, screen: NSRect) -> bool {
+    let x = frame.origin.x + frame.size.width / 2.0;
+    let y = frame.origin.y + frame.size.height / 2.0;
+    frame.size.width > 0.0
+        && frame.size.height > 0.0
+        && x >= screen.origin.x
+        && x < screen.origin.x + screen.size.width
+        && y >= screen.origin.y
+        && y < screen.origin.y + screen.size.height
+}
+
 impl StatusItem {
     /// 创建状态栏项。`on_click` 在用户点击图标时被调用（主线程）。
     pub fn new(on_click: impl Fn() + Send + Sync + 'static) -> Option<Self> {
+        Self::create(None, move |_| on_click())
+    }
+
+    /// Create an independently positioned menu-bar item using a stable identity.
+    /// Give each role its own name and keep it unchanged across launches so AppKit
+    /// can restore the position chosen by Command-dragging the item.
+    ///
+    /// AppKit also persists visibility under this name. New items explicitly start
+    /// visible; the caller must then apply the current application setting with
+    /// `set_visible`, rather than inheriting stale visibility from a previous run.
+    pub fn new_named(id: &str, on_click: impl Fn() + Send + Sync + 'static) -> Option<Self> {
+        Self::create(Some(id), move |_| on_click())
+    }
+
+    /// Like [`Self::new_named`], with a display-aware anchor captured during a
+    /// mouse action. Keyboard/accessibility actions receive `None`; callers can
+    /// use the status item's geometry for those activations.
+    pub fn new_named_with_click(
+        id: &str,
+        on_click: impl Fn(Option<ClickAnchor>) + Send + Sync + 'static,
+    ) -> Option<Self> {
+        Self::create(Some(id), on_click)
+    }
+
+    fn create(
+        autosave_name: Option<&str>,
+        on_click: impl Fn(Option<ClickAnchor>) + Send + Sync + 'static,
+    ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
 
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+        if let Some(name) = autosave_name {
+            item.setAutosaveName(Some(&NSString::from_str(name)));
+        }
+        // setAutosaveName can restore a hidden item from AppKit defaults. The app's
+        // independent visibility settings take precedence over that saved value.
+        item.setVisible(true);
 
         let target = ClickTarget::new(on_click);
         let Some(button) = item.button(mtm) else {
@@ -355,11 +507,16 @@ impl StatusItem {
     /// AppKit 的坐标系原点在左下，这里转成弹窗定位习惯的左上原点。
     /// 拿不到窗口（项还没被布局）时返回 `None`。
     pub fn icon_rect(&self) -> Option<(f64, f64, f64, f64)> {
+        if !self.is_visible() {
+            return None;
+        }
         let mtm = MainThreadMarker::new()?;
         let button = self.item.button(mtm)?;
         let window = button.window()?;
         let f = window.frame();
-        if f.size.height <= 0.0 {
+        // AppKit briefly reports a nonzero frame below the screen while laying
+        // out a new item. That is not yet a usable popover anchor.
+        if !frame_is_on_screen(f, window.screen()?.frame()) {
             return None;
         }
         // AppKit 全局坐标始终以第一块屏（菜单栏主屏）的左下角为原点。
@@ -389,6 +546,12 @@ impl StatusItem {
     /// 是否真的挂上了状态栏。排查「图标不出现」时先看这个。
     pub fn is_visible(&self) -> bool {
         self.item.isVisible()
+    }
+
+    /// 隐藏整个状态项，同时保留内容、点击回调与 autosaveName 供再次显示。
+    /// 不清空 autosaveName：AppKit 将 nil 解释为清除已保存的状态项信息。
+    pub fn set_visible(&self, visible: bool) {
+        self.item.setVisible(visible);
     }
 
     /// 把按钮当前的样子离屏渲染成 PNG。
@@ -447,7 +610,8 @@ impl StatusItem {
             None => (false, false, 0.0, 0),
         };
         format!(
-            "按钮 {:.0}×{:.0} 标题 {len} 字 窗口可见={wvis} 活跃Space={osp} alpha={alpha:.1} occlusion=0x{occl:x}",
+            "标识={} 按钮 {:.0}×{:.0} 标题 {len} 字 窗口可见={wvis} 活跃Space={osp} alpha={alpha:.1} occlusion=0x{occl:x}",
+            &*self.item.autosaveName(),
             bf.size.width, bf.size.height,
         )
     }
@@ -515,6 +679,136 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mouse_anchor_uses_clicked_display_and_global_top_left_coordinates() {
+        let rect = |x, y, w, h| NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+        let screens = [
+            (
+                rect(0.0, 0.0, 1800.0, 1169.0),
+                rect(0.0, 70.0, 1800.0, 1060.0),
+            ),
+            (
+                rect(-1200.0, -900.0, 1200.0, 900.0),
+                rect(-1200.0, -850.0, 1200.0, 826.0),
+            ),
+            (
+                rect(0.0, 1169.0, 1920.0, 1080.0),
+                rect(60.0, 1169.0, 1860.0, 1056.0),
+            ),
+        ];
+
+        let main = click_anchor_for_screens(NSPoint::new(1032.0, 1150.0), &screens, 22.0)
+            .expect("main display");
+        assert_eq!(main.rect, (1031.5, 0.0, 1.0, 39.0));
+        assert_eq!(main.work_area, (0.0, 39.0, 1800.0, 1060.0));
+
+        let lower_left = click_anchor_for_screens(NSPoint::new(-300.0, -10.0), &screens, 22.0)
+            .expect("lower-left display");
+        assert_eq!(lower_left.rect, (-300.5, 1169.0, 1.0, 24.0));
+        assert_eq!(lower_left.work_area, (-1200.0, 1193.0, 1200.0, 826.0));
+
+        let above = click_anchor_for_screens(NSPoint::new(1000.0, 2240.0), &screens, 22.0)
+            .expect("display above primary");
+        assert_eq!(above.rect, (999.5, -1080.0, 1.0, 24.0));
+        assert_eq!(above.work_area, (60.0, -1056.0, 1860.0, 1056.0));
+    }
+
+    #[test]
+    fn hidden_menu_bar_uses_native_height_and_unknown_display_has_no_anchor() {
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1800.0, 1169.0));
+        let screens = [(screen, screen)];
+        let anchor = click_anchor_for_screens(NSPoint::new(1000.0, 1159.0), &screens, 24.0)
+            .expect("revealed auto-hidden menu bar");
+        assert_eq!(anchor.rect, (999.5, 0.0, 1.0, 24.0));
+        assert_eq!(anchor.work_area, (0.0, 0.0, 1800.0, 1169.0));
+        assert!(click_anchor_for_screens(NSPoint::new(-10.0, 100.0), &screens, 24.0).is_none());
+        assert!(click_anchor_for_screens(NSPoint::new(f64::NAN, 100.0), &screens, 24.0).is_none());
+        assert!(click_anchor_for_screens(NSPoint::new(100.0, 100.0), &[], 24.0).is_none());
+    }
+
+    #[test]
+    fn keyboard_and_non_click_events_do_not_use_cursor_position() {
+        for event in [
+            NSEventType::LeftMouseDown,
+            NSEventType::LeftMouseUp,
+            NSEventType::RightMouseDown,
+            NSEventType::RightMouseUp,
+            NSEventType::OtherMouseDown,
+            NSEventType::OtherMouseUp,
+        ] {
+            assert!(is_mouse_activation(event));
+        }
+        for event in [
+            NSEventType::KeyDown,
+            NSEventType::KeyUp,
+            NSEventType::MouseMoved,
+            NSEventType::LeftMouseDragged,
+            NSEventType::ApplicationDefined,
+        ] {
+            assert!(!is_mouse_activation(event));
+        }
+    }
+
+    #[test]
+    fn stale_or_unrelated_mouse_events_cannot_anchor_accessibility_actions() {
+        assert!(mouse_event_is_current(
+            NSEventType::LeftMouseUp,
+            42,
+            42,
+            100.0,
+            100.05,
+        ));
+        assert!(!mouse_event_is_current(
+            NSEventType::LeftMouseUp,
+            41,
+            42,
+            100.0,
+            100.05,
+        ));
+        assert!(!mouse_event_is_current(
+            NSEventType::LeftMouseUp,
+            42,
+            42,
+            100.0,
+            102.0,
+        ));
+        assert!(!mouse_event_is_current(
+            NSEventType::LeftMouseUp,
+            42,
+            42,
+            102.0,
+            100.0,
+        ));
+        assert!(!mouse_event_is_current(
+            NSEventType::KeyDown,
+            42,
+            42,
+            100.0,
+            100.05,
+        ));
+        assert!(!mouse_event_is_current(
+            NSEventType::LeftMouseUp,
+            0,
+            0,
+            100.0,
+            100.05,
+        ));
+    }
+
+    #[test]
+    fn status_anchor_waits_for_layout_and_supports_negative_screen_coordinates() {
+        use objc2_foundation::NSPoint;
+        let rect = |x, y, w, h| NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+        let screen = rect(0.0, 0.0, 1800.0, 1169.0);
+        assert!(!frame_is_on_screen(rect(0.0, -39.0, 76.0, 39.0), screen));
+        assert!(!frame_is_on_screen(rect(1287.0, 1169.0, 76.0, 0.0), screen));
+        assert!(frame_is_on_screen(rect(1287.0, 1130.0, 76.0, 39.0), screen));
+        assert!(frame_is_on_screen(
+            rect(-300.0, -39.0, 76.0, 39.0),
+            rect(-1200.0, -900.0, 1200.0, 900.0)
+        ));
+    }
+
+    #[test]
     fn custom_tones_apply_to_text_and_mono_uses_system_label() {
         let custom = Rgb(255, 128, 0);
         for default in [Tone::Cpu, Tone::Gpu, Tone::Down, Tone::Up, Tone::Plain] {
@@ -536,14 +830,20 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let first = ClickTarget::new({
             let calls = calls.clone();
-            move || {
+            move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
             }
         });
         let second = ClickTarget::new({
             let calls = calls.clone();
-            move || {
+            move |_| {
                 calls.fetch_add(10, Ordering::SeqCst);
+            }
+        });
+        let third = ClickTarget::new({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(100, Ordering::SeqCst);
             }
         });
         let sender = NSObject::new();
@@ -560,6 +860,11 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 21);
         drop(second);
+        unsafe {
+            let _: () = msg_send![&third, toggle: &*sender];
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 121);
+        drop(third);
         assert_eq!(Arc::strong_count(&calls), 1);
     }
 

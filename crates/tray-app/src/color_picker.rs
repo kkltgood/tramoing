@@ -72,7 +72,7 @@ pub fn controls(
     let swatch = ui
         .interact(swatch_rect, ui.id().with("swatch"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(lang.t("选择颜色", "Choose color"));
+        .on_hover_text(lang.t("color.choose_color"));
     swatch.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, ui.is_enabled(), label)
     });
@@ -100,14 +100,11 @@ pub fn controls(
         ui,
         reset_rect,
         ui.id().with("reset"),
-        lang.t("默认", "Default"),
+        lang.t("color.default"),
         p,
         false,
     )
-    .on_hover_text(lang.t(
-        "恢复随系统明暗切换的默认颜色",
-        "Restore the color for the system theme",
-    ))
+    .on_hover_text(lang.t("color.restore_the_color_for_the_system_theme"))
     .clicked()
     {
         *current = None;
@@ -180,10 +177,7 @@ fn picker(
             ui.set_width(PICKER_W);
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             let header = region(ui, 34.0);
-            let title = match lang {
-                Lang::Zh => format!("{label}颜色"),
-                Lang::En => format!("{label} color"),
-            };
+            let title = lang.format("color_picker.title", &[("label", label)]);
             ui.painter().text(
                 header.min,
                 egui::Align2::LEFT_TOP,
@@ -194,7 +188,7 @@ fn picker(
             ui.painter().text(
                 header.left_bottom(),
                 egui::Align2::LEFT_BOTTOM,
-                lang.t("调整后即时生效", "Changes apply instantly"),
+                lang.t("color.changes_apply_instantly"),
                 FontId::proportional(10.5),
                 p.subtext,
             );
@@ -204,7 +198,7 @@ fn picker(
             );
             let response = ui.interact(cross, id.with("close"), Sense::click());
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, lang.t("关闭", "Close"))
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, lang.t("common.close"))
             });
             ui.painter().rect_filled(cross, 7.0, p.chip);
             let c = cross.center();
@@ -220,7 +214,7 @@ fn picker(
             surface::focus(ui.painter(), cross, &response, p);
             close |= response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(lang.t("关闭", "Close"))
+                .on_hover_text(lang.t("common.close"))
                 .clicked();
             ui.add_space(12.0);
             let sv = region(ui, 126.0);
@@ -236,7 +230,7 @@ fn picker(
             ui.painter().text(
                 caption.left_center(),
                 egui::Align2::LEFT_CENTER,
-                lang.t("常用颜色", "Color presets"),
+                lang.t("color.color_presets"),
                 FontId::proportional(10.5),
                 p.subtext,
             );
@@ -345,7 +339,7 @@ fn picker(
                 ui,
                 reset,
                 id.with("reset"),
-                lang.t("恢复默认", "Reset default"),
+                lang.t("color.reset_default"),
                 p,
                 false,
             )
@@ -358,7 +352,7 @@ fn picker(
                 egui::pos2(footer.right() - 70.0, footer.top()),
                 Vec2::new(70.0, CONTROL_H),
             );
-            close |= button(ui, done, id.with("done"), lang.t("完成", "Done"), p, true).clicked();
+            close |= button(ui, done, id.with("done"), lang.t("color.done"), p, true).clicked();
         });
     close || modal.should_close()
 }
@@ -465,10 +459,7 @@ fn hex_field(
         egui::StrokeKind::Inside,
     );
     let focused = input.has_focus();
-    input.on_hover_text(lang.t(
-        "输入十六进制色值，例如 #43D394",
-        "Enter a hex color, such as #43D394",
-    ));
+    input.on_hover_text(lang.t("color.enter_a_hex_color_such_as_43d394"));
     ui.data_mut(|data| {
         if focused {
             data.insert_temp(draft_id, draft);
@@ -495,7 +486,7 @@ fn saturation_value(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Slider,
             true,
-            lang.t("饱和度与亮度", "Saturation and brightness"),
+            lang.t("color.saturation_and_brightness"),
         )
     });
     if let Some(pos) = response.interact_pointer_pos() {
@@ -529,10 +520,7 @@ fn saturation_value(
     surface::focus(ui.painter(), rect, &response, p);
     response
         .on_hover_cursor(egui::CursorIcon::Crosshair)
-        .on_hover_text(lang.t(
-            "左右调整饱和度，上下调整亮度",
-            "Left/right: saturation. Up/down: brightness.",
-        ));
+        .on_hover_text(lang.t("color.left_right_saturation_up_down_brightness"));
     *hsv != before
 }
 
@@ -540,7 +528,7 @@ fn hue_slider(ui: &mut egui::Ui, rect: Rect, p: &Palette, lang: Lang, hue: &mut 
     let before = *hue;
     let response = ui.interact(rect, ui.id().with("hue"), Sense::click_and_drag());
     response.widget_info(|| {
-        egui::WidgetInfo::slider(ui.is_enabled(), *hue as f64 * 360.0, lang.t("色相", "Hue"))
+        egui::WidgetInfo::slider(ui.is_enabled(), *hue as f64 * 360.0, lang.t("color.hue"))
     });
     if let Some(pos) = response.interact_pointer_pos() {
         *hue = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
@@ -571,10 +559,7 @@ fn hue_slider(ui: &mut egui::Ui, rect: Rect, p: &Palette, lang: Lang, hue: &mut 
     surface::focus(ui.painter(), rect, &response, p);
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(lang.t(
-            "拖动或用左右方向键调整色相",
-            "Drag or use left/right arrows to adjust hue",
-        ));
+        .on_hover_text(lang.t("color.drag_or_use_left_right_arrows_to_adjust"));
     *hue != before
 }
 
@@ -752,7 +737,7 @@ mod tests {
     #[test]
     fn presets_apply_immediately_and_reset_restores_automatic_color() {
         for dark in [false, true] {
-            for lang in [Lang::Zh, Lang::En] {
+            for lang in [Lang::ZH_CN, Lang::EN] {
                 let mut ui = Controls::new(dark, lang);
                 ui.click(ui.root.with("swatch"));
                 assert!(ui.is_open());
@@ -774,7 +759,7 @@ mod tests {
 
     #[test]
     fn keyboard_and_backdrop_close_without_activating_background() {
-        let mut ui = Controls::new(true, Lang::En);
+        let mut ui = Controls::new(true, Lang::EN);
         let swatch = ui.root.with("swatch");
         ui.ctx.memory_mut(|memory| memory.request_focus(swatch));
         ui.run(vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
@@ -794,7 +779,7 @@ mod tests {
 
     #[test]
     fn incomplete_hex_drafts_do_not_replace_the_last_valid_color() {
-        let mut ui = Controls::new(true, Lang::En);
+        let mut ui = Controls::new(true, Lang::EN);
         let input = ui.root.with("hex-input");
         let command = egui::Modifiers {
             ctrl: true,
@@ -836,8 +821,8 @@ mod tests {
             frame(&ctx, events, |ui| {
                 root = ui.id();
                 state.sync(current.unwrap());
-                let changed = saturation_value(ui, field, &p, Lang::En, &mut state.hsv)
-                    | hue_slider(ui, hue, &p, Lang::En, &mut state.hsv.h);
+                let changed = saturation_value(ui, field, &p, Lang::EN, &mut state.hsv)
+                    | hue_slider(ui, hue, &p, Lang::EN, &mut state.hsv.h);
                 if changed {
                     state.commit(&mut current);
                 }

@@ -1,34 +1,14 @@
 //! 主题与字体。
 //!
-//! egui 自带字体不含中文，直接显示会变成方块。两个平台的系统字体形态不一样：
-//!
-//! - macOS 没有单文件 CJK `.ttf`（大多是 `.ttc` 字体集合），只有
-//!   `/System/Library/Fonts/Supplemental/Arial Unicode.ttf` 是单文件；
-//! - Windows 全是 `.ttc`（微软雅黑、宋体）或单文件（黑体、等线），
-//!   但 egui 的 `FontData` 带 `index` 字段，`.ttc` 取第 0 个字面是支持的。
-//!
-//! 找不到就把界面切成英文 —— 绝不能给用户看一屏方块。
+//! 字体补齐与语言选择相互独立。egui 自带字体缺少部分字形，优先使用系统
+//! Unicode/CJK 字体补齐；语言由 i18n 模块根据用户设置或系统首选语言决定。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
 
-/// 界面语言。字体缺失时自动退回英文。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    Zh,
-    En,
-}
-
-impl Lang {
-    pub fn t(self, zh: &'static str, en: &'static str) -> &'static str {
-        match self {
-            Self::Zh => zh,
-            Self::En => en,
-        }
-    }
-}
+pub use crate::i18n::Lang;
 
 /// 一个候选字体：文件路径 + 集合内的字面序号（单文件字体恒为 0）。
 struct Candidate {
@@ -46,6 +26,14 @@ fn candidates() -> Vec<Candidate> {
             },
             Candidate {
                 path: PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+                index: 0,
+            },
+            Candidate {
+                path: PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+                index: 0,
+            },
+            Candidate {
+                path: PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
                 index: 0,
             },
         ]
@@ -285,11 +273,5 @@ mod tests {
         ]));
         // PNG 之类的二进制不能被当成字体读进去
         assert!(!looks_like_font(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
-    }
-
-    #[test]
-    fn lang_switches_copy() {
-        assert_eq!(Lang::Zh.t("网络", "Network"), "网络");
-        assert_eq!(Lang::En.t("网络", "Network"), "Network");
     }
 }

@@ -59,6 +59,7 @@ fn append_settings(report: &mut String, directory: &Path) {
         "theme",
         "lang",
         "tray_mode",
+        "tray_icon",
         "tray_badge",
         "performance_enabled",
         "performance_temperature",
@@ -285,7 +286,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.path().join("settings.conf"),
-            "theme=dark\npinned_apps=secret.exe\ntoken=secret\nmax_apps=10\n",
+            "theme=dark\ntray_icon=off\ntray_badge=on\npinned_apps=secret.exe\ntoken=secret\nmax_apps=10\n",
         )
         .unwrap();
         fs::write(root.path().join("history.db"), "private traffic").unwrap();
@@ -294,6 +295,8 @@ mod tests {
         append_settings(&mut report, root.path());
         assert!(report.contains("Win32 2"));
         assert!(report.contains("theme=dark"));
+        assert!(report.contains("tray_icon=off"));
+        assert!(report.contains("tray_badge=on"));
         assert!(report.contains("Unavailable:"));
         assert!(!report.contains("secret"));
         assert!(!report.contains("private traffic"));

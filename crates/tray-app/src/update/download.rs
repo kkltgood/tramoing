@@ -14,6 +14,46 @@ use super::{
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+pub(super) fn installer_path(version: &str, root: &Path) -> Result<PathBuf, String> {
+    Ok(root
+        .join(parse_version(version)?.to_string())
+        .join(if cfg!(windows) {
+            "Tramoing-setup.exe"
+        } else {
+            "Tramoing.dmg"
+        }))
+}
+
+/// Recheck a completed download on a worker, without making any network requests.
+/// A missing, replaced or damaged package leaves the saved task available to resume.
+pub(super) fn restore(
+    asset: &Asset,
+    version: &str,
+    root: &Path,
+    stop: &Receiver<()>,
+) -> Result<Option<PathBuf>, String> {
+    if stopped(Some(stop)) {
+        return Ok(None);
+    }
+    let path = installer_path(version, root)?;
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("打开已下载的安装包失败：{error}")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("读取安装包信息失败：{e}"))?;
+    if !metadata.is_file() || (asset.size > 0 && metadata.len() != asset.size) {
+        return Ok(None);
+    }
+    let hash = sha256_reader(file).map_err(|e| format!("校验已下载的安装包失败：{e}"))?;
+    if hash != asset.sha256.trim().to_ascii_lowercase() || stopped(Some(stop)) {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
 pub(super) fn saved_progress(asset: &Asset, version: &str, root: &Path) -> Option<f32> {
     let hash = asset.sha256.trim().to_ascii_lowercase();
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -197,7 +237,7 @@ impl PartialDownload {
         }
         let version = parse_version(version)?.to_string();
         http_url(&asset.url)?;
-        let dir = root.join(version);
+        let dir = root.join(&version);
         std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败：{e}"))?;
         // Identity is the expected content, not a possibly expiring signed URL.
         // A replacement asset (even under the same version/URL) cannot reuse old bytes.
@@ -220,11 +260,7 @@ impl PartialDownload {
             file,
             path,
             state_path,
-            dest: dir.join(if cfg!(windows) {
-                "Tramoing-setup.exe"
-            } else {
-                "Tramoing.dmg"
-            }),
+            dest: installer_path(&version, root)?,
             state,
             size: asset.size,
             hash,

@@ -22,10 +22,7 @@ pub fn diagnostics_result(lang: crate::theme::Lang) -> Option<Result<std::path::
             .join("diagnostics")
             .join("Tramoing-diagnostics-20261125T095231Z-preview.txt"))),
         Ok("settings-diagnostics-error") => Some(Err(lang
-            .t(
-                "无法写入报告文件，请检查目标文件夹的存储权限（系统错误 5）。",
-                "Could not write the report. Check the destination folder's permissions (OS error 5).",
-            )
+            .t("preview.could_not_write_the_report_check_the_destination")
             .into())),
         _ => None,
     }
@@ -41,7 +38,7 @@ pub fn open_color_picker(ctx: &egui::Context, label: &str, lang: crate::theme::L
         return false;
     }
     let target = match std::env::var("TM_CAPTURE_STATE").as_deref() {
-        Ok("settings-color-download") => lang.t("下载", "Download"),
+        Ok("settings-color-download") => lang.t("network.download"),
         Ok("settings-color-gpu") => "GPU",
         _ => return false,
     };
@@ -72,16 +69,19 @@ pub fn prepare_network_panel(
     if state.starts_with("network-add") {
         panel.open();
         if state == "network-add-invalid" {
-            panel.preview_invalid_path(lang);
+            panel.preview_invalid_path();
         }
         if state == "network-add-offline" {
-            access.error = Some("未连接到网络控制助手，请重新运行安装程序以更新助手。".into());
+            access.error = Some(lang.t("preview.network_helper_offline").into());
         }
     }
 }
 
 /// 只给隔离的渲染验证注入状态；不会断开或启动系统的真实采集助手。
-pub fn preview_snapshot(snapshot: crate::engine::Snapshot) -> crate::engine::Snapshot {
+pub fn preview_snapshot(
+    snapshot: crate::engine::Snapshot,
+    lang: crate::theme::Lang,
+) -> crate::engine::Snapshot {
     if !enabled() {
         return snapshot;
     }
@@ -94,11 +94,8 @@ pub fn preview_snapshot(snapshot: crate::engine::Snapshot) -> crate::engine::Sna
             }
         }
         Ok("empty") => None,
-        Ok("timeout") => Some("采集暂时中断，正在重新连接".into()),
-        Ok("disconnected") => Some(
-            "未连接到采集助手，请重新运行安装程序以修复采集助手；连接命名管道失败（Win32 错误 2）"
-                .into(),
-        ),
+        Ok("timeout") => Some(lang.t("preview.collector_reconnecting").into()),
+        Ok("disconnected") => Some(lang.t("preview.collector_disconnected").into()),
         _ => return snapshot,
     };
     crate::engine::Snapshot {

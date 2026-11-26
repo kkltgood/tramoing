@@ -1,0 +1,23 @@
+[
+  {
+    "code": "en",
+    "native_name": "English",
+    "file": "en.json",
+    "aliases": [
+      "en-US",
+      "en-GB"
+    ]
+  },
+  {
+    "code": "zh-CN",
+    "native_name": "简体中文",
+    "file": "zh-CN.json",
+    "aliases": [
+      "zh",
+      "zh-Hans",
+      "zh-Hans-CN",
+      "zh-SG",
+      "zh-Hans-SG"
+    ]
+  }
+]

@@ -273,28 +273,40 @@ impl Updater {
         }
         let version = avail.version.clone();
         self.pending_download = Some((avail.clone(), root.clone()));
+        let pct = download::saved_progress(&asset, &version, &root).unwrap_or(0.0);
+        self.start_download_task(version.clone(), pct, move |tx, stopped| {
+            download::run(&asset, &version, tx, &root, stopped)
+        });
+    }
+
+    fn start_download_task(
+        &mut self,
+        version: String,
+        pct: f32,
+        work: impl FnOnce(&Sender<Event>, &Receiver<()>) -> Result<Option<PathBuf>, String>
+            + Send
+            + 'static,
+    ) {
         let (stop, stopped) = channel();
         self.download_stop = Some(stop);
         self.set(Phase::Downloading {
             version: version.clone(),
-            pct: download::saved_progress(&asset, &version, &root).unwrap_or(0.0),
+            pct,
         });
         let tx = self.tx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("update-download".into())
-            .spawn(
-                move || match download::run(&asset, &version, &tx, &root, &stopped) {
-                    Ok(Some(path)) => {
-                        let _ = tx.send(Event::Downloaded { version, path });
-                    }
-                    Ok(None) => {
-                        let _ = tx.send(Event::DownloadPaused);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Event::DownloadFailed(e));
-                    }
-                },
-            )
+            .spawn(move || match work(&tx, &stopped) {
+                Ok(Some(path)) => {
+                    let _ = tx.send(Event::Downloaded { version, path });
+                }
+                Ok(None) => {
+                    let _ = tx.send(Event::DownloadPaused);
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::DownloadFailed(e));
+                }
+            })
         {
             self.download_stop = None;
             self.set(Phase::Error(format!("无法启动下载：{e}")));
@@ -357,7 +369,16 @@ impl Updater {
             pct,
             error: None,
         });
-        self.pending_download = Some((available, root));
+        self.pending_download = Some((available.clone(), root.clone()));
+        if download::installer_path(&available.version, &root).is_ok_and(|path| path.is_file()) {
+            // Hashing a large installer must not block startup or the UI. Reuse the
+            // download lifecycle to prevent checks/resumes from racing this worker.
+            let asset = asset.clone();
+            let version = available.version;
+            self.start_download_task(version.clone(), pct, move |_, stopped| {
+                download::restore(&asset, &version, &root, stopped)
+            });
+        }
     }
 
     fn download_progress(&self) -> Option<(String, f32)> {
@@ -474,9 +495,8 @@ impl Updater {
                 }
                 Event::Downloaded { version, path } => {
                     self.download_stop = None;
-                    if let Some((_, root)) = self.pending_download.take() {
-                        let _ = std::fs::remove_file(root.join("pending.json"));
-                    }
+                    // Keep the task until its version is installed, including when
+                    // the user quits after download but before confirming installation.
                     log_line(&format!("已下载 {}：{}", version, path.display()));
                     self.set(Phase::Ready {
                         version,
@@ -1339,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn restarting_restores_the_pending_update_and_a_completed_resume_clears_it() {
+    fn restarting_keeps_a_completed_update_until_its_version_is_installed() {
         let root = tempfile::tempdir().unwrap();
         let (url, server) = serve_download(|mut stream| {
             stream
@@ -1374,7 +1394,32 @@ mod tests {
         }
         server.join().unwrap();
         assert!(matches!(updater.phase, Phase::Ready { .. }));
-        assert!(!root.path().join("pending.json").exists());
+        assert!(root.path().join("pending.json").exists());
+        let Phase::Ready { path, .. } = &updater.phase else {
+            unreachable!();
+        };
+        let completed_path = path.clone();
+        drop(updater);
+
+        // The server has exited. Restarting must verify the saved installer locally,
+        // retaining the user's confirmation step instead of downloading it again.
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updater.is_busy() {
+            updater.poll();
+            assert!(Instant::now() < deadline, "restore did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            updater.phase,
+            Phase::Ready {
+                version: available.version.clone(),
+                path: completed_path,
+                launch_error: None,
+            }
+        );
+        assert!(root.path().join("pending.json").exists());
 
         let already_installed = Available {
             version: CURRENT.into(),
@@ -1389,6 +1434,137 @@ mod tests {
         updater.restore_download_from(root.path().to_owned());
         assert_eq!(updater.phase, Phase::Idle);
         assert!(!root.path().join("pending.json").exists());
+    }
+
+    #[test]
+    fn restarting_recovers_an_installer_completed_before_the_ui_polled() {
+        let root = tempfile::tempdir().unwrap();
+        let (url, server) = serve_download(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+                .unwrap();
+        });
+        let available = Available {
+            version: "999.0.0".into(),
+            notes: String::new(),
+            pub_date: String::new(),
+            homepage: String::new(),
+            asset: Some(Asset {
+                url,
+                size: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            }),
+        };
+        let mut updater = Updater::new();
+        updater.download_into(&available, root.path().to_owned());
+        let completed_path = loop {
+            match updater.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::Downloaded { path, .. } => break path,
+                Event::Progress(_) => {}
+                _ => panic!("unexpected download event"),
+            }
+        };
+        assert!(matches!(updater.phase, Phase::Downloading { .. }));
+        drop(updater); // The UI never applied the completion event.
+        server.join().unwrap();
+
+        let mut restored = Updater::new();
+        restored.restore_download_from(root.path().to_owned());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while restored.is_busy() {
+            restored.poll();
+            assert!(Instant::now() < deadline, "restore did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            restored.phase,
+            Phase::Ready {
+                version: available.version,
+                path: completed_path,
+                launch_error: None,
+            }
+        );
+        assert!(root.path().join("pending.json").exists());
+    }
+
+    #[test]
+    fn restore_verifies_cached_installers_and_leaves_incomplete_tasks_paused_offline() {
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        for (body, size, expected_hash, ready) in [
+            (Some("abc"), 3, hash, true),
+            (Some("abc"), 0, hash, true),
+            (Some("bad"), 3, hash, false), // Corrupt bytes of the same length.
+            (Some("abc"), 4, hash, false), // A correct hash cannot waive a size mismatch.
+            (
+                Some("abc"),
+                3,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                false,
+            ),
+            (None, 3, hash, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let available = Available {
+                version: "999.0.0".into(),
+                notes: String::new(),
+                pub_date: String::new(),
+                homepage: String::new(),
+                asset: Some(Asset {
+                    url: format!("http://{}/setup.exe", listener.local_addr().unwrap()),
+                    size,
+                    sha256: expected_hash.into(),
+                }),
+            };
+            tm_store::files::atomic_write(
+                &root.path().join("pending.json"),
+                &serde_json::to_vec(&available).unwrap(),
+            )
+            .unwrap();
+            let dir = root.path().join(&available.version);
+            std::fs::create_dir(&dir).unwrap();
+            let path = download::installer_path(&available.version, root.path()).unwrap();
+            if let Some(body) = body {
+                std::fs::write(&path, body).unwrap();
+            }
+            let partial = dir.join(format!("{PLATFORM}-{expected_hash}.part"));
+            std::fs::write(&partial, b"a").unwrap();
+            let mut restored = Updater::new();
+            restored.restore_download_from(root.path().to_owned());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while restored.is_busy() {
+                restored.poll();
+                assert!(Instant::now() < deadline, "restore did not finish");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if ready {
+                assert_eq!(
+                    restored.phase,
+                    Phase::Ready {
+                        version: available.version,
+                        path,
+                        launch_error: None,
+                    }
+                );
+            } else {
+                assert_eq!(
+                    restored.phase,
+                    Phase::Paused {
+                        version: available.version,
+                        pct: 1.0 / size as f32,
+                        error: None,
+                    }
+                );
+            }
+            assert_eq!(std::fs::read(partial).unwrap(), b"a");
+            assert!(root.path().join("pending.json").exists());
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "restoring must not request the server"
+            );
+        }
     }
 
     #[test]

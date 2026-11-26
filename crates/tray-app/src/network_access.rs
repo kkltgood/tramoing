@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use tm_windows::network_policy::{same_path, validate_path, Request, Rule};
 
+use crate::theme::Lang;
+
 pub struct NetworkAccess {
     pub rules: Vec<Rule>,
     pub verified: bool,
@@ -118,7 +120,7 @@ impl NetworkAccess {
         }
     }
 
-    pub fn tick(&mut self, ctx: &egui::Context) -> Option<String> {
+    pub fn tick(&mut self, ctx: &egui::Context, lang: Lang) -> Option<String> {
         let result = self.job.as_ref().and_then(|job| match job.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -139,15 +141,12 @@ impl NetworkAccess {
                     self.save_cache();
                     if let Some(path) = changed {
                         log::info!(target: "tramoing::network", "网络规则已核验，blocked={}", self.rule(&path).is_some());
-                        message = Some(format!(
-                            "{}：{}",
-                            tm_core::pretty_name(&path),
-                            if self.rule(&path).is_some() {
-                                "已断网"
-                            } else {
-                                "已移除断网限制"
-                            }
-                        ));
+                        let key = if self.rule(&path).is_some() {
+                            "network.app_blocked"
+                        } else {
+                            "network.app_unblocked"
+                        };
+                        message = Some(lang.format(key, &[("app", &tm_core::pretty_name(&path))]));
                     }
                 }
                 Err(error) => {
@@ -156,7 +155,9 @@ impl NetworkAccess {
                     }
                     self.verified = false;
                     if changed.is_some() {
-                        message = Some(error.clone());
+                        message = Some(
+                            lang.format("network.control_failed_detail", &[("error", &error)]),
+                        );
                     }
                     self.error = Some(error);
                 }
@@ -169,13 +170,13 @@ impl NetworkAccess {
         message
     }
 
-    pub fn unavailable_reason(&self) -> Option<&str> {
+    pub fn unavailable_reason(&self, lang: Lang) -> Option<String> {
         if self.mock {
-            Some("演示模式不修改系统网络规则")
+            Some(lang.t("network.demo_rules_unchanged").into())
         } else if let Some(error) = self.error.as_deref() {
-            Some(error)
+            Some(lang.format("network.control_failed_detail", &[("error", error)]))
         } else if !self.verified {
-            Some("正在核验系统网络规则")
+            Some(lang.t("network.verifying_rules").into())
         } else {
             None
         }
@@ -214,11 +215,37 @@ mod tests {
         tx.send(Err("助手不可用".into())).unwrap();
         state.job = Some(rx);
         assert_eq!(
-            state.tick(&egui::Context::default()),
-            Some("助手不可用".into())
+            state.tick(&egui::Context::default(), Lang::EN),
+            Some("Network access could not be updated: 助手不可用".into())
         );
         assert!(!state.verified);
         assert!(state.rule(r"C:\app.exe").is_some());
         assert!(!state.busy());
+    }
+
+    #[test]
+    fn rule_status_is_formatted_using_the_current_language() {
+        let mut state = NetworkAccess::new(true);
+        let english = state.unavailable_reason(Lang::EN).unwrap();
+        let chinese = state.unavailable_reason(Lang::ZH_CN).unwrap();
+        assert_eq!(english, "Demo mode does not change system network rules");
+        assert_eq!(chinese, "演示模式不修改系统网络规则");
+        for (lang, expected) in [
+            (Lang::EN, "app: Network blocked"),
+            (Lang::ZH_CN, "app：已断网"),
+        ] {
+            state.pending_path = Some(r"C:\app.exe".into());
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(vec![Rule {
+                path: r"C:\app.exe".into(),
+                complete: true,
+            }]))
+            .unwrap();
+            state.job = Some(rx);
+            assert_eq!(
+                state.tick(&egui::Context::default(), lang).as_deref(),
+                Some(expected)
+            );
+        }
     }
 }

@@ -49,6 +49,61 @@ Windows 网络控制使用独立的账户 SID 命名管道；拒绝远程客户�
 
 数据迁移由主程序在打开设置、数据库和实例锁之前执行：锁住旧 UI，使用 SQLite 快照导入数据库（包括 WAL）、按缺失文件导入设置与 pending，最后写迁移标记；不覆盖新文件，保留旧目录备份。自启仅在旧项存在时迁移，禁用时同时清理旧项。Windows 安装器先停旧进程，注册新任务后清理旧任务、ETW、快捷方式、执行文件及注册项，主程序/助手必须成套升级。macOS 安装器接受旧 bundle 作为替换/回滚目标，新安装包只接受当前 id；旧程序内置更新器会拒绝新 id，首次跨标识升级需手动打开新版 DMG，之后恢复应用内更新。
 
+## 菜单栏与任务栏显示配置
+
+`Settings::tray_icon` 控制应用图标，`Settings::tray_badge` 控制实时网速，`performance_enabled` 控制 CPU/GPU；三个布尔开关相互独立。图标和网速默认开启，性能监控默认关闭。界面保留至少一个可点击入口；解析配置后若三项均关闭，则恢复图标，性能监控单独开启时不额外开启图标。
+
+macOS 的应用图标、网速和 CPU/GPU 各使用独立的 `NSStatusItem`，分别控制可见性和点击锚点；关闭时隐藏并保留原生项，重新开启不会清空其身份。各项采用稳定的 autosave 名称，应用设置优先于系统保存的可见性。
+
+保存时写入 `tray_icon=on|off`、`tray_badge=on|off`，不再写 `tray_mode`。旧 macOS 三档映射为 `(图标, 网速)`：`both/full → (true, true)`、`speed/compact → (false, true)`、`icon → (true, false)`。旧 macOS 文件虽然也保存 `tray_badge`，实际网速显示由 `tray_mode` 决定，因此迁移时后者优先；Windows 则优先使用显式 `tray_badge`，未提供时取旧模式的网速值。没有有效旧模式时使用显式网速值或默认值。旧 Windows 始终显示系统托盘图标，迁移时保留这一行为，不因旧 `tray_mode=speed/compact` 隐藏图标；只有新格式显式 `tray_icon` 才能关闭它。
+
+`tray_icon` 键的存在标记新格式，新格式忽略旧 `tray_mode`，独立解析图标与网速；缺失或非法值使用默认值，重复键保留最后一个有效值。所有显示键读完后再合并迁移并检查可点击入口，结果不依赖不同键的行序。配置测试同时覆盖两个平台的旧值优先级、新旧键混合、独立组合与保存重读。
+
+## 语言与翻译
+
+设置 → 通用中的语言下拉由 `crates/tray-app/src/i18n/locales.json` 生成，目前提供“跟随系统”、简体中文和 English。选择后即时生效并保存。`Lang` 是注册表中的语言标识，界面通过稳定的消息 key 取文案，不为每种语言增加枚举分支。
+
+注册表中每个条目的字段如下：
+
+| 字段 | 必填 | 含义 |
+| --- | --- | --- |
+| `code` | 是 | 稳定的语言代码，例如 `en`、`zh-CN`；写入设置文件 |
+| `native_name` | 是 | 语言自身的名称，用于下拉选项 |
+| `file` | 是 | `src/i18n/locales/` 内的 JSON 文件名，不接受目录路径 |
+| `aliases` | 否 | 与该语言等价的代码数组，例如 `zh-Hans`；不能与其他代码或别名冲突 |
+| `fallback` | 否 | 缺少某条译文时先尝试的已注册语言代码；不允许循环 |
+
+增加语言时，在 `src/i18n/locales/` 新建翻译文件，再向注册表追加条目。例如法语可以注册为：
+
+```json
+{
+  "code": "fr",
+  "native_name": "Français",
+  "file": "fr.json",
+  "aliases": ["fr-FR"],
+  "fallback": "en"
+}
+```
+
+翻译文件是消息 key 到字符串的 JSON 对象，以 `en.json` 为基础补齐译文；英文是最终回退资源，必须保留。缺少的翻译条目按显式 `fallback` 链查找，最后回退英文。已有条目不能为空，不能使用英文资源里不存在的 key。`build.rs` 会验证并将资源嵌入二进制；新增或修改资源后需要重新编译，应用不会从用户目录动态加载语言包。现有 `zh-CN` 注册项也须保留，以兼容已有设置。
+
+静态文案使用 `lang.t("message.key")`。含变量的完整句子使用 `lang.format("message.key", &[("name", name), ("amount", amount)])`，译文中写 `{name}`、`{amount}`；可调整参数顺序，但各语言的参数名称集合必须与英文一致。参数名使用 ASCII 字母、数字或下划线，不能以数字开头。需要显示字面量大括号时写 `{{`、`}}`。替换只解析模板一次，参数值里的 `{...}` 按原文显示；不要通过拼接多个译文片段固定某一种语言的语序。
+
+“跟随系统”使用 macOS `NSLocale.preferredLanguages` 或 Windows `GetUserPreferredUILanguages` 的首选语言顺序，按代码/别名、逐级地区回退、已注册的同语言变体匹配，无匹配时使用英文。首次解析系统语言后缓存到当前进程，系统语言改变后重启应用生效；手动切换应用语言即时生效。主界面与启动错误弹框共用解析入口。字体加载独立于语言选择，找到中文字体不会改变系统语言结果。
+
+设置文件保存 `lang=system` 或语言代码。旧 `auto`、`zh`、`en` 分别兼容为 `system`、`zh-CN`、`en`，下次保存使用新值；未知语言配置使用默认的“跟随系统”。语言代码比较忽略大小写，并接受下划线作为连字符。
+
+相关验证命令：
+
+```sh
+cargo test -p tray-app --locked i18n::
+cargo test -p tray-app --locked settings::tests::language_preferences_migrate_and_keep_stable_locale_codes
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+构建会检查资源格式、英文基础资源、别名冲突、回退链和参数一致性；测试另检查源码中直接使用的消息 key 是否存在英文译文，以及配置迁移、系统语言匹配和模板替换。增加语言后，还需在 Windows/macOS 验证字体字形、较长译文、菜单栏提示、错误弹框、下拉键盘操作和重启后的选择保留。目前正式资源只有简体中文与英文；右到左布局和复杂复数规则未专门实现，需要相应语言时应另行适配并验证。
+
 ## 隔离调试
 
 `--mock` 不写持久流量历史，但界面设置仍会保存。使用 `TM_DATA_DIR` 隔离设置、日志和实例锁。
@@ -175,7 +230,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 省略 `--arch` 时只构建本机架构，不受已安装 target 数量影响；显式 `--arch universal` 仍可生成本地通用包，自动发布只使用 `arm64` 和 `x64`。缺少指定的 target 时会报错并提示安装命令，不会悄悄改用其他架构。支持 `CARGO_TARGET_DIR`。产物为 `dist/macos-<arch>/Tramoing.app`、`dist/Tramoing-<version>-macos-<arch>.dmg` 和对应的 `.sha256`；包内应用仍名为 `Tramoing.app`。打包时校验 Mach-O 架构，部署目标默认为 macOS 11.0。生成 DMG 需要 Python 3.10+；打包脚本在 `target/dmgbuild-venv` 中安装固定版本的 `dmgbuild`，也可用 `DMGBUILD_PYTHON` 指向预先准备好的 Python 环境。`--no-dmg` 不需要此工具。
 
-DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-settings.py` 固定写入 `.DS_Store`，不需要 Finder 自动化授权或交互式桌面。背景源为 `dmg-background.svg`，修改设计后同步生成 700×460 的 PNG 和 1400×920 的 `@2x` PNG。安装器支持拖入 Applications，也支持从 DMG 双击应用后确认“安装并打开”；普通账户无法写入 `/Applications` 时，首次安装使用 `~/Applications`。已有安装优先沿用其路径，不会因权限不足悄悄另装一份。安装、更新或第一次启动后展开主面板一次，失焦收起仍正常生效。
+DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-settings.py` 固定写入 `.DS_Store`，不需要 Finder 自动化授权或交互式桌面。背景源为 `dmg-background.svg`，修改设计后同步生成 700×460 的 PNG 和 1400×920 的 `@2x` PNG。安装器支持拖入 Applications，也支持从 DMG 双击应用后确认“安装并打开”；普通账户无法写入 `/Applications` 时，首次安装使用 `~/Applications`。已有安装优先沿用其路径，不会因权限不足悄悄另装一份。全新安装首次启动时等待菜单栏入口完成布局后展开主面板一次，失焦正常收起；已有安装升级或回滚后使用 `--after-update` 在后台启动，不自动展开。旧更新助手传入的 `--after-install` 由已有设置、历史或 `ui-started` 标记识别，避免重复展示；首次启动标记在主界面实例创建成功后保存，不依赖用户修改设置。
 
 打包结束自动运行 `scripts/verify-macos-package.sh`：只读挂载并检查 DMG 完整性、签名、包内版本和二进制、Applications 链接、图标位置及 Retina 背景。原生安装测试随 macOS 的 `cargo test --workspace --locked` 执行，用隔离的临时签名应用检查暂存、版本核对和拒绝降级。手工验收应额外覆盖：DMG 双击安装和取消、拖拽后首次启动、旧版到新版自动更新、没有目录写权限、Gatekeeper 和安装后主面板。
 
@@ -190,7 +245,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.1.9` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.2.0` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -207,15 +262,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.1.9` 为例）：
+发布步骤（以当前 `0.2.0` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.1.9.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.0.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.1.9 -m "Release v0.1.9"
-   git push opensource v0.1.9
+   git tag -a v0.2.0 -m "Release v0.2.0"
+   git push opensource v0.2.0
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。

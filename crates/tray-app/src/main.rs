@@ -20,6 +20,7 @@ mod diagnostics;
 mod engine;
 mod error_dialog;
 mod export;
+mod i18n;
 mod icon;
 mod icons;
 mod instance;
@@ -30,6 +31,7 @@ mod network_panel;
 #[cfg(any(target_os = "macos", windows))]
 mod performance;
 mod settings;
+mod startup;
 mod surface;
 mod theme;
 #[cfg(debug_assertions)]
@@ -50,17 +52,22 @@ fn main() -> eframe::Result<()> {
         if reporter { "reporter" } else { "ui" },
         update::CURRENT,
     ) {
-        eprintln!("无法初始化诊断日志：{error}");
+        let lang = i18n::resolve(settings::Settings::load().lang);
+        eprintln!(
+            "{}",
+            lang.format("cli.logging_failed", &[("error", &error.to_string())])
+        );
         tm_diagnostics::report_error("tramoing::logging", &format!("无法初始化诊断日志：{error}"));
     }
     // 报告进程绕过采样、安装、数据迁移和单实例锁，不再安装崩溃启动器。
     if reporter {
         let pending = error_dialog::take_pending_crash();
+        let lang = i18n::resolve(settings::Settings::load().lang);
         error_dialog::report_fatal(
             args.get(1)
                 .map(String::as_str)
                 .or(pending.as_deref())
-                .unwrap_or("应用运行失败 / Application failed"),
+                .unwrap_or(lang.t("errors.application_failed")),
         );
         return Ok(());
     }
@@ -91,7 +98,10 @@ fn main() -> eframe::Result<()> {
             let message = format!("程序启动或运行失败：{error}");
             log::error!(target: "tramoing::startup", "{message}");
             if interactive {
-                error_dialog::report_fatal(&message);
+                let lang = i18n::resolve(settings::Settings::load().lang);
+                error_dialog::report_fatal(
+                    &lang.format("errors.startup_failed", &[("error", &error.to_string())]),
+                );
             }
         }
     }
@@ -101,11 +111,21 @@ fn main() -> eframe::Result<()> {
 fn run(args: &[String]) -> eframe::Result<()> {
     // This path works even if migration, the collector, or window creation fails.
     if args.iter().any(|arg| arg == "--export-diagnostics") {
+        let lang = i18n::resolve(settings::Settings::load().lang);
         match diagnostics::export_report("命令行诊断；实时状态请参考下方日志") {
-            Ok(path) => println!("诊断报告：{}", path.display()),
+            Ok(path) => println!(
+                "{}",
+                lang.format(
+                    "cli.diagnostic_report",
+                    &[("path", &path.display().to_string())]
+                )
+            ),
             Err(error) => {
                 log::error!(target: "tramoing::diagnostics", "导出失败：{error}");
-                eprintln!("导出诊断失败：{error}");
+                eprintln!(
+                    "{}",
+                    lang.format("cli.diagnostic_export_failed", &[("error", &error)])
+                );
                 std::process::exit(1);
             }
         }
@@ -133,11 +153,6 @@ fn run(args: &[String]) -> eframe::Result<()> {
     if args.iter().any(|a| a == "--show") {
         std::env::set_var("TM_SHOW_ON_START", "1");
     }
-    // Installed applications reveal the panel once, with normal blur behavior.
-    if args.iter().any(|a| a == "--after-install") {
-        std::env::set_var("TM_SHOW_ON_START", "1");
-        std::env::set_var("TM_AFTER_INSTALL", "1");
-    }
     // 直接打开设置页，省得每次截图都要手动点一下
     if args.iter().any(|a| a == "--settings") {
         std::env::set_var("TM_SHOW_ON_START", "1");
@@ -153,39 +168,54 @@ fn run(args: &[String]) -> eframe::Result<()> {
     if args.iter().any(|a| a == "--export") {
         if let Err(error) = tm_store::prepare_data_dir() {
             log::error!(target: "tramoing::migration", "导入旧数据失败：{error}");
-            eprintln!("导入旧数据失败：{error}");
+            let lang = i18n::resolve(settings::Settings::load().lang);
+            eprintln!(
+                "{}",
+                lang.format("cli.migration_failed", &[("error", &error.to_string())])
+            );
             std::process::exit(1);
         }
-        match app::export_history_csv(true) {
-            Ok(message) => println!("{message}"),
-            Err(message) => {
-                eprintln!("{message}");
-                std::process::exit(1);
-            }
+        // Resolve after migration, so an existing user's saved language applies.
+        let lang = i18n::resolve(settings::Settings::load().lang);
+        let result = app::export_history_csv();
+        let message = app::export_message(&result, lang);
+        if result.is_ok() {
+            println!("{message}");
+        } else {
+            eprintln!("{message}");
+            std::process::exit(1);
         }
         return Ok(());
     }
     // 开机自启的真实开关。命令行的好处是不用点界面就能验证，
     // 单测里不能碰 launchctl（见 autostart 的注释）。
     if let Some(pos) = args.iter().position(|a| a == "--autostart") {
+        let lang = i18n::resolve(settings::Settings::load().lang);
         let action = args.get(pos + 1).map(String::as_str).unwrap_or("status");
         let r = match action {
-            "on" => autostart::set_enabled(true).map(|_| "已开启开机自启".to_owned()),
-            "off" => autostart::set_enabled(false).map(|_| "已关闭开机自启".to_owned()),
-            _ => Ok(format!(
-                "当前状态：{}",
-                if autostart::is_enabled() {
-                    "已开启"
-                } else {
-                    "已关闭"
-                }
+            "on" => {
+                autostart::set_enabled(true).map(|_| lang.t("cli.autostart_enabled").to_owned())
+            }
+            "off" => {
+                autostart::set_enabled(false).map(|_| lang.t("cli.autostart_disabled").to_owned())
+            }
+            _ => Ok(lang.format(
+                "cli.autostart_status",
+                &[(
+                    "status",
+                    lang.t(if autostart::is_enabled() {
+                        "cli.enabled"
+                    } else {
+                        "cli.disabled"
+                    }),
+                )],
             )),
         };
         match r {
             Ok(msg) => println!("{msg}"),
             Err(e) => {
                 log::error!(target: "tramoing::autostart", "登录自启操作失败：{e}");
-                eprintln!("{e}");
+                eprintln!("{}", lang.format("cli.autostart_failed", &[("error", &e)]));
                 std::process::exit(1);
             }
         }
@@ -210,14 +240,24 @@ fn run(args: &[String]) -> eframe::Result<()> {
             update::log_line(&format!("导入旧数据失败：{error}"));
             return Err(eframe::Error::AppCreation(Box::new(error)));
         }
-        #[cfg(target_os = "macos")]
-        if !settings::Settings::path().exists() {
-            std::env::set_var("TM_SHOW_ON_START", "1");
-            std::env::set_var("TM_AFTER_INSTALL", "1");
-        }
     }
 
-    let _instance = match instance::Instance::acquire() {
+    let record_launch = cfg!(target_os = "macos") && std::env::var_os("TM_FORCE_MOCK").is_none();
+    let first_launch =
+        record_launch && !startup::has_launched(&tm_store::data_dir(), &engine::db_path());
+    let launch = startup::Launch::resolve(
+        args,
+        std::env::var_os("TM_SHOW_ON_START").is_some(),
+        std::env::var_os("TM_AFTER_INSTALL").is_some(),
+        first_launch,
+    );
+
+    let activate_existing = launch.keep_open
+        || (!args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--after-install" | "--after-update"))
+            && std::env::var_os("TM_AFTER_INSTALL").is_none());
+    let _instance = match instance::Instance::acquire(activate_existing) {
         Ok(Some(instance)) => instance,
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -270,6 +310,14 @@ fn run(args: &[String]) -> eframe::Result<()> {
     eframe::run_native(
         "tramoing",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(move |cc| {
+            let app = app::App::new(cc, launch);
+            if record_launch {
+                if let Err(error) = startup::record_launch(&tm_store::data_dir()) {
+                    log::warn!(target: "tramoing::startup", "无法保存首次启动标记：{error}");
+                }
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

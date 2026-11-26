@@ -10,7 +10,7 @@ pub struct Instance {
 }
 
 impl Instance {
-    pub fn acquire() -> io::Result<Option<Self>> {
+    pub fn acquire(activate_existing: bool) -> io::Result<Option<Self>> {
         let dir = tm_store::data_dir();
         std::fs::create_dir_all(&dir)?;
         let lock = OpenOptions::new()
@@ -28,6 +28,11 @@ impl Instance {
                 Ok(Some(Self { _lock: lock }))
             }
             Err(std::fs::TryLockError::WouldBlock) => {
+                // A duplicate installer/update launch must not reveal an already
+                // running panel. Normal user launches still activate it.
+                if !activate_existing {
+                    return Ok(None);
+                }
                 let request = if std::env::var("TM_VIEW").as_deref() == Ok("settings") {
                     "settings"
                 } else {

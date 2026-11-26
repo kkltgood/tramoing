@@ -6,27 +6,14 @@
 //! 配置文件坏掉不能让整个程序起不来。
 
 use std::path::PathBuf;
+
+use crate::i18n::Lang;
 use tm_core::color::{DisplayColors, Rgb};
 use tm_core::taskbar::{TaskbarItem, TaskbarOrder};
 
 /// Windows 手动输入的 exe 路径可能与采集器返回的大小写不同。
 pub(crate) fn same_app(a: &str, b: &str) -> bool {
     a == b || (cfg!(windows) && a.to_lowercase() == b.to_lowercase())
-}
-
-/// 状态栏显示内容。
-///
-/// 只有三档：图标 + 两行速率 / 只要两行速率 / 只要图标。
-/// 菜单栏空间紧张时「窄」本身就是可用性——被系统收进 `«` 折叠区之后，
-/// 用户基本不会去点它。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayMode {
-    /// 图标 + 上下两行（↑ 上传 / ↓ 下载）
-    Both,
-    /// 只有上下两行速率，不占图标的位置
-    SpeedOnly,
-    /// 只有图标
-    IconOnly,
 }
 
 /// 外观
@@ -40,15 +27,15 @@ pub enum ThemeMode {
 /// 界面语言
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LangMode {
-    /// 有中文字体就用中文，否则英文
-    Auto,
-    Zh,
-    En,
+    /// Match the system's ordered UI language preferences.
+    System,
+    Selected(Lang),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    pub tray_mode: TrayMode,
+    /// 是否显示菜单栏 / 系统托盘中的应用图标，与网速和性能显示独立。
+    pub tray_icon: bool,
     pub theme: ThemeMode,
     pub lang: LangMode,
     /// 列表通常最多列出几个应用。置顶项优先保留，剩余名额按流量从高到低填充；
@@ -62,7 +49,7 @@ pub struct Settings {
     pub alert_mb: u64,
     /// 菜单栏用彩色区分上下行。关掉后统一跟随系统色，适合喜欢素一点的菜单栏
     pub tray_color: bool,
-    /// 是否显示 Windows 原生任务栏网速区域。
+    /// 是否显示实时网速（macOS 菜单栏 / Windows 原生任务栏区域）。
     pub tray_badge: bool,
     /// Windows 任务栏：直接拖拽统计项保存的顺序，不在设置页提供排序控件。
     pub taskbar_order: TaskbarOrder,
@@ -90,9 +77,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            tray_mode: TrayMode::Both,
+            tray_icon: true,
             theme: ThemeMode::System,
-            lang: LangMode::Auto,
+            lang: LangMode::System,
             max_apps: 10,
             pinned_apps: Vec::new(),
             retention_days: 30,
@@ -156,6 +143,10 @@ impl Settings {
 
     pub fn parse(text: &str) -> Self {
         let mut s = Self::default();
+        let mut legacy_tray = None;
+        let mut tray_icon_present = false;
+        let mut tray_icon = None;
+        let mut tray_badge = None;
         let mut taskbar_order = None;
         let mut legacy_performance_first = false;
         for line in text.trim_start_matches('\u{feff}').lines() {
@@ -169,8 +160,14 @@ impl Settings {
             let (k, v) = (k.trim(), v.trim());
             match k {
                 "tray_mode" => {
-                    if let Some(m) = parse_tray(v) {
-                        s.tray_mode = m;
+                    if let Some(visibility) = parse_legacy_tray(v) {
+                        legacy_tray = Some(visibility);
+                    }
+                }
+                "tray_icon" => {
+                    tray_icon_present = true;
+                    if let Some(value) = parse_bool(v) {
+                        tray_icon = Some(value);
                     }
                 }
                 "theme" => {
@@ -226,11 +223,11 @@ impl Settings {
                     "off" | "false" | "0" => s.tray_color = false,
                     _ => {}
                 },
-                "tray_badge" => match v {
-                    "on" | "true" | "1" => s.tray_badge = true,
-                    "off" | "false" | "0" => s.tray_badge = false,
-                    _ => {}
-                },
+                "tray_badge" => {
+                    if let Some(value) = parse_bool(v) {
+                        tray_badge = Some(value);
+                    }
+                }
                 "taskbar_performance_first" => {
                     if let Some(value) = parse_bool(v) {
                         legacy_performance_first = value;
@@ -289,6 +286,16 @@ impl Settings {
                 _ => {} // 未知键忽略：旧版本写的字段不该让新版本报错
             }
         }
+        (s.tray_icon, s.tray_badge) = resolve_tray_visibility(
+            legacy_tray,
+            tray_icon_present,
+            tray_icon,
+            tray_badge,
+            cfg!(windows),
+        );
+        if !s.tray_icon && !s.tray_badge && !s.performance_enabled {
+            s.tray_icon = true;
+        }
         // 新格式优先，与两个键在文件中的先后无关；兼容升级前的顺序。
         if let Some(order) = taskbar_order {
             s.taskbar_order = order;
@@ -299,24 +306,19 @@ impl Settings {
     }
 
     pub fn serialize(&self) -> String {
-        let tray = match self.tray_mode {
-            TrayMode::Both => "both",
-            TrayMode::SpeedOnly => "speed",
-            TrayMode::IconOnly => "icon",
-        };
+        let tray_icon = if self.tray_icon { "on" } else { "off" };
         let theme = match self.theme {
             ThemeMode::System => "system",
             ThemeMode::Light => "light",
             ThemeMode::Dark => "dark",
         };
         let lang = match self.lang {
-            LangMode::Auto => "auto",
-            LangMode::Zh => "zh",
-            LangMode::En => "en",
+            LangMode::System => "system",
+            LangMode::Selected(language) => language.code(),
         };
         format!(
             "# Tramoing 设置。删掉这个文件即恢复全部默认值。\n\
-             tray_mode={tray}\n\
+             tray_icon={tray_icon}\n\
              theme={theme}\n\
              lang={lang}\n\
              max_apps={}\n\
@@ -388,15 +390,43 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_tray(v: &str) -> Option<TrayMode> {
+/// Legacy three-way setting, represented as (application icon, network speed).
+fn parse_legacy_tray(v: &str) -> Option<(bool, bool)> {
     match v {
         // full / compact 是旧版配置里的写法，读到时映射到新档位，
         // 不至于因为升级把用户的选择重置掉
-        "both" | "full" => Some(TrayMode::Both),
-        "speed" | "compact" => Some(TrayMode::SpeedOnly),
-        "icon" => Some(TrayMode::IconOnly),
+        "both" | "full" => Some((true, true)),
+        "speed" | "compact" => Some((false, true)),
+        "icon" => Some((true, false)),
         _ => None,
     }
+}
+
+fn resolve_tray_visibility(
+    legacy: Option<(bool, bool)>,
+    icon_present: bool,
+    icon: Option<bool>,
+    badge: Option<bool>,
+    windows: bool,
+) -> (bool, bool) {
+    if icon_present {
+        // Presence marks the new format even if the value is malformed. Old mode
+        // lines must never silently override either independent preference.
+        return (icon.unwrap_or(true), badge.unwrap_or(true));
+    }
+    let legacy_speed = legacy.map(|(_, speed)| speed);
+    let speed = if windows {
+        // Old Windows versions displayed the taskbar speed using tray_badge.
+        badge.or(legacy_speed)
+    } else {
+        // Old macOS files also serialized tray_badge, but only tray_mode affected
+        // the menu bar. Preserve that visible behavior during migration.
+        legacy_speed.or(badge)
+    };
+    // Windows always displayed its system tray icon before the independent switch.
+    // tray_mode only controlled the macOS menu bar, even when saved on Windows.
+    let icon = windows || legacy.map(|(icon, _)| icon).unwrap_or(true);
+    (icon, speed.unwrap_or(true))
 }
 
 fn parse_theme(v: &str) -> Option<ThemeMode> {
@@ -409,11 +439,13 @@ fn parse_theme(v: &str) -> Option<ThemeMode> {
 }
 
 fn parse_lang(v: &str) -> Option<LangMode> {
-    match v {
-        "auto" => Some(LangMode::Auto),
-        "zh" => Some(LangMode::Zh),
-        "en" => Some(LangMode::En),
-        _ => None,
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("system") {
+        Some(LangMode::System)
+    } else if v.eq_ignore_ascii_case("zh") {
+        // Preserve the historical preference even if registry aliases are refined later.
+        Some(LangMode::Selected(Lang::ZH_CN))
+    } else {
+        Lang::from_code(v).map(LangMode::Selected)
     }
 }
 
@@ -423,18 +455,37 @@ mod tests {
 
     #[test]
     fn utf8_bom_does_not_discard_the_first_setting() {
-        assert_eq!(
-            Settings::parse("\u{feff}tray_mode=speed\n").tray_mode,
-            TrayMode::SpeedOnly
-        );
+        let settings = Settings::parse("\u{feff}tray_mode=speed\n");
+        assert_eq!(settings.tray_icon, cfg!(windows));
+        assert!(settings.tray_badge);
+    }
+
+    #[test]
+    fn language_preferences_migrate_and_keep_stable_locale_codes() {
+        for (old, mode, saved) in [
+            ("auto", LangMode::System, "system"),
+            ("system", LangMode::System, "system"),
+            ("zh", LangMode::Selected(Lang::ZH_CN), "zh-CN"),
+            ("zh_CN", LangMode::Selected(Lang::ZH_CN), "zh-CN"),
+            ("en", LangMode::Selected(Lang::EN), "en"),
+            ("unknown-locale", LangMode::System, "system"),
+        ] {
+            let settings = Settings::parse(&format!("lang={old}"));
+            assert_eq!(settings.lang, mode);
+            assert!(settings
+                .serialize()
+                .lines()
+                .any(|line| line == format!("lang={saved}")));
+            assert_eq!(Settings::parse(&settings.serialize()).lang, mode);
+        }
     }
 
     #[test]
     fn roundtrip_preserves_everything() {
         let s = Settings {
-            tray_mode: TrayMode::SpeedOnly,
+            tray_icon: false,
             theme: ThemeMode::Dark,
-            lang: LangMode::En,
+            lang: LangMode::Selected(Lang::EN),
             max_apps: 20,
             pinned_apps: vec![
                 "/Applications/WeChat.app".into(),
@@ -462,14 +513,108 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tray_modes_map_to_new_ones() {
-        // 升级前写下的 full / compact 不能让用户的选择丢掉
-        assert_eq!(parse_tray("full"), Some(TrayMode::Both));
-        assert_eq!(parse_tray("compact"), Some(TrayMode::SpeedOnly));
-        assert_eq!(parse_tray("speed"), Some(TrayMode::SpeedOnly));
-        assert_eq!(parse_tray("icon"), Some(TrayMode::IconOnly));
-        assert_eq!(parse_tray("both"), Some(TrayMode::Both));
-        assert_eq!(parse_tray("nonsense"), None);
+    fn legacy_tray_modes_migrate_with_platform_specific_speed_precedence() {
+        for (mode, icon, speed) in [
+            ("both", true, true),
+            ("full", true, true),
+            ("speed", false, true),
+            ("compact", false, true),
+            ("icon", true, false),
+        ] {
+            let legacy = parse_legacy_tray(mode);
+            assert_eq!(legacy, Some((icon, speed)));
+            for windows in [false, true] {
+                assert_eq!(
+                    resolve_tray_visibility(legacy, false, None, None, windows),
+                    (windows || icon, speed)
+                );
+                for badge in [false, true] {
+                    assert_eq!(
+                        resolve_tray_visibility(legacy, false, None, Some(badge), windows),
+                        (windows || icon, if windows { badge } else { speed })
+                    );
+                }
+            }
+            for badge in ["on", "off"] {
+                let expected_speed = if cfg!(windows) { badge == "on" } else { speed };
+                for text in [
+                    format!("tray_mode={mode}\ntray_badge={badge}\nperformance_enabled=on"),
+                    format!("performance_enabled=on\ntray_badge={badge}\ntray_mode={mode}"),
+                ] {
+                    let settings = Settings::parse(&text);
+                    assert_eq!(
+                        (settings.tray_icon, settings.tray_badge),
+                        (cfg!(windows) || icon, expected_speed)
+                    );
+                    assert!(!settings.serialize().contains("tray_mode="));
+                    assert_eq!(Settings::parse(&settings.serialize()), settings);
+                }
+            }
+        }
+        assert_eq!(parse_legacy_tray("nonsense"), None);
+        assert_eq!(Settings::parse("tray_mode=nonsense"), Settings::default());
+    }
+
+    #[test]
+    fn independent_tray_preferences_override_legacy_modes_in_any_order() {
+        for icon in [false, true] {
+            for speed in [false, true] {
+                let new = format!("tray_icon={icon}\ntray_badge={speed}\nperformance_enabled=on");
+                for mode in ["both", "speed", "icon"] {
+                    for text in [
+                        format!("{new}\ntray_mode={mode}"),
+                        format!("tray_mode={mode}\n{new}"),
+                    ] {
+                        let settings = Settings::parse(&text);
+                        assert_eq!((settings.tray_icon, settings.tray_badge), (icon, speed));
+                        assert_eq!(Settings::parse(&settings.serialize()), settings);
+                    }
+                    for windows in [false, true] {
+                        assert_eq!(
+                            resolve_tray_visibility(
+                                parse_legacy_tray(mode),
+                                true,
+                                Some(icon),
+                                Some(speed),
+                                windows
+                            ),
+                            (icon, speed)
+                        );
+                    }
+                }
+            }
+        }
+        for text in [
+            "tray_mode=icon\ntray_icon=invalid",
+            "tray_icon=invalid\ntray_mode=icon",
+            "tray_icon=on\ntray_icon=invalid\ntray_mode=speed",
+        ] {
+            let settings = Settings::parse(text);
+            assert!(settings.tray_icon && settings.tray_badge);
+        }
+        let settings =
+            Settings::parse("tray_icon=off\ntray_icon=invalid\ntray_badge=on\ntray_badge=invalid");
+        assert!(!settings.tray_icon && settings.tray_badge);
+    }
+
+    #[test]
+    fn a_clickable_entry_is_restored_only_when_all_displays_are_disabled() {
+        for icon in [false, true] {
+            for speed in [false, true] {
+                for performance in [false, true] {
+                    for text in [
+                        format!("tray_icon={icon}\ntray_badge={speed}\nperformance_enabled={performance}"),
+                        format!("performance_enabled={performance}\ntray_badge={speed}\ntray_icon={icon}"),
+                    ] {
+                        let settings = Settings::parse(&text);
+                        assert_eq!(settings.tray_icon, icon || (!speed && !performance));
+                        assert_eq!(settings.tray_badge, speed);
+                        assert_eq!(settings.performance_enabled, performance);
+                        assert_eq!(Settings::parse(&settings.serialize()), settings);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -484,7 +629,11 @@ mod tests {
         let s = Settings::parse(text);
         assert_eq!(s.theme, ThemeMode::System, "非法值应该退回默认");
         assert_eq!(s.max_apps, 10, "非法数字应该退回默认");
-        assert_eq!(s.lang, LangMode::En, "同一行里的合法值仍要生效");
+        assert_eq!(
+            s.lang,
+            LangMode::Selected(Lang::EN),
+            "同一行里的合法值仍要生效"
+        );
     }
 
     #[test]
@@ -560,7 +709,7 @@ mod tests {
                 "pinned_apps=[\"saved\"]\npinned_apps={invalid}\nlang=en"
             ));
             assert_eq!(settings.pinned_apps, ["saved"]);
-            assert_eq!(settings.lang, LangMode::En);
+            assert_eq!(settings.lang, LangMode::Selected(Lang::EN));
         }
         let mut settings = settings;
         assert!(!settings.toggle_pin(" \t"));

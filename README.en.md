@@ -25,7 +25,7 @@ These screenshots show a Windows demo instance. macOS shares the panel layout; p
 - **Traffic history:** local SQLite storage, configurable retention, CSV export, and per-app traffic alerts.
 - **Windows application firewall controls:** block or restore network access for a selected executable, including connections through local proxies. Requires the bundled administrator helper.
 - **Error reporting:** errors offer to export diagnostic logs through a dialog; reports stay on your device and are not uploaded automatically.
-- **Desktop integration:** light/dark/system themes, Chinese and English UI, animated settings tabs, optional launch at login, and in-app updates. Downloads support pause/resume, automatic retries after disconnections, and saved progress across app restarts; the complete installer must pass SHA-256 verification.
+- **Desktop integration:** light/dark/system themes, a language dropdown with system preference, Simplified Chinese and English, animated settings tabs, optional launch at login, and in-app updates. Language changes apply and save immediately; translation resources support adding more languages. Downloads support pause/resume, automatic retries after disconnections, and saved progress across app restarts; the complete installer must pass SHA-256 verification.
 
 ## Download and install
 
@@ -38,7 +38,7 @@ Download the installer for your system and processor from [GitHub Releases](http
 | macOS 11+, Apple Silicon | `Tramoing-<version>-macos-arm64.dmg` |
 | macOS 11+, Intel | `Tramoing-<version>-macos-x64.dmg` |
 
-Windows installers include the matching network collection helper; administrator permission is required to install it. On macOS, open the DMG and drag Tramoing to Applications, or double-click the app and confirm installation. Linux is not supported.
+Windows installers include the matching network collection helper; administrator permission is required to install it. On macOS, open the DMG and drag Tramoing to Applications, or double-click the app and confirm installation. A fresh installation reveals the panel once near its menu bar item; upgrades restart in the background. Linux is not supported.
 
 Every package has a SHA-256 checksum. Windows installers are currently unsigned; macOS packages use ad-hoc signing and are not Developer ID signed or notarized.
 

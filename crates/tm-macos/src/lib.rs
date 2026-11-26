@@ -16,6 +16,8 @@ pub mod flows;
 pub mod icon;
 pub mod installation;
 #[cfg(target_os = "macos")]
+pub mod locale;
+#[cfg(target_os = "macos")]
 pub mod procname;
 #[cfg(target_os = "macos")]
 pub mod pty;
@@ -36,4 +38,4 @@ pub use icon::{app_icon, IconBitmap, ICON_SIDE};
 #[cfg(target_os = "macos")]
 pub use sampler::NettopSampler;
 #[cfg(target_os = "macos")]
-pub use status_item::{SpeedLines, StatusItem, Tone};
+pub use status_item::{ClickAnchor, SpeedLines, StatusItem, Tone};
