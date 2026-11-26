@@ -82,6 +82,7 @@ VIAddVersionKey "LegalCopyright" "MIT"
 ; System plugin calls in the upgrade callbacks must follow SetCompressor.
 !define TRAMOING_SENSOR_COMPONENT
 !include "upgrade.nsh"
+!include "stop-ui.nsh"
 
 ; ---------- 安装界面 ----------
 ; 图标同时管三处：安装包自身、卸载程序、以及对话框左上角那个小图标
@@ -127,6 +128,8 @@ Section "-升级准备：关闭旧进程" SEC_PRE
   SectionIn RO
   Call WaitForUpdateParent
   DetailPrint "正在关闭旧的 Tramoing 进程..."
+  !insertmacro STOP_UI "${APP_EXE}"
+  !insertmacro STOP_UI "${LEGACY_APP_EXE}"
 
   ; 计划任务在登录时以最高权限拉起助手，先让它退下来，避免拷贝期间
   ; 任务调度器又把旧 exe 拉起来重新占住文件。
@@ -137,11 +140,7 @@ Section "-升级准备：关闭旧进程" SEC_PRE
 
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${HELPER_EXE}" /F'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${APP_EXE}" /F'
-  Pop $0
-  ; 改名前的 exe 也可能还在跑，一样停掉
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${LEGACY_APP_EXE}" /F'
-  Pop $0
+  ; 改名前的助手也可能还在跑，一样停掉
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM "${LEGACY_HELPER_EXE}" /F'
   Pop $0
 
@@ -284,8 +283,9 @@ Function SaveSensorSelection
 FunctionEnd
 
 Section "Uninstall"
-  ; 先停任务再删文件，顺序反了会删不掉正在运行的 exe
-  ExecWait 'taskkill /IM ${APP_EXE} /F'
+  ; 先让 UI 清理托盘并保存历史，再停任务、删除文件。
+  !insertmacro STOP_UI "${APP_EXE}"
+  !insertmacro STOP_UI "${LEGACY_APP_EXE}"
   ExecWait '"$SYSDIR\schtasks.exe" /End /TN "${TASK_NAME}"'
   ExecWait '"$SYSDIR\schtasks.exe" /End /TN "${LEGACY_TASK_NAME}"'
   ExecWait 'taskkill /IM ${HELPER_EXE} /F'
@@ -298,9 +298,7 @@ Section "Uninstall"
   ${EndIf}
   ExecWait '"$INSTDIR\${HELPER_EXE}" --uninstall'
   ExecWait 'taskkill /IM ${HELPER_EXE} /F'
-  ExecWait 'taskkill /IM ${APP_EXE} /F'
-  ; 改名前的旧程序如果还在运行，一起停掉。
-  ExecWait 'taskkill /IM ${LEGACY_APP_EXE} /F'
+  ; 改名前的旧助手如果还在运行，一起停掉。
   ExecWait 'taskkill /IM ${LEGACY_HELPER_EXE} /F'
 
   ; 托盘程序自己的开机自启（设置里打开时写在 HKCU）。

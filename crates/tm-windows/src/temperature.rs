@@ -1,5 +1,6 @@
-//! GPU: WDDM telemetry. CPU: supervised built-in sensors, then optional WMI.
+//! GPU: WDDM telemetry, then built-in sensors. CPU: built-in sensors. WMI fills gaps.
 //! ACPI thermal zones are intentionally not labelled as CPU temperatures.
+use crate::temperature_sources::{merge, needs_wmi};
 use std::fs;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
@@ -201,13 +202,10 @@ impl Sampler {
         }
         let native = self.helper_reading.as_ref().map(|r| r.temperatures());
         let driver_gpu = gpu_temperature();
-        if let Some(native) = native
-            .as_ref()
-            .filter(|r| r.cpu.is_some() && driver_gpu.is_some())
-        {
+        if !needs_wmi(native.as_ref(), driver_gpu) {
             // Built-in sensors recovered: release the fallback PowerShell process.
             self.provider = None;
-            return with_gpu(native.clone(), driver_gpu);
+            return merge(native, Temperatures::default(), "", driver_gpu);
         }
         if self.provider.is_none() && Instant::now() >= self.retry {
             self.retry = Instant::now() + Duration::from_secs(60);
@@ -234,37 +232,6 @@ impl Sampler {
                 self.retry = Instant::now() + Duration::from_secs(60);
             }
         }
-        if let Some(native) = native {
-            if native.cpu.is_some() {
-                result.cpu = native.cpu;
-                result.cpu_unavailable = None;
-            }
-            if result.gpu.is_none() {
-                result.gpu = native.gpu;
-            }
-            if result.cpu.is_none() {
-                result.cpu_unavailable = native.cpu_unavailable;
-            }
-            result.source = format!("{}; {}", native.source, result.source);
-        } else {
-            if result.cpu.is_none() {
-                result.cpu_unavailable =
-                    Some(tm_core::temperature::CpuUnavailable::HelperUnavailable);
-            }
-            result.source = format!("{}; {}", self.helper_error, result.source);
-        }
-        with_gpu(result, driver_gpu)
+        merge(native, result, &self.helper_error, driver_gpu)
     }
-}
-
-fn with_gpu(mut result: Temperatures, driver_gpu: Option<f64>) -> Temperatures {
-    if let Some(gpu) = driver_gpu {
-        result.gpu = Some(gpu);
-        result
-            .source
-            .push_str("; GPU=WDDM driver (hottest adapter)");
-    } else {
-        result.source.push_str("; GPU WDDM temperature unavailable");
-    }
-    result
 }

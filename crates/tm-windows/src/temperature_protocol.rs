@@ -95,6 +95,21 @@ mod tests {
     }
 
     #[test]
+    fn ready_gpu_does_not_require_a_cpu_sensor() {
+        let frame: Snapshot = serde_json::from_str(
+            r#"{"cpu":null,"gpu":54.0,"status":"ready","source":"GPU=NVIDIA GeForce GT 730"}"#,
+        )
+        .unwrap();
+        let reading = frame.temperatures();
+        assert_eq!(reading.cpu, None);
+        assert_eq!(reading.gpu, Some(54.0));
+        assert_eq!(
+            reading.cpu_unavailable,
+            Some(CpuUnavailable::SensorUnavailable)
+        );
+    }
+
+    #[test]
     fn request_cannot_supply_a_program_or_arguments() {
         assert!(serde_json::from_str::<Request>(r#"{"command":"Read"}"#).is_ok());
         assert!(

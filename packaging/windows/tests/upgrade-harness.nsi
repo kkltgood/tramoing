@@ -10,6 +10,8 @@ RequestExecutionLevel user
 !define INSTALL_REG_ROOT HKCU
 !define TRAMOING_UPGRADE_TEST_TRACE
 !include "..\upgrade.nsh"
+!define TRAMOING_STOP_UI_TIMEOUT 1000
+!include "..\stop-ui.nsh"
 
 Name "${APP_NAME}"
 OutFile "${TEST_OUTPUT}"
@@ -56,6 +58,9 @@ FunctionEnd
 
 Section "Test payload"
   Call WaitForUpdateParent
+  IfFileExists "$EXEDIR\stop-ui" 0 stop_ui_done
+    !insertmacro STOP_UI "${TEST_UI_EXE}"
+  stop_ui_done:
   ; Simulate a helper registration failure after entering the install section.
   IfFileExists "$EXEDIR\fail-install" 0 +3
     SetErrorLevel 1

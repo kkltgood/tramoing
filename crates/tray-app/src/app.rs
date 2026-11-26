@@ -1245,6 +1245,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Remove native status items while the UI thread and its windows are
+        // still alive, before Engine::drop waits for the final history flush.
+        // A later installer timeout must not leave an Explorer ghost icon.
+        self.tray.take();
+        #[cfg(target_os = "macos")]
+        {
+            self.speed_tray.take();
+            self.performance_tray.take();
+        }
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // 全透明，圆角之外的区域才不会出现一块底色
         [0.0, 0.0, 0.0, 0.0]

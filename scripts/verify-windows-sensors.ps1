@@ -52,7 +52,15 @@ try {
     $allowed = @('ready','starting','permission_denied','unsupported_platform','driver_missing','driver_unavailable','sensor_unavailable')
     if ($frame.status -notin $allowed -or -not $frame.source) { throw "Unexpected sensor response: $($frame | ConvertTo-Json -Compress)" }
     if ($frame.status -ne 'ready' -and ($null -ne $frame.cpu -or $null -ne $frame.gpu)) { throw 'Failure returned a temperature' }
-    if ($frame.status -eq 'ready' -and ($frame.cpu -le 0 -or $frame.cpu -gt 150)) { throw 'Invalid CPU temperature' }
+    if ($frame.status -eq 'ready') {
+        if ($null -eq $frame.cpu -and $null -eq $frame.gpu) { throw 'Ready frame has no temperature' }
+        foreach ($name in @('cpu', 'gpu')) {
+            $value = $frame.$name
+            if ($null -ne $value -and ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -le 0 -or $value -gt 150)) {
+                throw "Invalid $name temperature"
+            }
+        }
+    }
     Write-Host "Sensor worker protocol passed: $($frame.status) ($($frame.source))"
 } finally {
     if ($process.Id -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }

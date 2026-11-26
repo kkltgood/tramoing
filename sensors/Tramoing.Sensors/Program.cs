@@ -21,6 +21,8 @@ internal static class Program
         var output = Console.OpenStandardOutput();
         Console.SetOut(TextWriter.Null); // library diagnostics cannot corrupt the binary stream
         Computer? computer = null;
+        long gpuRetryAt = 0;
+        string? gpuOpenError = null;
         try
         {
             while (true)
@@ -36,19 +38,41 @@ internal static class Program
                     }
                     else
                     {
+                        // LHM's GPU setter may add some vendor groups before
+                        // throwing without updating IsGpuEnabled. Recreate the
+                        // computer to retry; toggling that flag would leak groups.
+                        if (computer != null && gpuOpenError != null && Environment.TickCount64 >= gpuRetryAt)
+                        {
+                            computer.Close();
+                            computer = null;
+                        }
                         if (computer == null)
                         {
-                            Emit(output, new(null, null, "starting", Library + ": opening CPU sensors"));
+                            Emit(output, new(null, null, "starting", Library + ": opening CPU/GPU sensors"));
                             computer = new Computer { IsCpuEnabled = true };
                             computer.Open();
+                            gpuOpenError = null;
+                            // Open GPUs after CPU setup so a vendor driver exception
+                            // cannot discard working CPU sensors. LHM uses NVAPI/ADL
+                            // here, providing temperatures even without WDDM telemetry.
+                            try
+                            {
+                                computer.IsGpuEnabled = true;
+                            }
+                            catch (Exception error)
+                            {
+                                gpuRetryAt = Environment.TickCount64 + 60_000;
+                                gpuOpenError = "GPU initialization failed: " + error.GetType().Name;
+                            }
                         }
-                        var temperatures = new List<(string Name, double? Value)>();
-                        foreach (var cpu in computer.Hardware.Where(h => h.HardwareType == HardwareType.Cpu))
-                            Collect(cpu, temperatures);
-                        double? cpuTemperature = TemperatureSelection.Hottest(temperatures);
-                        Emit(output, new(cpuTemperature, null,
-                            cpuTemperature.HasValue ? "ready" : "sensor_unavailable",
-                            Library + (cpuTemperature.HasValue ? ": hottest CPU core/die sensor" : ": no supported CPU temperature sensor")));
+                        var cpu = ReadHardware(computer, h => h.HardwareType == HardwareType.Cpu);
+                        var gpu = ReadHardware(computer, h => h.HardwareType is
+                            HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel);
+                        string detail = Library + ": " + Describe("CPU core/die", cpu)
+                            + "; " + Describe("GPU", gpu);
+                        if (gpuOpenError != null) detail += "; " + gpuOpenError;
+                        Emit(output, new(cpu.Temperature, gpu.Temperature,
+                            TemperatureSelection.Status(cpu.Temperature, gpu.Temperature), detail));
                     }
                 }
                 catch (Exception error) when (error is not IOException)
@@ -65,6 +89,20 @@ internal static class Program
         catch (IOException) { return 0; } // helper has closed the pipe
         finally { computer?.Close(); }
     }
+
+    private static (double? Temperature, int FailedDevices) ReadHardware(
+        Computer computer, Func<IHardware, bool> include) =>
+        TemperatureSelection.Read(computer.Hardware.Where(include).Select(hardware =>
+            (Func<IEnumerable<(string Name, double? Value)>>)(() =>
+            {
+                var values = new List<(string, double?)>();
+                Collect(hardware, values);
+                return values;
+            })));
+
+    private static string Describe(string category, (double? Temperature, int FailedDevices) reading) =>
+        (reading.Temperature.HasValue ? "hottest " + category + " sensor" : "no supported " + category + " temperature sensor")
+        + (reading.FailedDevices > 0 ? $" ({reading.FailedDevices} device reads failed)" : "");
 
     private static void Collect(IHardware hardware, List<(string, double?)> values)
     {

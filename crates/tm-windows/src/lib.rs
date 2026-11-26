@@ -21,6 +21,8 @@ pub mod network;
 pub mod network_policy;
 pub mod proto;
 pub mod temperature_protocol;
+#[cfg(any(windows, test))]
+mod temperature_sources;
 
 #[cfg(windows)]
 pub mod firewall;

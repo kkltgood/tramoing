@@ -245,7 +245,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.2.0` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.2.1` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -262,15 +262,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.2.0` 为例）：
+发布步骤（以当前 `0.2.1` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.0.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.1.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.2.0 -m "Release v0.2.0"
-   git push opensource v0.2.0
+   git tag -a v0.2.1 -m "Release v0.2.1"
+   git push opensource v0.2.1
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -342,9 +342,9 @@ powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
 
 Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHardwareMonitor 0.9.6，NuGet 传递依赖与完整性记录在 `packages.lock.json`。构建需要 .NET 10 SDK，安装包发布 self-contained 的同架构组件，用户无需预装 .NET。执行 `dotnet run --project sensors/Tramoing.Sensors.Tests -c Release`、`packaging/windows/build-sensors.ps1 -Architecture x64`（或 arm64）及 `scripts/verify-windows-sensors.ps1` 验证；打包脚本的 `-DotNet` 可指定 SDK 可执行文件。只有完整 `build.ps1` 构建会生成可安装的主程序、助手和传感器组件组合。开发版助手旁也需要同架构 `sensors/` 子目录。
 
-温度管道 `Tramoing-Temperature-<SID>-v1` 沿用网络控制的账户 ACL、远程连接拒绝、双端程序路径及助手提权验证，但请求只有 Read，不能传入路径或命令。助手在独立线程管理 worker，worker 先等待握手，再进入硬件库；Windows Job Object 确保助手终止时关闭子进程。协议是 4 字节长度加 UTF-8 JSON，worker 帧上限 8 KiB；采样约 2 秒，15 秒 watchdog、60 秒失败退避、12 秒 UI 请求租期。关闭显示不会保留最后一次有效温度。仅开启 LHM 的 CPU 硬件组，不扫描主板 EC、磁盘或风扇控制。
+温度管道 `Tramoing-Temperature-<SID>-v1` 沿用网络控制的账户 ACL、远程连接拒绝、双端程序路径及助手提权验证，但请求只有 Read，不能传入路径或命令。助手在独立线程管理 worker，worker 先等待握手，再进入硬件库；Windows Job Object 确保助手终止时关闭子进程。协议是 4 字节长度加 UTF-8 JSON，worker 帧上限 8 KiB；采样约 2 秒，15 秒 watchdog、60 秒失败退避、12 秒 UI 请求租期。关闭显示不会保留最后一次有效温度。仅开启 LHM 的 CPU 和 GPU 硬件组，不扫描主板 EC、磁盘，也不写入风扇控制。CPU 与 GPU 独立采样，GPU 查询异常不清除正常 CPU 读数；任一温度有效即可返回 ready，另一项仍保持空值。
 
-Windows GPU 继续使用 D3DKMT_ADAPTER_PERFDATA（0.1°C 单位）。CPU 内置读数不可用或 GPU WDDM 不可用时，可选 WMI 桥在独立 PowerShell 进程查询已有 LHM/OHM，使用限长快照与 15 秒超时。ARM64 及在 ARM64 上模拟运行的 x64 程序不进入 LHM 的 CPUID 路径；当前内置 CPU 适配覆盖上游支持的 Intel/AMD，老 AMD Family 10h–16h 暂无适配，必须区分构建覆盖与传感器实机覆盖。
+Windows GPU 按 WDDM → 内置 LHM GPU → 可选 WMI 的顺序选择读数。WDDM 使用 D3DKMT_ADAPTER_PERFDATA（0.1°C 单位）；LHM 的 NVIDIA 路径使用 NVAPI，可补充旧系统/驱动没有 WDDM 温度的情形。CPU 或 GPU 仍缺少读数时，可选 WMI 桥在独立 PowerShell 进程查询已有 LHM/OHM，使用限长快照与 15 秒超时；内置 CPU 与内置 GPU/WDDM 已完整时停止 WMI。内置 GPU 与 CPU 共用现有的 Windows x64、管理员助手和 PawnIO 前置检查。ARM64 及在 ARM64 上模拟运行的 x64 程序不进入 LHM 的 CPUID 路径；当前内置 CPU 适配覆盖上游支持的 Intel/AMD，老 AMD Family 10h–16h 暂无适配，必须区分构建覆盖与传感器实机覆盖。
 
 x64 安装包包含官方 PawnIO 2.2.0，构建校验固定 SHA-256 及发布者 Authenticode 签名；构建和运行采集均不安装驱动。安装器默认选中的独立 CPU 温度组件使用官方 `-install -silent`，跳过已安装的较新版本，识别 3010 重启状态，错误时保留其他功能并说明原因。ARM64 包不携带或安装该驱动。卸载不删除共享 PawnIO。第三方说明和 NuGet 许可证随组件打包。
 

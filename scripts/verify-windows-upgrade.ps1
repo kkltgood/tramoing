@@ -25,6 +25,7 @@ $registryPath = "HKCU:\Software\$bundleId"
 $legacyRegistryPath = "$registryPath-legacy"
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 $fixture = Join-Path $testRoot 'fixture.exe'
+$uiName = "TramoingUpgradeGui-$testId.exe"
 
 function Assert-That([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -82,7 +83,7 @@ function Assert-Upgraded([string]$Result, [string]$Directory) {
 }
 
 try {
-    & $MakeNsis '/V2' "/DAPP_ARCH=$Architecture" "/DTEST_BUNDLE_ID=$bundleId" "/DTEST_OUTPUT=$fixture" (Join-Path $repository 'packaging\windows\tests\upgrade-harness.nsi')
+    & $MakeNsis '/V2' "/DAPP_ARCH=$Architecture" "/DTEST_BUNDLE_ID=$bundleId" "/DTEST_OUTPUT=$fixture" "/DTEST_UI_EXE=$uiName" (Join-Path $repository 'packaging\windows\tests\upgrade-harness.nsi')
     if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the NSIS upgrade harness.' }
 
     $caseRoot = New-Case 'fresh'
@@ -138,6 +139,51 @@ try {
         $parent.Dispose()
     }
     Write-Output 'PASS installer waits for parent exit and accepts an already exited parent'
+
+    # Exercise the exact installer macro and script with a disposable native UI.
+    # Like Tramoing, it remains WS_VISIBLE but is parked far offscreen, so the
+    # close path is tested while its panel is not visible to the user.
+    $uiExecutable = Join-Path $testRoot $uiName
+    & rustc --edition=2021 --target $parentTarget -o $uiExecutable (Join-Path $repository 'packaging\windows\tests\upgrade-ui.rs')
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the native test UI.' }
+    foreach ($mode in @('normal-close', 'ignore-close', 'not-running')) {
+        $caseRoot = New-Case "ui-$mode"
+        $installedDir = Join-Path $caseRoot 'app'
+        Set-Installed $installedDir
+        [IO.File]::WriteAllText((Join-Path $caseRoot 'stop-ui'), '')
+        $uiReady = Join-Path $caseRoot 'ui-ready'
+        $uiClosed = Join-Path $caseRoot 'ui-closed'
+        $testUi = $null
+        try {
+            if ($mode -ne 'not-running') {
+                $testUi = Start-Process -FilePath $uiExecutable -ArgumentList "`"$uiReady`" `"$uiClosed`" $mode" -PassThru
+                $null = $testUi.Handle # Retain the handle to read ExitCode after the installer stops it.
+                $readyWatch = [Diagnostics.Stopwatch]::StartNew()
+                while (-not (Test-Path -LiteralPath $uiReady)) {
+                    if ($testUi.HasExited) { throw 'Test UI exited before signaling readiness.' }
+                    if ($readyWatch.Elapsed.TotalSeconds -ge 60) { throw 'Test UI did not become ready.' }
+                    Start-Sleep -Milliseconds 50
+                }
+                Assert-That ([IO.File]::ReadAllText($uiReady) -eq $testUi.Id.ToString()) 'Ready signal came from a different UI.'
+            }
+            $result = Run-Case $caseRoot "/UPDATE /D=$installedDir"
+            Assert-Upgraded $result $installedDir
+            if ($testUi) { Assert-That $testUi.HasExited 'Installer changed files while the old UI still ran.' }
+            if ($mode -eq 'normal-close') {
+                Assert-That ((Test-Path -LiteralPath $uiClosed) -and [IO.File]::ReadAllText($uiClosed) -eq 'clean shutdown') 'Installer forced a responsive UI closed before cleanup.'
+                Assert-That ($testUi.ExitCode -eq 0) 'Responsive UI did not exit normally.'
+            } elseif ($mode -eq 'ignore-close') {
+                Assert-That (-not (Test-Path -LiteralPath $uiClosed)) 'Ignoring close unexpectedly ran normal cleanup.'
+                Assert-That ($testUi.ExitCode -ne 0) 'Unresponsive UI was not terminated after its grace period.'
+            }
+        } finally {
+            if ($testUi) {
+                if (-not $testUi.HasExited) { Stop-Process -Id $testUi.Id -Force }
+                $testUi.Dispose()
+            }
+        }
+        Write-Output "PASS installer UI shutdown: $mode"
+    }
 
     $caseRoot = New-Case 'parent-timeout'
     $installedDir = Join-Path $caseRoot 'app'
