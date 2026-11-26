@@ -538,3 +538,222 @@ fn ranges_and_retry_delays_are_bounded() {
     assert!(!strong_etag("W/\"abc\""));
     assert!(!strong_etag("\"abc\r\n\""));
 }
+
+fn component_fast(
+    asset: &Asset,
+    fallbacks: &[String],
+    root: &Path,
+    tx: &Sender<Event>,
+    stop: &Receiver<()>,
+) -> Result<Option<PathBuf>, String> {
+    component_with_agent(
+        asset,
+        "1.0.0",
+        tx,
+        root,
+        stop,
+        fallbacks,
+        ComponentPolicy {
+            client: &download_agent(Duration::from_millis(500)),
+            delay: Duration::from_millis(5),
+        },
+    )
+}
+
+#[test]
+fn component_404_uses_the_pinned_fallback_and_separate_destination() {
+    let (official, first) = serve(1, |_, _, stream| {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let (fallback, second) = serve(1, |_, _, stream| {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+            .unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = channel();
+    let (_cancel, stop) = channel();
+    let result = component_fast(
+        &asset(official, b"abc"),
+        &[fallback],
+        root.path(),
+        &tx,
+        &stop,
+    )
+    .unwrap()
+    .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(result, root.path().join("1.0.0/payload.exe"));
+    assert_eq!(std::fs::read(result).unwrap(), b"abc");
+    assert!(!installer_path("1.0.0", root.path()).unwrap().exists());
+}
+
+#[test]
+fn component_hash_mismatch_resets_partial_before_fallback() {
+    let (official, first) = serve(1, |_, _, stream| {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+            .unwrap();
+    });
+    let (fallback, second) = serve(1, |_, request, stream| {
+        assert!(
+            !request.contains("\r\nrange:"),
+            "bad bytes must be discarded"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+            .unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = channel();
+    let (_cancel, stop) = channel();
+    let path = component_fast(
+        &asset(official, b"abc"),
+        &[fallback],
+        root.path(),
+        &tx,
+        &stop,
+    )
+    .unwrap()
+    .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"abc");
+
+    let (bad, server) = serve(1, |_, _, stream| {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+            .unwrap();
+    });
+    let other = tempfile::tempdir().unwrap();
+    assert!(
+        component_fast(&asset(bad, b"abc"), &[], other.path(), &tx, &stop)
+            .unwrap_err()
+            .contains("sha256")
+    );
+    server.join().unwrap();
+    assert!(!component_path("1.0.0", other.path()).unwrap().exists());
+}
+
+#[test]
+fn component_validated_cache_reuses_bytes_without_network() {
+    let root = tempfile::tempdir().unwrap();
+    let path = component_path("1.0.0", root.path()).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"abc").unwrap();
+    // Port 0 is intentionally unavailable: a verified cache hit must not connect.
+    let asset = asset("http://127.0.0.1:0/never".into(), b"abc");
+    let (tx, _rx) = channel();
+    let (_cancel, stop) = channel();
+    assert_eq!(
+        component_fast(&asset, &[], root.path(), &tx, &stop).unwrap(),
+        Some(path.clone())
+    );
+    std::fs::write(&path, b"bad").unwrap();
+    assert!(component_fast(&asset, &[], root.path(), &tx, &stop).is_err());
+}
+
+#[test]
+fn component_fallback_resumes_bytes_without_forwarding_source_etag() {
+    let (official, first) = serve(3, |attempt, request, stream| {
+        if attempt == 0 {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nETag: \"official\"\r\nConnection: close\r\n\r\nabc")
+                .unwrap();
+        } else {
+            assert!(request.contains("range: bytes=3-\r\n"));
+            assert!(request.contains("if-range: \"official\"\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        }
+    });
+    let (fallback, second) = serve(1, |_, request, stream| {
+        assert!(request.contains("range: bytes=3-\r\n"));
+        assert!(!request.contains("if-range:"));
+        stream
+            .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 3-5/6\r\nETag: \"mirror\"\r\nConnection: close\r\n\r\ndef")
+            .unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = channel();
+    let (_cancel, stop) = channel();
+    let path = component_fast(
+        &asset(official, b"abcdef"),
+        &[fallback],
+        root.path(),
+        &tx,
+        &stop,
+    )
+    .unwrap()
+    .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+}
+
+#[test]
+fn component_pause_preserves_partial_and_unblocks_retry_wait() {
+    let (url, server) = serve(1, |_, _, stream| {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nETag: \"official\"\r\nConnection: close\r\n\r\nabc")
+            .unwrap();
+    });
+    let source = asset(url, b"abcdef");
+    let expected_hash = source.sha256.clone();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().to_owned();
+    let (tx, rx) = channel();
+    let (cancel, stop) = channel();
+    let worker = std::thread::spawn(move || {
+        component_with_agent(
+            &source,
+            "1.0.0",
+            &tx,
+            &path,
+            &stop,
+            &[],
+            ComponentPolicy {
+                client: &download_agent(Duration::from_millis(500)),
+                delay: Duration::from_secs(30),
+            },
+        )
+    });
+    loop {
+        if matches!(
+            rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::DownloadRetrying { .. }
+        ) {
+            break;
+        }
+    }
+    cancel.send(()).unwrap();
+    assert!(worker.join().unwrap().unwrap().is_none());
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read(
+            root.path()
+                .join("1.0.0")
+                .join(format!("{PLATFORM}-{expected_hash}.part"))
+        )
+        .unwrap(),
+        b"abc"
+    );
+    assert!(!component_path("1.0.0", root.path()).unwrap().exists());
+}
+
+#[test]
+fn component_production_api_rejects_http_before_network_or_cache_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = channel();
+    let (_cancel, stop) = channel();
+    let bad = asset("http://example.invalid/runtime.exe".into(), b"abc");
+    assert!(component(&bad, "1.0.0", &tx, root.path(), &stop, &[])
+        .unwrap_err()
+        .contains("HTTPS"));
+    assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    assert!(component_path("../escape", root.path()).is_err());
+}

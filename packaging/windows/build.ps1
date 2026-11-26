@@ -8,7 +8,7 @@
 #   2. Rust 工具链：rustup target add x86_64-pc-windows-msvc（ARM64 使用 aarch64-pc-windows-msvc）
 #      交叉编译 ARM64 还需安装 Visual Studio 的 C++ ARM64 生成工具
 #   3. NSIS 3：winget install NSIS.NSIS
-#   4. .NET 10 SDK（仅构建传感器组件需要，安装包自带运行时）
+#   4. .NET 10 SDK（仅 x64 可选温度组件的构建需要）
 #
 # 产物：dist\Tramoing-<version>-windows-<arch>-setup.exe
 #
@@ -64,6 +64,34 @@ function Assert-PeArchitecture([string]$Path) {
     }
 }
 
+# winget 装的 NSIS 不会把自己写进 PATH，所以先查命令、再退到默认安装目录
+$makensis = $null
+$cmd = Get-Command makensis -ErrorAction SilentlyContinue
+if ($cmd) {
+    $makensis = $cmd.Source
+} else {
+    $candidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"),
+        (Join-Path $env:ProgramFiles "NSIS\makensis.exe"),
+        "C:\Program Files (x86)\NSIS\makensis.exe"
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { $makensis = $c; break }
+    }
+}
+if (-not $makensis) {
+    throw "找不到 makensis。先安装 NSIS：winget install NSIS.NSIS，或到 nsis.sourceforge.io 下载"
+}
+
+# Pin the exact optional component bytes in the executable before compiling it.
+# ARM64 carries no unsupported worker, runtime, driver, or download metadata.
+if ($Architecture -eq 'x64') {
+    & (Join-Path $PSScriptRoot 'package-sensors.ps1') -DotNet $DotNet -MakeNsis $makensis
+    $env:TRAMOING_SENSOR_COMPONENT_MANIFEST = Join-Path $root 'dist/sensors-component.json'
+} else {
+    Remove-Item Env:TRAMOING_SENSOR_COMPONENT_MANIFEST -ErrorAction SilentlyContinue
+}
+
 Write-Host "==> 编译 release"
 # Cargo 报告本次构建的确切路径，兼容 CARGO_TARGET_DIR、.cargo 配置及目标平台子目录。
 # 不能从固定 target/release 收集：那里可能还留着另一次构建的旧程序。
@@ -99,28 +127,6 @@ foreach ($binary in @('tramoing', 'tramoing-helper')) {
     Write-Host "    $binary <- $($artifacts[$binary])"
 }
 Write-Host "    已收集到 $stage"
-
-& (Join-Path $PSScriptRoot 'build-sensors.ps1') -Architecture $Architecture -DotNet $DotNet
-Assert-PeArchitecture (Join-Path $stage 'sensors/tramoing-sensors.exe')
-
-# winget 装的 NSIS 不会把自己写进 PATH，所以先查命令、再退到默认安装目录
-$makensis = $null
-$cmd = Get-Command makensis -ErrorAction SilentlyContinue
-if ($cmd) {
-    $makensis = $cmd.Source
-} else {
-    $candidates = @(
-        (Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"),
-        (Join-Path $env:ProgramFiles "NSIS\makensis.exe"),
-        "C:\Program Files (x86)\NSIS\makensis.exe"
-    )
-    foreach ($c in $candidates) {
-        if ($c -and (Test-Path $c)) { $makensis = $c; break }
-    }
-}
-if (-not $makensis) {
-    throw "找不到 makensis。先安装 NSIS：winget install NSIS.NSIS，或到 nsis.sourceforge.io 下载"
-}
 
 Write-Host "==> 生成安装包"
 & $makensis "/DAPP_VERSION=$Version" "/DAPP_ARCH=$Architecture" "packaging\windows\tramoing.nsi"

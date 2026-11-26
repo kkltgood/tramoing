@@ -1,5 +1,6 @@
 //! Isolated sensor worker supervised by the elevated helper. The UI can only
-//! request a reading; it cannot supply paths, arguments, files, or driver commands.
+//! request a reading or recheck the installed component; it cannot supply paths,
+//! arguments, files, or driver commands.
 use std::io::{Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::*;
+use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
 
 use crate::network_control::{self, Server};
 use crate::temperature_protocol::{Request, Snapshot, Status, MAX_FRAME};
@@ -30,6 +33,40 @@ fn pipe_name() -> Result<String, String> {
 pub fn request() -> Result<Snapshot, String> {
     network_control::request_named(&pipe_name()?, &Request::Read {}, REQUEST_TIMEOUT)
         .map_err(|error| error.replace("网络控制", "温度采集"))
+}
+
+/// Recheck only the component at the helper's fixed installation path. This is
+/// separate from downloading/installing and never grants callers an execute API.
+pub fn refresh() -> Result<Snapshot, String> {
+    network_control::request_named(&pipe_name()?, &Request::Refresh {}, REQUEST_TIMEOUT)
+        .map_err(|error| error.replace("网络控制", "温度采集"))
+}
+
+/// Check the native OS, not the process target: an x64 process under ARM64
+/// emulation must not enter LibreHardwareMonitor's x86 CPU/driver code.
+pub fn supported_platform() -> bool {
+    let mut process = 0;
+    let mut native = 0;
+    unsafe {
+        IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) != 0
+            && native == IMAGE_FILE_MACHINE_AMD64
+    }
+}
+
+/// FDD apphosts use the registered machine runtime. Do not inherit environment
+/// overrides that could redirect an elevated worker/probe to user-owned code,
+/// enable a profiler/startup hook, change roll-forward, or write a trace file.
+pub fn clean_runtime_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if ["DOTNET_", "COMPLUS_", "COR_", "CORECLR_", "COREHOST_"]
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+            || upper == "DEVPATH"
+        {
+            command.env_remove(key);
+        }
+    }
 }
 
 struct Worker {
@@ -52,6 +89,7 @@ impl Worker {
     }
 
     fn start_command(mut command: Command) -> Result<Self, String> {
+        clean_runtime_environment(&mut command);
         let raw = unsafe { CreateJobObjectW(null(), null()) };
         if raw.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
@@ -71,12 +109,6 @@ impl Worker {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let mut child = command
-            // Ignore inherited runtime injection/profiling settings.
-            .env_remove("DOTNET_STARTUP_HOOKS")
-            .env_remove("DOTNET_ADDITIONAL_DEPS")
-            .env_remove("DOTNET_SHARED_STORE")
-            .env_remove("COR_ENABLE_PROFILING")
-            .env_remove("CORECLR_ENABLE_PROFILING")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -216,6 +248,13 @@ impl Supervisor {
 
     fn start(&mut self) {
         self.retry = Instant::now() + RETRY;
+        if !supported_platform() {
+            self.reading = Snapshot::unavailable(
+                Status::UnsupportedPlatform,
+                "Built-in temperature sensors support native Windows x64 only",
+            );
+            return;
+        }
         let installed = std::env::current_exe().ok().is_some_and(|p| {
             p.with_file_name("sensors")
                 .join("tramoing-sensors.exe")
@@ -224,7 +263,7 @@ impl Supervisor {
         self.reading = if !installed {
             Snapshot::unavailable(
                 Status::ComponentMissing,
-                "Built-in sensor component missing; reinstall the complete Windows package",
+                "Built-in sensor component missing; download it from Settings",
             )
         } else {
             match Worker::start() {
@@ -242,6 +281,14 @@ impl Supervisor {
 
     fn reading(&mut self) -> Snapshot {
         self.requested = Some(Instant::now());
+        self.reading.clone()
+    }
+
+    fn refresh(&mut self) -> Snapshot {
+        self.worker.take();
+        self.retry = Instant::now();
+        self.requested = Some(self.retry);
+        self.reading = Snapshot::unavailable(Status::Starting, "Rechecking sensor component");
         self.reading.clone()
     }
 }
@@ -275,8 +322,11 @@ pub fn run() -> ! {
             let mut serve = || -> Result<(), String> {
                 let deadline = Instant::now() + REQUEST_TIMEOUT;
                 network_control::verify_peer(handle, false)?;
-                let Request::Read {} = network_control::receive(handle, deadline)?;
-                network_control::send(handle, &supervisor.reading(), deadline)?;
+                let reading = match network_control::receive(handle, deadline)? {
+                    Request::Read {} => supervisor.reading(),
+                    Request::Refresh {} => supervisor.refresh(),
+                };
+                network_control::send(handle, &reading, deadline)?;
                 network_control::read(handle, &mut [0; 1], deadline)
             };
             if let Err(error) = serve() {

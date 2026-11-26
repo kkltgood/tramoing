@@ -15,6 +15,8 @@ mod autostart;
 #[cfg(windows)]
 mod badge_window;
 mod color_picker;
+#[cfg(any(windows, test))]
+mod component_install;
 mod device_ip;
 mod diagnostics;
 mod engine;
@@ -30,6 +32,8 @@ mod network_access;
 mod network_panel;
 #[cfg(any(target_os = "macos", windows))]
 mod performance;
+#[cfg(any(windows, test))]
+mod sensor_components;
 mod settings;
 mod startup;
 mod surface;
@@ -43,6 +47,10 @@ mod windows_panel;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    if let Some(code) = component_install::handle_install_command() {
+        std::process::exit(code);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let reporter = args
         .first()

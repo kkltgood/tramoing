@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "dependencies": [
+    {
+      "id": "dotnet",
+      "name": ".NET Runtime",
+      "version": "10.0.15",
+      "architecture": "x64",
+      "minimum_version": "10.0.0",
+      "url": "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.15/dotnet-runtime-10.0.15-win-x64.exe",
+      "relative_path": "dotnet/10.0.15/windows-x64/dotnet-runtime-10.0.15-win-x64.exe",
+      "size": 30661872,
+      "sha256": "59b0da003d18b76e8dcc0dc05bf7e54a0e6e83e7c569d57e1ee5c270664bb128",
+      "official_sha512": "c202a6721d66f49086e087a58e31c448062b0718fdd66b31807d7b2b31673adae5d3ccb36fc7451e113172ce59913d6c8034a35d5cc1cf6b079d5b544f1f425b",
+      "publisher": "Microsoft Corporation",
+      "fallbacks": [
+        "https://github.com/kkltgood/tramoing/releases/download/deps-dotnet-10.0.15/dotnet-runtime-10.0.15-win-x64.exe"
+      ]
+    },
+    {
+      "id": "pawnio",
+      "name": "PawnIO",
+      "version": "2.2.0",
+      "architecture": "x64",
+      "minimum_version": "2.2.0",
+      "url": "https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe",
+      "relative_path": "pawnio/2.2.0/windows-x64/PawnIO_setup.exe",
+      "size": 3410960,
+      "sha256": "1f519a22e47187f70a1379a48ca604981c4fcf694f4e65b734aaa74a9fba3032",
+      "publisher": "namazso.eu",
+      "fallbacks": [
+        "https://github.com/kkltgood/tramoing/releases/download/deps-pawnio-2.2.0/PawnIO_setup.exe"
+      ]
+    }
+  ]
+}

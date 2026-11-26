@@ -204,7 +204,7 @@ cargo test -p tray-app live_macos_engine_recovers --locked -- --ignored --nocapt
 
 ## 打包
 
-版本统一读取根 `Cargo.toml` 的 `[workspace.package].version`。发布时修改该值、更新锁文件，再运行测试和打包。构建产物放在 `dist/`，通过 GitHub Releases 分发，不提交二进制到源码仓库。
+版本统一读取根 `Cargo.toml` 的 `[workspace.package].version`。发布时修改该值、更新锁文件，再运行测试和打包。构建产物放在 `dist/`，通过 GitHub Releases 分发。应用构建产物和第三方依赖安装器均不提交到 Git。`static/dependencies/` 仅跟踪依赖清单和说明，已下载的安装器作为被忽略的本地缓存保留；远程兜底通过独立 `deps-*` Release 附件发布，不进入基础安装包。
 
 Windows：
 
@@ -216,7 +216,7 @@ rustup target add aarch64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -Architecture arm64
 ```
 
-`-Architecture` 支持 `x64`（默认）和 `arm64`，分别指定 `x86_64-pc-windows-msvc` 和 `aarch64-pc-windows-msvc` 编译目标。脚本从 Cargo 返回的实际产物路径收集主程序和助手，兼容自定义 `CARGO_TARGET_DIR`，并校验两个 PE 文件的真实架构。暂存目录为 `dist/windows-<arch>/`，生成 `dist/Tramoing-<version>-windows-<arch>-setup.exe` 和对应的 `.sha256`，安装目录包含项目许可证。安装器在修改现有安装前拒绝不兼容的架构；已有的 x64 程序在 ARM64 Windows 的模拟环境下仍可继续升级 x64 包。`.ps1` 和 `.nsi` 中的中文使用 UTF-8 BOM，以兼容 Windows PowerShell 5.1 和 NSIS。
+`-Architecture` 支持 `x64`（默认）和 `arm64`，分别指定 `x86_64-pc-windows-msvc` 和 `aarch64-pc-windows-msvc` 编译目标。脚本从 Cargo 返回的实际产物路径收集主程序和助手，兼容自定义 `CARGO_TARGET_DIR`，并校验两个 PE 文件的真实架构。暂存目录为 `dist/windows-<arch>/`，生成 `dist/Tramoing-<version>-windows-<arch>-setup.exe` 和对应的 `.sha256`，安装目录包含项目许可证。基础安装包不携带温度组件、.NET 运行时或 PawnIO 安装器；升级时保留已有的兼容 `sensors/` 目录。x64 构建在编译 Rust 前准备独立温度组件及其可信清单，ARM64 不构建该组件。安装器在修改现有安装前拒绝不兼容的架构；已有的 x64 程序在 ARM64 Windows 的模拟环境下仍可继续升级 x64 包。`.ps1` 和 `.nsi` 中的中文使用 UTF-8 BOM，以兼容 Windows PowerShell 5.1 和 NSIS。
 
 升级逻辑位于 `packaging/windows/upgrade.nsh`，同样保存为 UTF-8 BOM。`verify-windows-upgrade.ps1` 编译并运行使用这些回调的独立安装器，验证首次安装保留向导、旧客户端升级跳过向导、自定义目录、等待旧进程退出、失败时不重启和旧产品名迁移。等待退出的用例用 Rust 编译同架构的临时父进程，并核对其就绪信号；需要安装对应 Rust target 和 MSVC 生成工具。测试仅写入 `target/upgrade-test-<id>` 和独立的 HKCU 测试键，结束时清理测试键；发布工作流在 Windows 打包前运行。也可在 Actions 的 `Windows installer verification` 中选择架构单独运行，失败时保留安装器诊断文件。
 
@@ -277,7 +277,7 @@ macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连
 
 不要对 `opensource` 使用 `git push -u`，以免改变日常开发的上游。标签必须与 Cargo 版本完全一致，格式为 `v主版本.次版本.补丁版本`；当前 Windows 安装器要求三个版本分量均为不超过 65535 的非负整数，因此此流程暂不发布预览版本标签。
 
-每次 Release 包含四个安装包、各自的 `.sha256` 以及 `latest.json`，共九个附件：
+每次主程序 Release 包含四个安装包、各自的 `.sha256` 以及 `latest.json`，共九个附件。温度组件使用独立版本及 `sensors-v<version>` Release；主程序更新复用已有组件，不因为主程序版本变化重复分发依赖：
 
 | 安装包 | 适用设备 | 更新清单平台键 |
 | --- | --- | --- |
@@ -340,12 +340,32 @@ powershell -ExecutionPolicy Bypass -File packaging\update\make-manifest.ps1 `
 
 温度回归：`cargo test -p tm-macos temperature -- --include-ignored --nocapture` 可读取真实 AppleSMC（只读）。检查 CPU/GPU 使用率旁的 °C、独立“显示温度”开关和重启保留、无传感器时的 `--°C`、Windows 96–192 DPI 温度列。
 
-Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHardwareMonitor 0.9.6，NuGet 传递依赖与完整性记录在 `packages.lock.json`。构建需要 .NET 10 SDK，安装包发布 self-contained 的同架构组件，用户无需预装 .NET。执行 `dotnet run --project sensors/Tramoing.Sensors.Tests -c Release`、`packaging/windows/build-sensors.ps1 -Architecture x64`（或 arm64）及 `scripts/verify-windows-sensors.ps1` 验证；打包脚本的 `-DotNet` 可指定 SDK 可执行文件。只有完整 `build.ps1` 构建会生成可安装的主程序、助手和传感器组件组合。开发版助手旁也需要同架构 `sensors/` 子目录。
+## Windows 温度组件按需安装
 
-温度管道 `Tramoing-Temperature-<SID>-v1` 沿用网络控制的账户 ACL、远程连接拒绝、双端程序路径及助手提权验证，但请求只有 Read，不能传入路径或命令。助手在独立线程管理 worker，worker 先等待握手，再进入硬件库；Windows Job Object 确保助手终止时关闭子进程。协议是 4 字节长度加 UTF-8 JSON，worker 帧上限 8 KiB；采样约 2 秒，15 秒 watchdog、60 秒失败退避、12 秒 UI 请求租期。关闭显示不会保留最后一次有效温度。仅开启 LHM 的 CPU 和 GPU 硬件组，不扫描主板 EC、磁盘，也不写入风扇控制。CPU 与 GPU 独立采样，GPU 查询异常不清除正常 CPU 读数；任一温度有效即可返回 ready，另一项仍保持空值。
+Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHardwareMonitor 0.9.6，NuGet 传递依赖与完整性记录在 `packages.lock.json`。组件构建需要 .NET 10 SDK，使用 `--self-contained false` 发布 Windows x64 程序、硬件库及其依赖，不附带 .NET 运行时。版本和协议号集中在 `sensors/component.json`，独立于主程序版本。执行 `dotnet run --project sensors/Tramoing.Sensors.Tests -c Release`、`packaging/windows/build-sensors.ps1 -Architecture x64` 和 `scripts/verify-windows-sensors.ps1 -Architecture x64` 验证；`-DotNet` 可指定 SDK 可执行文件。开发版助手旁也需要可用的 `sensors/` 子目录及兼容运行时。
+
+`packaging/windows/package-sensors.ps1` 生成 `dist/Tramoing-Sensors-<version>-windows-x64-setup.exe`、对应 `.sha256` 和 `dist/sensors-component.json`。完整 `build.ps1` 在 Rust 编译前准备组件，并通过 `TRAMOING_SENSOR_COMPONENT_MANIFEST` 将生成清单嵌入主程序。清单固定组件架构、版本、协议、文件大小、SHA-256 和下载来源；组件源文件或发布输入变化时必须更新组件版本，已经发布的同版本文件不能被覆盖。独立组件发布不标记为主程序 latest，避免影响原有更新入口。
+
+打开设置中的温度区域只执行本机检查，不触发联网。点击“下载所需组件”后才开始下载，下载全部校验完成后点击“安装并启用”。检测会分别检查组件兼容性、.NET 运行时种类/架构/版本以及 PawnIO 状态；已有可用组件或依赖直接复用。旧版 self-contained 组件在兼容时继续使用，不为了迁移而强制重装 .NET。
+
+依赖来源顺序是：已安装且兼容的依赖 → 本地完整校验通过的缓存 → 清单锁定的官方 HTTPS 地址 → 独立依赖 Release 的固定附件地址。第三方安装器保留原始签名，官方源和备用源必须通过同一预期大小及 SHA-256，安装前另核验所需的发布者签名。`static/dependencies/manifest.json` 保留版本、来源和校验信息，安装器不进入 Git 历史。默认开发缓存是 `target/dependency-cache/`，原先保存在 `static/dependencies/` 的安装器也可作为被忽略的本地缓存继续保留。
+
+`python3 scripts/verify-static-dependencies.py` 默认只验证清单，不要求本地存在安装器。添加 `--download --dependency all` 会从固定官方地址下载并验证大小、SHA-256 及清单中可用的官方 SHA-512；`--verify-cache` 只验证已有文件。`--dependency` 可选 `all`、`dotnet` 或 `pawnio`，`--cache-dir` 可指定缓存目录。
+
+首次发布兜底文件时，先将代码推到 `kkltgood/tramoing` 的默认 `main` 分支（本地远程名 `opensource`），再打开 GitHub **Actions → Publish dependency backups → Run workflow**，选择要发布的依赖。`.github/workflows/dependency-releases.yml` 只接受手动触发，在 Windows runner 上下载官方文件并核验哈希和 Authenticode 签名，再创建草稿、上传附件和校验文件、发布。标签分别为 `deps-dotnet-10.0.15`、`deps-pawnio-2.2.0` 等，设置 `make_latest=false`，不会替代软件的 latest，也不会触发监听 `v*` 的软件打包流程。普通主程序更新不重复发布依赖。
+
+已发布的依赖版本只校验复用，不能覆盖为其他内容；草稿上传中断可重试。更新依赖时修改可信清单并发布新的依赖版本，保留仍被已发布客户端引用的旧 Release。备用附件只有发布后才可用，提交清单或保留本地文件不等于上线。GitHub 备用和 PawnIO 官方源使用同一托管服务，无法解决 GitHub 整体不可达；无论来源如何变化都必须保持同一文件校验值。
+
+组件下载缓存位于数据目录的 `components/`，与主程序 `update/` 分开。每个组件独立命名，下载支持暂停、断点续传和重新启动后复用缓存；程序重启不自动恢复联网。主源连续无进展时有限重试再切备用源，所有源失败后返回可重试状态。切换镜像会丢弃源专属 ETag，保留与同一 SHA-256 绑定的部分内容；完整哈希失败则清空损坏内容。校验通过前不会提供安装入口。
+
+安装在专用提权流程中执行：下载保持普通权限，提权后重新校验输入，第三方官方安装器安装共享 .NET/PawnIO，独立温度安装器将私有组件写入受保护的应用目录。管理员采集助手继续只启动固定安装位置的组件，不接受用户指定的可执行路径。组件替换失败时保留或恢复旧组件；取消 UAC 后保留已校验缓存并允许重试。主程序升级必须保留现有 `sensors/`，不能先删除 worker 再因瘦身而不补回。卸载 Tramoing 清理安装目录中的私有组件和安装日志，保留共享 .NET/PawnIO；下载缓存与现有用户数据一样保留，可手动删除数据目录中的 `components/`。
+
+ARM64 系统（包括运行 x64 模拟程序）不显示内置组件下载入口、不构建该 worker，也不安装 PawnIO；可用的 WDDM/WMI 温度来源保留。下载和安装状态独立于温度读数：文件就绪不代表硬件受支持，仍需以实际采样状态为准。
+
+温度管道 `Tramoing-Temperature-<SID>-v1` 沿用网络控制的账户 ACL、远程连接拒绝、双端程序路径及助手提权验证，请求只有 Read 和重新检查固定组件的 Refresh，不能传入路径、参数或安装命令。助手在独立线程管理 worker，worker 先等待握手，再进入硬件库；Windows Job Object 确保助手终止时关闭子进程。协议是 4 字节长度加 UTF-8 JSON，worker 帧上限 8 KiB；采样约 2 秒，15 秒 watchdog、60 秒失败退避、12 秒 UI 请求租期。关闭显示不会保留最后一次有效温度。仅开启 LHM 的 CPU 和 GPU 硬件组，不扫描主板 EC、磁盘，也不写入风扇控制。CPU 与 GPU 独立采样，GPU 查询异常不清除正常 CPU 读数；任一温度有效即可返回 ready，另一项仍保持空值。
 
 Windows GPU 按 WDDM → 内置 LHM GPU → 可选 WMI 的顺序选择读数。WDDM 使用 D3DKMT_ADAPTER_PERFDATA（0.1°C 单位）；LHM 的 NVIDIA 路径使用 NVAPI，可补充旧系统/驱动没有 WDDM 温度的情形。CPU 或 GPU 仍缺少读数时，可选 WMI 桥在独立 PowerShell 进程查询已有 LHM/OHM，使用限长快照与 15 秒超时；内置 CPU 与内置 GPU/WDDM 已完整时停止 WMI。内置 GPU 与 CPU 共用现有的 Windows x64、管理员助手和 PawnIO 前置检查。ARM64 及在 ARM64 上模拟运行的 x64 程序不进入 LHM 的 CPUID 路径；当前内置 CPU 适配覆盖上游支持的 Intel/AMD，老 AMD Family 10h–16h 暂无适配，必须区分构建覆盖与传感器实机覆盖。
 
-x64 安装包包含官方 PawnIO 2.2.0，构建校验固定 SHA-256 及发布者 Authenticode 签名；构建和运行采集均不安装驱动。安装器默认选中的独立 CPU 温度组件使用官方 `-install -silent`，跳过已安装的较新版本，识别 3010 重启状态，错误时保留其他功能并说明原因。ARM64 包不携带或安装该驱动。卸载不删除共享 PawnIO。第三方说明和 NuGet 许可证随组件打包。
+PawnIO 使用清单锁定的官方安装器与发布者 Authenticode 签名要求；构建和运行采集均不安装驱动。用户确认组件安装后才按需执行官方 `-install -silent`，跳过已经可用的兼容版本，识别 3010 重启状态，错误时保留其他功能并说明原因。已安装但驱动未就绪时应区分“需要重启/受策略限制”和“缺少下载文件”，避免反复下载安装。第三方说明和 NuGet 许可证随自有温度组件打包。
 
-发布前实机矩阵应覆盖 Intel/AMD 台式机与笔记本、Windows 10/11 x64、Windows 11 ARM64、无驱动/旧驱动/驱动受策略限制、启停温度、助手被结束、硬件查询卡住、WMI 运行/退出与 GPU 驱动不支持。普通权限的 smoke test 只证明进程协议和权限状态，不代表真实温度读取成功。
+发布前按需安装回归须覆盖：纯净机器、已有兼容/不兼容 .NET、已有/过旧/不可用 PawnIO、旧 self-contained 组件升级保留、官方源失败转备用、备用未发布、跨镜像续传、错误哈希、暂停/重启、UAC 取消、组件替换失败恢复。发布前实机矩阵还应覆盖 Intel/AMD 台式机与笔记本、Windows 10/11 x64、Windows 11 ARM64、无驱动/旧驱动/驱动受策略限制、启停温度、助手被结束、硬件查询卡住、WMI 运行/退出与 GPU 驱动不支持。普通权限的 smoke test 只证明进程协议和权限状态，不代表真实温度读取成功。

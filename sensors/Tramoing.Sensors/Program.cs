@@ -7,13 +7,35 @@ using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 using Tramoing.Sensors;
 
-// Only the elevated helper launches this executable. No command line paths,
-// plugins, fan controls, driver installation or network listeners are exposed.
+// The elevated helper launches the sampling mode. --probe only reports the
+// installed component/runtime without touching hardware or requiring elevation.
+// No command line paths, plugins, fan controls or driver commands are exposed.
 internal static class Program
 {
     private const string Library = "LibreHardwareMonitor 0.9.6 / PawnIO";
 
-    private static int Main()
+    private static int Main(string[] args)
+    {
+        if (args is ["--probe"])
+        {
+            var version = typeof(Program).Assembly.GetName().Version!;
+            Console.WriteLine(JsonSerializer.Serialize(new
+            {
+                protocol = 1,
+                component_version = $"{version.Major}.{version.Minor}.{version.Build}",
+                architecture = RuntimeInformation.ProcessArchitecture.ToString(),
+                os_architecture = RuntimeInformation.OSArchitecture.ToString(),
+                runtime = Environment.Version.ToString()
+            }));
+            return 0;
+        }
+        if (args.Length != 0) return 2;
+        return Sample();
+    }
+
+    // Keep hardware types outside Main so --probe never initializes the
+    // hardware library and can run as a normal user before installing PawnIO.
+    private static int Sample()
     {
         // The helper assigns our process to a kill-on-close job before sending
         // this handshake. Do not open any sensor hardware before then.
@@ -134,7 +156,7 @@ internal static class Program
     {
         "unsupported_platform" => "Built-in CPU sensors support Windows x64 Intel/AMD; this architecture requires another sensor provider",
         "permission_denied" => "Built-in CPU sensors require the elevated Tramoing helper",
-        "driver_missing" => "PawnIO 2.2 or newer is not installed; repair the Windows installation with CPU temperature selected",
+        "driver_missing" => "PawnIO 2.2 or newer is not installed; install the temperature component from Settings",
         _ => "PawnIO is installed but its driver cannot be opened; check installation, driver policy or a pending restart"
     };
 

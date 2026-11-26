@@ -8,6 +8,9 @@ pub const MAX_FRAME: usize = 8192;
 #[serde(tag = "command", deny_unknown_fields)]
 pub enum Request {
     Read {},
+    /// Discard a previous failure and recheck the fixed installed component.
+    /// No paths, installer commands or caller-supplied arguments are accepted.
+    Refresh {},
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -112,10 +115,18 @@ mod tests {
     #[test]
     fn request_cannot_supply_a_program_or_arguments() {
         assert!(serde_json::from_str::<Request>(r#"{"command":"Read"}"#).is_ok());
+        assert!(serde_json::from_str::<Request>(r#"{"command":"Refresh"}"#).is_ok());
         assert!(
             serde_json::from_str::<Request>(r#"{"command":"Read","path":"other.exe"}"#).is_err()
         );
         assert!(serde_json::from_str::<Request>(r#"{"command":"Launch"}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"command":"Refresh","path":"other.exe"}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"command":"Refresh","args":["--install"]}"#)
+                .is_err()
+        );
         let frame: Snapshot = serde_json::from_str(r#"{"cpu":null,"gpu":null,"status":"driver_missing","source":"PawnIO is not installed"}"#).unwrap();
         assert_eq!(frame.status, Status::DriverMissing);
     }

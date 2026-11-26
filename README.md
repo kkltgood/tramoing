@@ -6,7 +6,7 @@
 
 An open-source network speed and traffic monitor for the Windows taskbar and macOS menu bar, with per-app bandwidth usage, local traffic history, and optional CPU/GPU monitoring. Built with Rust and egui.
 
-查看哪些应用正在使用网络、各自的上传和下载速率，以及可选的 CPU / GPU 使用率和温度。数据保存在本机，运行时无需 Electron、Python 或其他外部运行环境。
+查看哪些应用正在使用网络、各自的上传和下载速率，以及可选的 CPU / GPU 使用率和温度。数据保存在本机，基础监控无需 Electron、Python 或其他外部运行环境；Windows 可选温度组件需要 .NET 运行时，可按需下载安装并复用已有依赖。
 
 [下载最新版](https://github.com/kkltgood/tramoing/releases/latest) · [版本记录](https://github.com/kkltgood/tramoing/releases) · [问题反馈](https://github.com/kkltgood/tramoing/issues) · [开发与打包](docs/development.md) · [配置与故障排查](docs/troubleshooting.md) · [MIT 许可证](LICENSE)
 
@@ -43,7 +43,7 @@ An open-source network speed and traffic monitor for the Windows taskbar and mac
 | Windows 11 ARM64 | ETW 采集助手 | 使用 ARM64 原生安装包，助手需要管理员权限 |
 | macOS 11+，Apple Silicon / Intel | 系统 `nettop` | 建议通过 `.app` 包运行并验证菜单栏行为 |
 
-CPU / GPU 使用率不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。温度显示在对应使用率旁，关闭“显示温度”会停止温度采集，保留使用率。macOS 从 AppleSMC 读取已适配的 Intel / Apple Silicon 传感器。Windows x64 的 CPU 温度由管理员助手管理的独立组件读取，使用 LibreHardwareMonitor 0.9.6；安装程序默认选中“CPU 温度支持”，部署官方签名的 PawnIO 2.2 驱动，无需另开监控软件。Windows GPU 优先读取 WDDM 驱动温度；不可用时由内置组件读取显卡传感器（NVIDIA 使用 NVAPI）。已有 LibreHardwareMonitor / OpenHardwareMonitor 的 WMI 数据仍可作为补充来源。ARM64 及部分老型号没有内置传感器适配，程序正常运行并提示原因；不可用时显示 `--°C`。温度取可用核心/芯片传感器中的最高值，多 GPU 的温度和使用率可能来自不同设备。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
+CPU / GPU 使用率不依赖 Windows 网络采集助手。GPU 使用率需要驱动提供相应计数器，不支持时显示 `--%`。温度显示在对应使用率旁，关闭“显示温度”会停止温度采集，保留使用率。macOS 从 AppleSMC 读取已适配的 Intel / Apple Silicon 传感器。Windows x64 的 CPU 温度由管理员助手管理的独立组件读取，使用 LibreHardwareMonitor 0.9.6；基础安装包不附带该组件、.NET 或 PawnIO。在性能设置里点击“下载所需组件”，只下载缺失的依赖，校验后点击“安装并启用”；.NET 和 PawnIO 使用固定版本的官方下载地址，失败时尝试独立依赖 Release 的备用附件。已有兼容组件和依赖直接复用，普通主程序更新不会重复下载，无需另开监控软件。Windows GPU 优先读取 WDDM 驱动温度；不可用时由内置组件读取显卡传感器（NVIDIA 使用 NVAPI）。已有 LibreHardwareMonitor / OpenHardwareMonitor 的 WMI 数据仍可作为补充来源。ARM64 及部分老型号没有内置传感器适配，程序正常运行并提示原因；不可用时显示 `--°C`。关闭显示不会卸载组件；卸载 Tramoing 保留共享 .NET 和 PawnIO。温度取可用核心/芯片传感器中的最高值，多 GPU 的温度和使用率可能来自不同设备。Windows 任务栏扩展可能受系统版本、可用空间和第三方任务栏工具影响。Linux 暂不支持。
 
 ## 从源码运行
 

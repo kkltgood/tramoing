@@ -1,0 +1,57 @@
+name: Publish dependency backups
+
+on:
+  workflow_dispatch:
+    inputs:
+      dependency:
+        description: 'Pinned dependency to publish as an independent backup release'
+        required: true
+        type: choice
+        options: [all, dotnet, pawnio]
+        default: all
+
+permissions:
+  contents: read
+
+# The all option overlaps both individual options; serialize every publication.
+concurrency:
+  group: dependency-backup-releases
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'kkltgood/tramoing' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      DEPENDENCY: ${{ inputs.dependency }}
+      DEPENDENCY_CACHE: target/dependency-backups
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check dependency publication logic
+        run: node --test packaging/update/dependency-release.test.cjs
+      - name: Download pinned original installers and verify checksums
+        shell: pwsh
+        run: |
+          python scripts/verify-static-dependencies.py --download --dependency $env:DEPENDENCY --cache-dir $env:DEPENDENCY_CACHE
+          if ($LASTEXITCODE -ne 0) { throw 'Official dependency download or verification failed' }
+      - name: Verify official publisher signatures
+        shell: powershell
+        run: ./scripts/verify-dependency-signatures.ps1 -Dependency $env:DEPENDENCY -CacheDirectory $env:DEPENDENCY_CACHE
+      - name: Publish or verify immutable dependency releases
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { publishDependencies } = require('./packaging/update/dependency-release.cjs');
+            await publishDependencies({
+              github, context, core,
+              cacheRoot: process.env.DEPENDENCY_CACHE,
+              dependency: process.env.DEPENDENCY,
+            });

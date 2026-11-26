@@ -308,6 +308,8 @@ pub struct App {
     error_prompt: Option<crate::error_dialog::Prompt>,
     /// 更新检测。网络动作全在后台线程，这里只是把事件攒成可画的状态。
     update: crate::update::Updater,
+    #[cfg(windows)]
+    sensor_components: crate::sensor_components::Manager,
     /// 进程启动时刻。
     ///
     /// 自动检查要等启动 10 秒后再发请求：首帧那会儿还在建窗口、连采样线程，
@@ -538,6 +540,8 @@ impl App {
                 }
                 updater
             },
+            #[cfg(windows)]
+            sensor_components: crate::sensor_components::Manager::new(),
             started_at: Instant::now(),
             force_update_check: std::env::var_os("TM_FORCE_UPDATE").is_some(),
             // 调试用：TM_SCROLL=140 给列表一个初始位置，方便截图核对滚动后的样子
@@ -793,6 +797,10 @@ impl App {
 
     pub fn close(&mut self, ctx: &egui::Context) {
         if self.error_prompt.is_some() {
+            return;
+        }
+        #[cfg(windows)]
+        if self.sensor_components.is_installing() {
             return;
         }
         if matches!(
@@ -1334,6 +1342,16 @@ impl eframe::App for App {
                 self.open(ctx, rect);
             } else {
                 self.show_on_start = true;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if self.sensor_components.poll() {
+                ctx.request_repaint();
+            }
+            if self.sensor_components.is_busy() {
+                ctx.request_repaint_after(Duration::from_millis(120));
             }
         }
 
@@ -2439,11 +2457,7 @@ impl App {
                     );
                     #[cfg(windows)]
                     {
-                        settings_note(
-                            ui,
-                            p,
-                            lang.t("ui.cpu_temperature_uses_the_built_in_sensor_component"),
-                        );
+                        self.sensor_component_controls(ui, p, lang);
                         if let Some(thermal) = reading
                             .as_ref()
                             .map(|r| &r.temperatures)
@@ -2453,15 +2467,18 @@ impl App {
                             let message = match thermal.cpu_unavailable {
                                 Some(Reason::Starting) => lang.t("ui.reading_cpu_temperature"),
                                 Some(Reason::HelperUnavailable) => lang.t("ui.cpu_sensor_helper_is_unavailable_install_or_start"),
-                                Some(Reason::ComponentMissing) => lang.t("ui.cpu_sensor_component_is_missing_repair_using_the"),
-                                Some(Reason::DriverMissing) => lang.t("ui.cpu_sensor_driver_is_missing_or_outdated_enable"),
+                                Some(Reason::ComponentMissing | Reason::DriverMissing)
+                                    if matches!(self.sensor_components.phase, crate::sensor_components::Phase::Installed { .. }) => lang.t("sensors.changed"),
+                                // The component manager offers installation or repair above.
+                                Some(Reason::ComponentMissing | Reason::DriverMissing | Reason::UnsupportedPlatform) => "",
                                 Some(Reason::DriverUnavailable) => lang.t("ui.cpu_sensor_driver_is_unavailable_check_its_installation"),
                                 Some(Reason::PermissionDenied) => lang.t("ui.cpu_sensor_helper_needs_administrator_privileges_repair_the"),
-                                Some(Reason::UnsupportedPlatform) => lang.t("ui.built_in_cpu_sensors_do_not_support_this"),
                                 Some(Reason::Failed) => lang.t("ui.cpu_temperature_reading_failed_and_will_retry_automatically"),
                                 _ => lang.t("ui.no_cpu_temperature_sensor_is_available_a_running"),
                             };
-                            settings_note(ui, p, message).on_hover_text(&thermal.source);
+                            if !message.is_empty() {
+                                settings_note(ui, p, message).on_hover_text(&thermal.source);
+                            }
                         }
                     }
                 }
@@ -2469,6 +2486,156 @@ impl App {
                 settings_note(ui, p, lang.t("performance.display_hint"));
             }
         });
+    }
+
+    #[cfg(windows)]
+    fn sensor_component_controls(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
+        use crate::sensor_components::Phase;
+        if matches!(self.sensor_components.phase, Phase::Idle) {
+            // Inspecting the machine never contacts a download server.
+            self.sensor_components.inspect();
+        }
+        let phase = self.sensor_components.phase.clone();
+        let update_busy = self.update.is_busy();
+        match phase {
+            Phase::Idle | Phase::Checking => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+                    settings_note(ui, p, lang.t("sensors.checking"));
+                });
+            }
+            Phase::Missing { bytes, reused } => {
+                settings_note(ui, p, lang.t("sensors.missing"));
+                if !reused.is_empty() {
+                    settings_note(
+                        ui,
+                        p,
+                        &lang.format("sensors.reusing", &[("items", &reused.join(", "))]),
+                    );
+                }
+                let label = lang.format(
+                    "sensors.download_size",
+                    &[("size", &format!("{:.1}", bytes as f64 / 1_000_000.0))],
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if settings_action(ui, p, &label, !update_busy).clicked() {
+                        self.sensor_components.download();
+                    }
+                    if settings_action(ui, p, lang.t("sensors.recheck"), true).clicked() {
+                        self.sensor_components.inspect();
+                    }
+                });
+            }
+            Phase::Downloading { pct, label } | Phase::Pausing { pct, label } => {
+                settings_note(
+                    ui,
+                    p,
+                    &lang.format("sensors.downloading", &[("item", &label)]),
+                );
+                ui.add(
+                    egui::ProgressBar::new(pct)
+                        .desired_width(ui.available_width())
+                        .show_percentage()
+                        .fill(p.accent),
+                );
+                ui.add_space(5.0);
+                let pausing = matches!(self.sensor_components.phase, Phase::Pausing { .. });
+                if settings_action(
+                    ui,
+                    p,
+                    lang.t(if pausing {
+                        "sensors.pausing"
+                    } else {
+                        "sensors.pause"
+                    }),
+                    !pausing,
+                )
+                .clicked()
+                {
+                    self.sensor_components.pause();
+                }
+            }
+            Phase::Paused { pct, error } => {
+                if let Some(error) = error {
+                    settings_note(
+                        ui,
+                        p,
+                        &lang.format("sensors.download_failed", &[("error", &error)]),
+                    );
+                } else {
+                    settings_note(
+                        ui,
+                        p,
+                        &lang.format(
+                            "sensors.paused",
+                            &[("percent", &format!("{:.0}", pct * 100.0))],
+                        ),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if settings_action(ui, p, lang.t("sensors.resume"), !update_busy).clicked() {
+                        self.sensor_components.download();
+                    }
+                    if settings_action(ui, p, lang.t("sensors.recheck"), true).clicked() {
+                        self.sensor_components.inspect();
+                    }
+                });
+            }
+            Phase::Ready { error } => {
+                settings_note(ui, p, lang.t("sensors.ready"));
+                if let Some(error) = error {
+                    settings_note(
+                        ui,
+                        p,
+                        &lang.format("sensors.install_failed", &[("error", &error)]),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if settings_action(ui, p, lang.t("sensors.install"), !update_busy).clicked() {
+                        self.sensor_components.install();
+                    }
+                    if settings_action(ui, p, lang.t("sensors.recheck"), true).clicked() {
+                        self.sensor_components.inspect();
+                    }
+                });
+            }
+            Phase::Installing => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+                    settings_note(ui, p, lang.t("sensors.installing"));
+                });
+            }
+            Phase::Installed { needs_restart } => {
+                settings_note(
+                    ui,
+                    p,
+                    lang.t(if needs_restart {
+                        "sensors.restart_required"
+                    } else {
+                        "sensors.installed"
+                    }),
+                );
+                if settings_action(ui, p, lang.t("sensors.recheck"), !update_busy).clicked() {
+                    self.sensor_components.inspect();
+                }
+            }
+            Phase::Unsupported => {
+                settings_note(ui, p, lang.t("sensors.unsupported"));
+            }
+            Phase::Error(error) => {
+                settings_note(
+                    ui,
+                    p,
+                    &lang.format("sensors.check_failed", &[("error", &error)]),
+                );
+                if settings_action(ui, p, lang.t("sensors.recheck"), !update_busy).clicked() {
+                    self.sensor_components.inspect();
+                }
+            }
+        }
+        if update_busy && !self.sensor_components.is_busy() {
+            settings_note(ui, p, lang.t("sensors.wait_for_update"));
+        }
     }
 
     /// 设置改动后立刻生效并落盘。
@@ -3326,6 +3493,11 @@ impl App {
         )
         .on_hover_text(lang.t("common.quit"));
         if quit.clicked() {
+            #[cfg(windows)]
+            if self.sensor_components.is_installing() {
+                self.toast = Some((lang.t("sensors.finish_before_quit").into(), Instant::now()));
+                return;
+            }
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -3454,6 +3626,14 @@ impl App {
     /// 点更新提示之后干什么。两个入口（页脚、设置页）共用。
     fn update_action(&mut self, ctx: &egui::Context) {
         use crate::update::Phase;
+        #[cfg(windows)]
+        if self.sensor_components.is_installing() {
+            self.toast = Some((
+                self.lang.t("sensors.finish_install_first").into(),
+                Instant::now(),
+            ));
+            return;
+        }
         // 先拷一份：下面要 &mut self，不能挂着对 phase 的借用
         match &self.update.phase.clone() {
             // 清单里没有本平台的包时退而求其次：打开下载页。

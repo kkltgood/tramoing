@@ -11,7 +11,7 @@
 //! 默认读取官方 GitHub Release 的 latest.json 附件，不依赖 GitHub API 配额。
 //! 可通过 TRAMOING_UPDATE_URL 覆盖地址或用空值禁用，见 docs/development.md。
 
-mod download;
+pub(crate) mod download;
 
 use std::io::Read;
 #[cfg(any(not(target_os = "macos"), test))]
@@ -609,8 +609,8 @@ fn fetch_manifest(source: &str) -> Result<Manifest, String> {
     serde_json::from_str(text).map_err(|e| format!("清单格式不对：{e}"))
 }
 
-#[cfg(test)]
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+#[cfg(any(windows, test))]
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     sha256_reader(std::fs::File::open(path)?)
 }
 

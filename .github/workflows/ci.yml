@@ -36,27 +36,48 @@ jobs:
           dotnet run --project sensors/Tramoing.Sensors.Tests -c Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./packaging/windows/build-sensors.ps1 -Architecture x64
-          ./packaging/windows/build-sensors.ps1 -Architecture arm64
           ./scripts/verify-windows-sensors.ps1
+          ./scripts/test-sensor-payload.ps1
+      - name: Download pinned official dependencies into local cache
+        if: runner.os == 'Windows'
+        run: python scripts/verify-static-dependencies.py --download
+      - name: Verify optional dependency detection and official signatures
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/verify-component-dependencies.ps1
       - name: Verify sensor handshake with Windows PowerShell UTF-8
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           [Console]::InputEncoding = [Text.Encoding]::UTF8
           ./scripts/verify-windows-sensors.ps1
+      - name: Verify optional component installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
+          }
+          ./scripts/verify-sensors-installer.ps1
       - name: Check macOS packaging script syntax
         if: runner.os == 'macOS'
         run: |
           for script in scripts/package-macos.sh scripts/verify-macos-package.sh; do bash -n "$script"; done
           python3 -m py_compile packaging/macos/dmg-settings.py packaging/macos/verify-dmg.py
+      - name: Validate dependency manifest and downloader
+        run: |
+          python scripts/verify-static-dependencies.py
+          python -m unittest discover -s scripts -p 'test_dependency_cache.py'
       - name: Check update release publishing
-        run: node --test packaging/update/release.test.cjs
+        run: node --test packaging/update/*.test.cjs
       - name: Check PowerShell script syntax
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           $failed = $false
-          Get-ChildItem scripts, packaging -Filter *.ps1 -Recurse | ForEach-Object {
+          Get-ChildItem scripts, packaging, crates/tray-app/src/component_install -Filter *.ps1 -Recurse | ForEach-Object {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)

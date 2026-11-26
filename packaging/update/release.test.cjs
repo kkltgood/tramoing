@@ -6,7 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const publishRelease = require('./release.cjs');
 
-function fixture(t, { existing, failUpload, notes } = {}) {
+function fixture(t, { existing, failUpload, notes, component = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tramoing-release-'));
   t.after(() => {
     assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
@@ -31,6 +31,18 @@ function fixture(t, { existing, failUpload, notes } = {}) {
     const hash = crypto.createHash('sha256').update(bytes).digest('hex');
     fs.writeFileSync(path.join(directory, `${name}.sha256`), `${hash}  ${name}\n`);
   }
+  const componentName = 'Tramoing-Sensors-1.0.0-windows-x64-setup.exe';
+  if (component) {
+    const bytes = Buffer.from('optional component');
+    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+    fs.writeFileSync(path.join(directory, componentName), bytes);
+    fs.writeFileSync(path.join(directory, `${componentName}.sha256`), `${sha256}  ${componentName}\n`);
+    fs.writeFileSync(path.join(directory, 'sensors-component.json'), JSON.stringify({
+      component_version: '1.0.0', protocol: 1, architecture: 'x64',
+      url: `https://github.com/kkltgood/tramoing/releases/download/sensors-v1.0.0/${componentName}`,
+      sha256, size: bytes.length, source_sha256: 'a'.repeat(64),
+    }));
+  }
   const events = [];
   const created = [];
   const uploaded = new Map();
@@ -41,7 +53,8 @@ function fixture(t, { existing, failUpload, notes } = {}) {
   };
   const github = {
     rest: { repos: {
-      async getReleaseByTag() {
+      async getReleaseByTag({ tag: requested }) {
+        if (requested.startsWith('sensors-')) throw Object.assign(new Error('Not found'), { status: 404 });
         // Exercise the draft recovery path used when GitHub omits a draft.
         if (!existing || existing.draft) throw Object.assign(new Error('Not found'), { status: 404 });
         return { data: release };
@@ -49,19 +62,32 @@ function fixture(t, { existing, failUpload, notes } = {}) {
       async listReleases() {},
       async createRelease(input) {
         assert.equal(input.draft, true);
+        if (input.tag_name.startsWith('sensors-')) {
+          events.push('create:component');
+          return { data: { id: 43, draft: true, assets: [] } };
+        }
         created.push(input);
         release.body = input.generate_release_notes ? release.body : input.body;
         events.push('create');
         return { data: release };
       },
       async deleteReleaseAsset({ asset_id }) { events.push(`delete:${asset_id}`); },
-      async uploadReleaseAsset({ name, data }) {
+      async uploadReleaseAsset({ name, data, release_id }) {
+        if (release_id === 43) {
+          events.push(`upload:component:${name}`);
+          if (name === failUpload) throw new Error('Upload interrupted');
+          return;
+        }
         events.push(`upload:${name}`);
         if (name === failUpload) throw new Error('Upload interrupted');
         uploaded.set(name, data);
       },
       async updateRelease(input) {
         assert.equal(input.draft, false);
+        if (input.release_id === 43) {
+          events.push('publish:component');
+          return { data: { id: 43, draft: false } };
+        }
         events.push('publish');
         return { data: release };
       },
@@ -70,9 +96,10 @@ function fixture(t, { existing, failUpload, notes } = {}) {
   };
   const core = { notice() {}, summary: { addLink() { return { async write() {} }; } } };
   return {
-    directory, packages, uploaded, events, created,
+    directory, packages, uploaded, events, created, componentName,
     run: () => publishRelease({
       github, core, context: { repo: { owner: 'kkltgood', repo: 'tramoing' } }, directory, version, tag, notesFile,
+      requireComponent: component,
     }),
   };
 }
@@ -103,6 +130,28 @@ test('publishes four distinct architecture packages with verified bytes and comp
     assert.equal(asset.sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
     assert.equal(asset.size, bytes.length);
   }
+});
+
+test('publishes the pinned component before exposing a main release that needs it', async t => {
+  const f = fixture(t, { component: true });
+  await f.run();
+  assert.ok(f.events.indexOf('publish:component') < f.events.indexOf('create'));
+  assert.equal(f.events.at(-1), 'publish');
+  assert.equal(f.uploaded.size, 9, 'main releases do not duplicate component assets');
+});
+
+test('component upload failure prevents publishing the main program', async t => {
+  const f = fixture(t, { component: true, failUpload: 'sensors-component.json' });
+  await assert.rejects(f.run(), /Upload interrupted/);
+  assert.ok(!f.events.includes('create'));
+  assert.ok(!f.events.includes('publish'));
+});
+
+test('rejects corrupt optional components before creating any release', async t => {
+  const f = fixture(t, { component: true });
+  fs.appendFileSync(path.join(f.directory, f.componentName), 'tampered');
+  await assert.rejects(f.run(), /checksum or size/);
+  assert.deepEqual(f.events, []);
 });
 
 test('uses the version notes in both the release body and update manifest', async t => {

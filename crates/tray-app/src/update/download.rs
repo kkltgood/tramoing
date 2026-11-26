@@ -14,6 +14,170 @@ use super::{
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(any(windows, test))]
+pub(crate) fn component_path(version: &str, root: &Path) -> Result<PathBuf, String> {
+    Ok(root
+        .join(parse_version(version)?.to_string())
+        .join("payload.exe"))
+}
+
+/// Components have a separate cache root and a finite fallback policy. The same
+/// pinned digest applies to every source, including the static backup.
+#[cfg(any(windows, test))]
+pub(crate) fn component(
+    asset: &Asset,
+    version: &str,
+    tx: &Sender<Event>,
+    root: &Path,
+    stop: &Receiver<()>,
+    fallbacks: &[String],
+) -> Result<Option<PathBuf>, String> {
+    for source in std::iter::once(&asset.url).chain(fallbacks) {
+        let url = http_url(source)?;
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+            return Err("组件下载必须使用无凭据的 HTTPS 地址".into());
+        }
+    }
+    let client: ureq::Agent = agent_config()
+        .https_only(true)
+        .timeout_resolve(Some(Duration::from_secs(15)))
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_send_request(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(IDLE_TIMEOUT))
+        .timeout_per_read(Some(IDLE_TIMEOUT))
+        .timeout_per_write(Some(IDLE_TIMEOUT))
+        .build()
+        .into();
+    component_with_agent(
+        asset,
+        version,
+        tx,
+        root,
+        stop,
+        fallbacks,
+        ComponentPolicy {
+            client: &client,
+            delay: Duration::from_secs(2),
+        },
+    )
+}
+
+#[cfg(any(windows, test))]
+struct ComponentPolicy<'a> {
+    client: &'a ureq::Agent,
+    delay: Duration,
+}
+
+#[cfg(any(windows, test))]
+fn component_with_agent(
+    asset: &Asset,
+    version: &str,
+    tx: &Sender<Event>,
+    root: &Path,
+    stop: &Receiver<()>,
+    fallbacks: &[String],
+    policy: ComponentPolicy<'_>,
+) -> Result<Option<PathBuf>, String> {
+    if asset.size == 0 {
+        return Err("组件清单缺少文件大小".into());
+    }
+    if stopped(Some(stop)) {
+        return Ok(None);
+    }
+    // Validate hash/version and acquire the partial-file lock before inspecting
+    // a completed cache entry. A cache hit never needs a network request.
+    let mut download = PartialDownload::open(asset, version, root)?;
+    download.dest = component_path(version, root)?;
+    match File::open(&download.dest) {
+        Ok(file) => {
+            let size = file.metadata().map_err(|e| e.to_string())?.len();
+            if size == asset.size
+                && sha256_reader(file).map_err(|e| e.to_string())? == download.hash
+            {
+                if stopped(Some(stop)) {
+                    return Ok(None);
+                }
+                let _ = tx.send(Event::Progress(1.0));
+                return Ok(Some(download.dest));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法校验已有组件下载：{error}")),
+    }
+    let mut last_error = "组件下载失败".to_owned();
+    for source in std::iter::once(&asset.url).chain(fallbacks) {
+        let url = http_url(source)?;
+        let mut no_progress = 0;
+        let mut failures = 0;
+        loop {
+            if stopped(Some(stop)) {
+                download.sync()?;
+                return Ok(None);
+            }
+            // ETags identify a representation at one source. A mirror may use
+            // another ETag for the exact same pinned bytes, so never send the
+            // previous host's If-Range value when changing source or resuming.
+            if download.state.source.as_deref() != Some(url.as_str()) {
+                download.state.etag = None;
+                download.state.source = Some(url.to_string());
+                download.save_state()?;
+            }
+            let before = download.len()?;
+            download.progress(tx)?;
+            match download.attempt(policy.client, url.as_str(), tx, Some(stop)) {
+                Ok(true) => return download.finish().map(Some),
+                Ok(false) => {
+                    if download.len()? > before {
+                        no_progress = 0;
+                        continue;
+                    } else {
+                        no_progress += 1;
+                        failures += 1;
+                        last_error = "组件下载没有取得进展".into();
+                    }
+                }
+                Err(AttemptError::Paused) => {
+                    download.sync()?;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    download.sync()?;
+                    let retryable = matches!(error, AttemptError::Retry(_));
+                    last_error = error.message();
+                    log::warn!(target: "tramoing::components", "{}: {last_error}", url.host_str().unwrap_or_default());
+                    failures += 1;
+                    if download.len()? > before {
+                        no_progress = 0;
+                    } else {
+                        no_progress += 1;
+                    }
+                    if !retryable {
+                        // Hash mismatches have already reset the bad partial;
+                        // a fallback gets a fresh chance with the same digest.
+                        break;
+                    }
+                }
+            }
+            // Switch after two stalled requests; even a repeatedly dropping
+            // source that adds a few bytes cannot consume unbounded retries.
+            if no_progress >= 2 || failures >= 6 {
+                break;
+            }
+            let _ = tx.send(Event::DownloadRetrying {
+                delay: policy.delay,
+            });
+            match stop.recv_timeout(policy.delay) {
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    download.sync()?;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Err(format!("组件下载来源均不可用，请重试：{last_error}"))
+}
+
 pub(super) fn installer_path(version: &str, root: &Path) -> Result<PathBuf, String> {
     Ok(root
         .join(parse_version(version)?.to_string())
@@ -217,6 +381,8 @@ impl From<String> for AttemptError {
 struct PartialState {
     total: Option<u64>,
     etag: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 struct PartialDownload {

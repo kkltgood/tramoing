@@ -1,5 +1,5 @@
 ﻿# Read-only smoke test of the real worker. Does not install a driver or elevate.
-param([ValidateSet('x64', 'arm64')][string]$Architecture = 'x64')
+param([ValidateSet('x64')][string]$Architecture = 'x64')
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $path = Join-Path $root "dist/windows-$Architecture/sensors/tramoing-sensors.exe"

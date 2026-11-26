@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { readComponent, publishComponent } = require('./component-release.cjs');
 
 module.exports = async function publishRelease({
   github, context, core,
@@ -10,6 +11,7 @@ module.exports = async function publishRelease({
   version = process.env.RELEASE_VERSION,
   tag = process.env.RELEASE_TAG,
   notesFile = path.join('docs', 'releases', `${tag}.md`),
+  requireComponent = true,
 }) {
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || tag !== `v${version}`) {
     throw new Error('Release tag must match the stable package version.');
@@ -20,9 +22,11 @@ module.exports = async function publishRelease({
     'macos-aarch64': `Tramoing-${version}-macos-arm64.dmg`,
     'macos-x86_64': `Tramoing-${version}-macos-x64.dmg`,
   };
+  const component = requireComponent ? readComponent(directory, context.repo) : null;
   const names = Object.values(packages).flatMap(name => [name, `${name}.sha256`]).sort();
+  const expected = [...names, ...(component ? component.files.keys() : [])].sort();
   const actual = fs.readdirSync(directory).sort();
-  if (JSON.stringify(actual) !== JSON.stringify(names)) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`Unexpected release assets: ${actual.join(', ')}`);
   }
 
@@ -52,6 +56,9 @@ module.exports = async function publishRelease({
   if (release && !release.draft) {
     throw new Error(`${tag} is already published. Use a new version instead of replacing its files.`);
   }
+  // Make the pinned component available before publishing any executable that
+  // references it. It is not duplicated in each main-program release.
+  if (component) await publishComponent({ github, context, core, component });
   if (!release) {
     release = (await github.rest.repos.createRelease({
       owner, repo, tag_name: tag, name: `Tramoing ${tag}`, draft: true,

@@ -18,7 +18,9 @@ The managed assemblies remain separate and replaceable.
   The installer includes its own licenses and installs a shared system component.
   Tramoing does not remove that shared driver on uninstall.
 - .NET runtime: https://github.com/dotnet/runtime (MIT and third-party notices).
-  The worker is published self-contained; users need not install .NET separately.
+  New workers use the system .NET runtime. Tramoing can download the verified
+  official installer when a compatible runtime is missing. Older bundled workers
+  retain their private runtime until the component itself is replaced.
 
 The complete dependency versions and integrity hashes are recorded in
 `sensors/Tramoing.Sensors/packages.lock.json` in Tramoing's source distribution.
