@@ -1,5 +1,6 @@
 ﻿# Validate downloaded official installers and the real framework-dependent probe.
 # Does not install runtimes, drivers, or change machine configuration.
+param([switch]$ExpectMissingRuntime)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $manifest = Get-Content -LiteralPath (Join-Path $root 'static/dependencies/manifest.json') -Raw | ConvertFrom-Json
@@ -19,7 +20,10 @@ $sensorRoot = Join-Path $fixture 'sensors'
 try {
     $fresh = Inspect-Fixture
     if ($fresh.component_ok -or $fresh.legacy_component) { throw 'An empty installation was treated as a working component' }
-    if (-not $fresh.runtime_ok) { throw 'Installed x64 .NET 10 runtime was not detected (CI installs the SDK first)' }
+    $expectedRuntime = -not $ExpectMissingRuntime.IsPresent
+    if ($fresh.runtime_ok -ne $expectedRuntime) {
+        throw "Unexpected x64 .NET 10 runtime detection (expected: $expectedRuntime, detected: $($fresh.runtime_ok))"
+    }
     Copy-Item -LiteralPath $original -Destination $sensorRoot -Recurse
     $installed = Inspect-Fixture
     if (-not $installed.component_ok -or $installed.legacy_component) { throw 'Published framework-dependent component did not pass its probe' }
@@ -51,7 +55,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $original 'component.json') -Destination $metadata -Force
     Copy-Item -LiteralPath (Join-Path $original 'tramoing-sensors.runtimeconfig.json') -Destination $runtimeConfig -Force
     if (-not (Inspect-Fixture).component_ok) { throw 'Component was not reusable after restoring its metadata' }
-    Write-Host 'Official signatures, runtime reuse, fresh install detection and executable/library/legacy repair checks passed.'
+    Write-Host "Official signatures, fresh install and component repair checks passed. Global runtime detected: $($fresh.runtime_ok)."
 } finally {
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }

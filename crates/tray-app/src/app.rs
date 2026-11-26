@@ -2267,6 +2267,14 @@ impl App {
                         tm_core::color::upload(bar_dark),
                     );
                 }
+                #[cfg(windows)]
+                if self.settings.performance_enabled {
+                    settings_note(
+                        ui,
+                        p,
+                        lang.t("ui.drag_the_taskbar_items_to_change_their_order"),
+                    );
+                }
             } else {
                 settings_note(ui, p, lang.t("ui.show_live_upload_and_download_speeds"));
             }
@@ -2274,14 +2282,6 @@ impl App {
         ui.add_space(8.0);
         #[cfg(any(target_os = "macos", windows))]
         self.performance_options(ui, p, lang, changed);
-        #[cfg(windows)]
-        {
-            settings_note(
-                ui,
-                p,
-                lang.t("ui.drag_the_taskbar_items_to_change_their_order"),
-            );
-        }
     }
 
     fn statistics_options(
@@ -2425,60 +2425,66 @@ impl App {
                     );
                 }
                 let reading = self.performance.reading();
-                let text = if self.performance.error.is_some() {
-                    lang.t("ui.sampler_unavailable_toggle_off_and_on_to_retry")
-                        .to_owned()
-                } else {
-                    format!(
-                        "CPU {}    ·    GPU {}",
-                        crate::performance::menu_reading(
-                            reading.as_ref().and_then(|r| r.cpu),
-                            reading.as_ref().and_then(|r| r.temperatures.cpu),
-                            self.settings.performance_temperature
-                        ),
-                        crate::performance::menu_reading(
-                            reading.as_ref().and_then(|r| r.gpu),
-                            reading.as_ref().and_then(|r| r.temperatures.gpu),
-                            self.settings.performance_temperature
-                        )
-                    )
-                };
-                let hint = if cfg!(windows) {
-                    lang.t("ui.cpu_is_the_system_average_gpu_shows_the")
-                } else {
-                    lang.t("ui.cpu_is_the_system_average_gpu_shows_the_2")
-                };
-                settings_note(ui, p, &text).on_hover_text(hint);
-                if self.settings.performance_temperature {
+                ui.add_space(6.0);
+                settings_separator(ui, p);
+                if self.performance.error.is_some() {
                     settings_note(
                         ui,
                         p,
-                        lang.t("ui.temperature_is_the_hottest_available_core_die_sensor"),
+                        lang.t("ui.sampler_unavailable_toggle_off_and_on_to_retry"),
                     );
-                    #[cfg(windows)]
+                } else {
+                    performance_readouts(
+                        ui,
+                        p,
+                        lang,
+                        reading.as_ref(),
+                        self.settings.performance_temperature,
+                    );
+                }
+                #[cfg(windows)]
+                if self.settings.performance_temperature {
+                    settings_separator(ui, p);
+                    ui.add_space(6.0);
+                    self.sensor_component_controls(ui, p, lang);
+                    if let Some(thermal) = reading
+                        .as_ref()
+                        .map(|r| &r.temperatures)
+                        .filter(|r| r.cpu.is_none())
                     {
-                        self.sensor_component_controls(ui, p, lang);
-                        if let Some(thermal) = reading
-                            .as_ref()
-                            .map(|r| &r.temperatures)
-                            .filter(|r| r.cpu.is_none())
-                        {
-                            use tm_core::temperature::CpuUnavailable as Reason;
-                            let message = match thermal.cpu_unavailable {
-                                Some(Reason::Starting) => lang.t("ui.reading_cpu_temperature"),
-                                Some(Reason::HelperUnavailable) => lang.t("ui.cpu_sensor_helper_is_unavailable_install_or_start"),
-                                Some(Reason::ComponentMissing | Reason::DriverMissing)
-                                    if matches!(self.sensor_components.phase, crate::sensor_components::Phase::Installed { .. }) => lang.t("sensors.changed"),
-                                // The component manager offers installation or repair above.
-                                Some(Reason::ComponentMissing | Reason::DriverMissing | Reason::UnsupportedPlatform) => "",
-                                Some(Reason::DriverUnavailable) => lang.t("ui.cpu_sensor_driver_is_unavailable_check_its_installation"),
-                                Some(Reason::PermissionDenied) => lang.t("ui.cpu_sensor_helper_needs_administrator_privileges_repair_the"),
-                                Some(Reason::Failed) => lang.t("ui.cpu_temperature_reading_failed_and_will_retry_automatically"),
-                                _ => lang.t("ui.no_cpu_temperature_sensor_is_available_a_running"),
-                            };
-                            if !message.is_empty() {
-                                settings_note(ui, p, message).on_hover_text(&thermal.source);
+                        use tm_core::temperature::CpuUnavailable as Reason;
+                        let message = match thermal.cpu_unavailable {
+                            Some(Reason::Starting) => lang.t("ui.reading_cpu_temperature"),
+                            Some(Reason::HelperUnavailable) => {
+                                lang.t("ui.cpu_sensor_helper_is_unavailable_install_or_start")
                             }
+                            Some(Reason::ComponentMissing | Reason::DriverMissing)
+                                if matches!(
+                                    self.sensor_components.phase,
+                                    crate::sensor_components::Phase::Installed { .. }
+                                ) =>
+                            {
+                                lang.t("sensors.changed")
+                            }
+                            // The component manager offers installation or repair above.
+                            Some(
+                                Reason::ComponentMissing
+                                | Reason::DriverMissing
+                                | Reason::UnsupportedPlatform,
+                            ) => "",
+                            Some(Reason::DriverUnavailable) => {
+                                lang.t("ui.cpu_sensor_driver_is_unavailable_check_its_installation")
+                            }
+                            Some(Reason::PermissionDenied) => lang.t(
+                                "ui.cpu_sensor_helper_needs_administrator_privileges_repair_the",
+                            ),
+                            Some(Reason::Failed) => lang.t(
+                                "ui.cpu_temperature_reading_failed_and_will_retry_automatically",
+                            ),
+                            _ => lang.t("ui.no_cpu_temperature_sensor_is_available_a_running"),
+                        };
+                        if !message.is_empty() {
+                            settings_note(ui, p, message).on_hover_text(&thermal.source);
                         }
                     }
                 }
@@ -2606,16 +2612,29 @@ impl App {
                 });
             }
             Phase::Installed { needs_restart } => {
-                settings_note(
-                    ui,
-                    p,
-                    lang.t(if needs_restart {
-                        "sensors.restart_required"
-                    } else {
-                        "sensors.installed"
-                    }),
-                );
-                if settings_action(ui, p, lang.t("sensors.recheck"), !update_busy).clicked() {
+                let (_, recheck) = egui::containers::Sides::new()
+                    .shrink_left()
+                    .height(30.0)
+                    .show(
+                        ui,
+                        |ui| {
+                            let (status, color) = if needs_restart {
+                                (lang.t("sensors.restart_required"), p.warn)
+                            } else {
+                                (lang.t("sensors.installed"), p.download)
+                            };
+                            let (dot, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 2.5, color);
+                            ui.add(
+                                egui::Label::new(RichText::new(status).size(11.5).color(p.text))
+                                    .wrap(),
+                            )
+                            .on_hover_text(lang.t("sensors.reuse_hint"));
+                        },
+                        |ui| settings_action(ui, p, lang.t("sensors.recheck"), !update_busy),
+                    );
+                if recheck.clicked() {
                     self.sensor_components.inspect();
                 }
             }
@@ -4067,14 +4086,72 @@ fn diagnostics_report_icon(ui: &mut egui::Ui, p: &Palette) {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn performance_readouts(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    lang: Lang,
+    reading: Option<&crate::performance::Reading>,
+    show_temperature: bool,
+) {
+    let usage_hint = if cfg!(windows) {
+        lang.t("ui.cpu_is_the_system_average_gpu_shows_the")
+    } else {
+        lang.t("ui.cpu_is_the_system_average_gpu_shows_the_2")
+    };
+    let metrics = [
+        (
+            "CPU",
+            reading.and_then(|r| r.cpu),
+            reading.and_then(|r| r.temperatures.cpu),
+        ),
+        (
+            "GPU",
+            reading.and_then(|r| r.gpu),
+            reading.and_then(|r| r.temperatures.gpu),
+        ),
+    ];
+    ui.columns(2, |columns| {
+        for (column, (name, usage, temperature)) in columns.iter_mut().zip(metrics) {
+            column.horizontal_centered(|ui| {
+                ui.set_height(34.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new(name).size(11.0).color(p.subtext));
+                let usage = crate::performance::menu_percent(usage);
+                ui.label(
+                    RichText::new(usage.trim())
+                        .font(theme::display_font(15.0))
+                        .color(p.text),
+                )
+                .on_hover_text(usage_hint);
+                if show_temperature {
+                    let temperature = crate::performance::menu_temperature(temperature);
+                    ui.label(
+                        RichText::new(temperature.trim())
+                            .size(12.0)
+                            .color(p.subtext),
+                    )
+                    .on_hover_text(
+                        lang.t("ui.temperature_is_the_hottest_available_core_die_sensor"),
+                    );
+                }
+            });
+        }
+    });
+}
+
 fn settings_action(ui: &mut egui::Ui, p: &Palette, text: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(text).size(11.0).color(p.accent))
-            .min_size(Vec2::new(82.0, 27.0))
-            .fill(mix(p.surface, p.accent, 0.07))
-            .stroke(Stroke::new(0.7_f32, mix(p.border, p.accent, 0.15)))
-            .corner_radius(8),
+        egui::Button::new((
+            egui::Atom::grow(),
+            RichText::new(text).size(11.0).color(p.accent),
+            egui::Atom::grow(),
+        ))
+        .min_size(Vec2::new(66.0, 28.0))
+        .fill(mix(p.surface, p.accent, 0.07))
+        .stroke(Stroke::new(0.7_f32, mix(p.border, p.accent, 0.15)))
+        .corner_radius(8),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
 }

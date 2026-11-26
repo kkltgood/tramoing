@@ -58,10 +58,28 @@ function Test-LegacySensorPayload([string]$SensorRoot) {
     try {
         $runtimeConfig = Get-Content -LiteralPath (Join-Path $SensorRoot 'tramoing-sensors.runtimeconfig.json') -Raw | ConvertFrom-Json
         $included = @($runtimeConfig.runtimeOptions.includedFrameworks | Where-Object { $_.name -eq 'Microsoft.NETCore.App' -and $_.version -like '10.0.*' })
-        return $included.Count -gt 0 -and
-            (Test-Path -LiteralPath (Join-Path $SensorRoot 'coreclr.dll') -PathType Leaf) -and
-            (Test-Path -LiteralPath (Join-Path $SensorRoot 'System.Private.CoreLib.dll') -PathType Leaf) -and
-            (Test-Path -LiteralPath (Join-Path $SensorRoot 'LibreHardwareMonitorLib.dll') -PathType Leaf)
+        if (-not $included.Count) { return $false }
+        # The old self-contained publish has no payload-files.json. Its .deps.json
+        # lists the managed and native files copied to the publish directory.
+        $deps = Get-Content -LiteralPath (Join-Path $SensorRoot 'tramoing-sensors.deps.json') -Raw | ConvertFrom-Json
+        if ($deps.runtimeTarget.name -notlike '*/win-x64') { return $false }
+        $target = $deps.targets.PSObject.Properties[$deps.runtimeTarget.name].Value
+        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($library in $target.PSObject.Properties) {
+            foreach ($group in @('runtime', 'native')) {
+                foreach ($asset in $library.Value.$group.PSObject.Properties) {
+                    $name = [IO.Path]::GetFileName($asset.Name)
+                    if ($name -ne '_._') { [void]$names.Add($name) }
+                }
+            }
+        }
+        foreach ($required in @('tramoing-sensors.dll', 'hostfxr.dll', 'hostpolicy.dll', 'coreclr.dll', 'System.Private.CoreLib.dll', 'LibreHardwareMonitorLib.dll')) {
+            if (-not $names.Contains($required)) { return $false }
+        }
+        foreach ($name in $names) {
+            if (-not [IO.File]::Exists([IO.Path]::Combine($SensorRoot, $name))) { return $false }
+        }
+        return $true
     } catch {
         # Damaged legacy metadata is a missing component, so settings can offer
         # a repair download instead of getting stuck on an inspection error.
@@ -69,36 +87,46 @@ function Test-LegacySensorPayload([string]$SensorRoot) {
     }
 }
 
+function Test-X64DotNetRuntime([string]$Location, [version]$Minimum) {
+    $hosts = Get-ChildItem -LiteralPath (Join-Path $Location 'host\fxr') -Directory -ErrorAction SilentlyContinue
+    if (-not ($hosts | Where-Object { [IO.File]::Exists((Join-Path $_.FullName 'hostfxr.dll')) })) { return $false }
+    $versions = Get-ChildItem -LiteralPath (Join-Path $Location 'shared\Microsoft.NETCore.App') -Directory -ErrorAction SilentlyContinue
+    foreach ($entry in $versions) {
+        $version = $null
+        if (-not [version]::TryParse($entry.Name, [ref]$version) -or
+            $version.Major -ne $Minimum.Major -or $version.Minor -ne $Minimum.Minor -or $version -lt $Minimum) { continue }
+        if (-not [IO.File]::Exists((Join-Path $entry.FullName 'System.Private.CoreLib.dll')) -or
+            -not [IO.File]::Exists((Join-Path $entry.FullName 'hostpolicy.dll'))) { continue }
+        # A copied runtime of another architecture is unusable by the x64 apphost.
+        try {
+            $reader = [IO.BinaryReader]::new([IO.File]::OpenRead((Join-Path $entry.FullName 'coreclr.dll')))
+            try {
+                if ($reader.ReadUInt16() -ne 0x5a4d) { continue }
+                $reader.BaseStream.Position = 0x3c
+                $reader.BaseStream.Position = $reader.ReadUInt32()
+                if ($reader.ReadUInt32() -eq 0x4550 -and $reader.ReadUInt16() -eq 0x8664) { return $true }
+            } finally { $reader.Dispose() }
+        } catch { continue }
+    }
+    return $false
+}
+
 $runtime = @($cfg.manifest.dependencies | Where-Object { $_.id -eq 'dotnet' })[0]
 $driver = @($cfg.manifest.dependencies | Where-Object { $_.id -eq 'pawnio' })[0]
-$minimum = [version]$runtime.minimum_version
-$runtimeOk = $false
 # .NET's Windows host reads its registration from the 32-bit view even for
 # x64 runtimes. PawnIO's uninstall registration uses the native 64-bit view.
+$location = $null
 $dotnetRegistry = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry32)
 try {
     $installed = $dotnetRegistry.OpenSubKey('SOFTWARE\dotnet\Setup\InstalledVersions\x64')
     if ($installed) {
-        try {
-            $location = [string]$installed.GetValue('InstallLocation')
-            $key = $installed.OpenSubKey('sharedfx\Microsoft.NETCore.App')
-            if ($key) {
-                try {
-                    foreach ($name in $key.GetValueNames()) {
-                        $version = $null
-                        if ([version]::TryParse($name, [ref]$version) -and $version.Major -eq $minimum.Major -and $version.Minor -eq $minimum.Minor -and $version -ge $minimum -and $location) {
-                            $runtimeDirectory = Join-Path $location ('shared\Microsoft.NETCore.App\' + $name)
-                            if ((Test-Path -LiteralPath (Join-Path $runtimeDirectory 'coreclr.dll') -PathType Leaf) -and
-                                (Test-Path -LiteralPath (Join-Path $runtimeDirectory 'System.Private.CoreLib.dll') -PathType Leaf)) {
-                                $runtimeOk = $true
-                            }
-                        }
-                    }
-                } finally { $key.Dispose() }
-            }
-        } finally { $installed.Dispose() }
+        try { $location = [string]$installed.GetValue('InstallLocation') } finally { $installed.Dispose() }
     }
 } finally { $dotnetRegistry.Dispose() }
+# Match AppHostDotNetSearch=Global, including global installs without MSI
+# sharedfx inventory. Per-user SDKs and DOTNET_ROOT overrides are not consulted.
+if (-not $location) { $location = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'dotnet' }
+$runtimeOk = Test-X64DotNetRuntime $location ([version]$runtime.minimum_version)
 $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
 try {
     $driverOk = $false

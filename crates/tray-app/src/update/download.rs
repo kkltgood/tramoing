@@ -109,6 +109,7 @@ fn component_with_agent(
         let url = http_url(source)?;
         let mut no_progress = 0;
         let mut failures = 0;
+        let mut reused_prefix = download.len()? > 0;
         loop {
             if stopped(Some(stop)) {
                 download.sync()?;
@@ -139,6 +140,12 @@ fn component_with_agent(
                 Err(AttemptError::Paused) => {
                     download.sync()?;
                     return Ok(None);
+                }
+                Err(AttemptError::ChecksumMismatch) if reused_prefix => {
+                    // The saved prefix may be corrupt even when this source is good.
+                    // attempt() discarded it. Give this source one try from zero.
+                    reused_prefix = false;
+                    continue;
                 }
                 Err(error) => {
                     download.sync()?;
@@ -218,7 +225,7 @@ pub(super) fn restore(
     Ok(Some(path))
 }
 
-pub(super) fn saved_progress(asset: &Asset, version: &str, root: &Path) -> Option<f32> {
+pub(crate) fn saved_progress(asset: &Asset, version: &str, root: &Path) -> Option<f32> {
     let hash = asset.sha256.trim().to_ascii_lowercase();
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -344,6 +351,7 @@ fn run_with_agent(
 enum AttemptError {
     Retry(String),
     Failed(String),
+    ChecksumMismatch,
     Paused,
 }
 
@@ -351,6 +359,7 @@ impl AttemptError {
     fn message(self) -> String {
         match self {
             Self::Retry(message) | Self::Failed(message) => message,
+            Self::ChecksumMismatch => "sha256 不匹配，已丢弃损坏的下载内容，请重试".into(),
             Self::Paused => "下载已暂停，进度已保存".into(),
         }
     }
@@ -560,9 +569,7 @@ impl PartialDownload {
                     return Ok(true);
                 }
                 self.reset()?;
-                return Err(AttemptError::Failed(
-                    "sha256 不匹配，已丢弃损坏的下载内容，请重试".into(),
-                ));
+                return Err(AttemptError::ChecksumMismatch);
             }
             // The range is no longer satisfiable. Retry once from zero; a 416 at zero is fatal.
             self.reset()?;
@@ -695,9 +702,7 @@ impl PartialDownload {
                 )));
             }
             self.reset()?;
-            return Err(AttemptError::Failed(
-                "sha256 不匹配，已丢弃损坏的下载内容，请重试".into(),
-            ));
+            return Err(AttemptError::ChecksumMismatch);
         }
         self.progress(tx)?;
         Ok(true)

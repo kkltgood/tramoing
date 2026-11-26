@@ -3808,11 +3808,11 @@ dependencies = [
 
 [[package]]
 name = "tm-core"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "tm-diagnostics"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "log",
  "tempfile",
@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "tm-macos"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "core-foundation-sys",
  "libc",
@@ -3836,14 +3836,14 @@ dependencies = [
 
 [[package]]
 name = "tm-sampler"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "tm-core",
 ]
 
 [[package]]
 name = "tm-store"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3852,7 +3852,7 @@ dependencies = [
 
 [[package]]
 name = "tm-windows"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "log",
  "serde",
@@ -4004,7 +4004,7 @@ dependencies = [
 
 [[package]]
 name = "tray-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "eframe",

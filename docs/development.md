@@ -245,7 +245,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.2.1` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.2.2` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -262,15 +262,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以当前 `0.2.1` 为例）：
+发布步骤（以 `0.2.2` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本。后续版本需要同步更新 `Cargo.lock` 中的工作区版本并提交；可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.1.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明；缺少或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本，并同步更新 `Cargo.lock` 中的工作区版本。可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.2.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明。文件缺失或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.2.1 -m "Release v0.2.1"
-   git push opensource v0.2.1
+   git tag -a v0.2.2 -m "Release v0.2.2"
+   git push opensource v0.2.2
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -356,7 +356,9 @@ Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHard
 
 已发布的依赖版本只校验复用，不能覆盖为其他内容；草稿上传中断可重试。更新依赖时修改可信清单并发布新的依赖版本，保留仍被已发布客户端引用的旧 Release。备用附件只有发布后才可用，提交清单或保留本地文件不等于上线。GitHub 备用和 PawnIO 官方源使用同一托管服务，无法解决 GitHub 整体不可达；无论来源如何变化都必须保持同一文件校验值。
 
-组件下载缓存位于数据目录的 `components/`，与主程序 `update/` 分开。每个组件独立命名，下载支持暂停、断点续传和重新启动后复用缓存；程序重启不自动恢复联网。主源连续无进展时有限重试再切备用源，所有源失败后返回可重试状态。切换镜像会丢弃源专属 ETag，保留与同一 SHA-256 绑定的部分内容；完整哈希失败则清空损坏内容。校验通过前不会提供安装入口。
+组件下载缓存位于数据目录的 `components/`。重启或在设置中重新检查时，程序会在本地重新校验缓存。全部所需安装包通过校验后可直接安装，部分下载会显示已保存的进度，点击继续后才联网。主源连续无进展时会切换备用源。跨镜像续传保留与 SHA-256 绑定的片段，并清除原来源的 ETag。如果已有片段导致完整文件校验失败，下载器会从当前来源重新下载一次。所有来源失败后仍可重试。
+
+开发机只有便携 .NET SDK 时，可用 `scripts/verify-windows-sensors.ps1 -DotNet <dotnet.exe 路径>` 验证 worker 握手。使用 `scripts/verify-component-dependencies.ps1 -ExpectMissingRuntime` 可验证缺少系统运行时的场景。
 
 安装在专用提权流程中执行：下载保持普通权限，提权后重新校验输入，第三方官方安装器安装共享 .NET/PawnIO，独立温度安装器将私有组件写入受保护的应用目录。管理员采集助手继续只启动固定安装位置的组件，不接受用户指定的可执行路径。组件替换失败时保留或恢复旧组件；取消 UAC 后保留已校验缓存并允许重试。主程序升级必须保留现有 `sensors/`，不能先删除 worker 再因瘦身而不补回。卸载 Tramoing 清理安装目录中的私有组件和安装日志，保留共享 .NET/PawnIO；下载缓存与现有用户数据一样保留，可手动删除数据目录中的 `components/`。
 

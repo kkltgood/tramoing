@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use crate::component_install::{self, Inspection, InstallOutcome, Prepared, Progress};
+use crate::component_install::{
+    self, CachedDownload, Inspection, InstallOutcome, Prepared, Progress,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Phase {
@@ -23,8 +25,10 @@ pub enum Phase {
     Error(String),
 }
 
+type InspectionResult = Result<(Inspection, CachedDownload), String>;
+
 enum Job {
-    Inspect(Receiver<Result<Inspection, String>>),
+    Inspect(Receiver<InspectionResult>),
     Download {
         progress: Receiver<Progress>,
         result: Receiver<Result<Option<Prepared>, String>>,
@@ -34,7 +38,7 @@ enum Job {
 }
 
 enum Completion {
-    Inspected(Result<Inspection, String>),
+    Inspected(InspectionResult),
     Downloaded(Result<Option<Prepared>, String>),
     Installed(Result<InstallOutcome, String>),
 }
@@ -78,10 +82,15 @@ impl Manager {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        let cache = self.cache.clone();
         match std::thread::Builder::new()
             .name("sensor-component-check".into())
             .spawn(move || {
-                let _ = tx.send(component_install::inspect());
+                let result = component_install::inspect().and_then(|plan| {
+                    let cached = plan.cached_download(&cache)?;
+                    Ok((plan, cached))
+                });
+                let _ = tx.send(result);
             }) {
             Ok(_) => {
                 self.phase = Phase::Checking;
@@ -207,7 +216,7 @@ impl Manager {
 
     fn complete(&mut self, completion: Completion) {
         match completion {
-            Completion::Inspected(Ok(plan)) => {
+            Completion::Inspected(Ok((plan, cached))) => {
                 self.prepared = None;
                 self.phase = if !plan.supported {
                     Phase::Unsupported
@@ -216,9 +225,16 @@ impl Manager {
                         needs_restart: plan.needs_restart,
                     }
                 } else {
-                    Phase::Missing {
-                        bytes: plan.total_bytes,
-                        reused: plan.reused.clone(),
+                    match cached {
+                        CachedDownload::Ready(prepared) => {
+                            self.prepared = Some(prepared);
+                            Phase::Ready { error: None }
+                        }
+                        CachedDownload::Partial(pct) => Phase::Paused { pct, error: None },
+                        CachedDownload::Empty => Phase::Missing {
+                            bytes: plan.total_bytes,
+                            reused: plan.reused.clone(),
+                        },
                     }
                 };
                 self.plan = Some(plan);
@@ -300,7 +316,10 @@ mod tests {
         let mut manager = Manager::new();
         assert_eq!(manager.phase, Phase::Idle);
         assert!(!manager.is_busy());
-        manager.complete(Completion::Inspected(Ok(inspection(true, false))));
+        manager.complete(Completion::Inspected(Ok((
+            inspection(true, false),
+            CachedDownload::Empty,
+        ))));
         assert_eq!(
             manager.phase,
             Phase::Missing {
@@ -311,7 +330,10 @@ mod tests {
         assert!(!manager.is_busy());
         assert!(manager.prepared.is_none());
 
-        manager.complete(Completion::Inspected(Ok(inspection(false, false))));
+        manager.complete(Completion::Inspected(Ok((
+            inspection(false, false),
+            CachedDownload::Empty,
+        ))));
         assert_eq!(manager.phase, Phase::Unsupported);
         manager.download();
         assert!(!manager.is_busy());

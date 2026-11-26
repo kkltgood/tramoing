@@ -183,11 +183,7 @@ pub(super) fn install(prepared: &Prepared) -> Result<InstallOutcome, String> {
     }
     let root = prepared.root.canonicalize().map_err(|e| e.to_string())?;
     for item in &inspection.items {
-        let path = crate::update::download::component_path(&item.version, &root.join(&item.id))?;
-        let valid = std::fs::metadata(&path)
-            .is_ok_and(|meta| meta.is_file() && meta.len() == item.asset.size)
-            && crate::update::sha256_file(&path).is_ok_and(|hash| hash == item.asset.sha256);
-        if !valid {
+        if !item.verified_in(&root)? {
             return Err(format!("{} 的下载文件缺失或已损坏，请重新检查并下载 / Cached installer is missing or damaged; recheck and download", item.name));
         }
     }

@@ -34,7 +34,7 @@ public static class TramoingRuntimeProbe {
  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p,IntPtr l);
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,StringBuilder b,int n);
  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
- public static IntPtr Main(uint pid){ IntPtr found=IntPtr.Zero; EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);var b=new StringBuilder(256);GetWindowText(h,b,256);if(p==pid && b.ToString()=="Tramoing"){found=h;return false;}return true;},IntPtr.Zero);return found; }
+ public static IntPtr FindMainWindow(uint pid){ IntPtr found=IntPtr.Zero; EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);var b=new StringBuilder(256);GetWindowText(h,b,256);if(p==pid && b.ToString()=="Tramoing"){found=h;return false;}return true;},IntPtr.Zero);return found; }
  public static IntPtr Badge(uint pid){var parent=FindWindow("Shell_TrayWnd",null);var h=IntPtr.Zero;while((h=FindWindowEx(parent,h,"Tramoing.TaskbarSpeed",null))!=IntPtr.Zero){uint p;GetWindowThreadProcessId(h,out p);if(p==pid)return h;}return IntPtr.Zero;}
 }
 '@
@@ -97,7 +97,7 @@ try {
     }
     $second = Start-Process -FilePath $Executable -ArgumentList '--mock' -WindowStyle Hidden -PassThru
     if (-not $second.WaitForExit(5000)) {
-        $secondMain = [TramoingRuntimeProbe]::Main($second.Id)
+        $secondMain = [TramoingRuntimeProbe]::FindMainWindow($second.Id)
         if ($secondMain -ne [IntPtr]::Zero) { [TramoingRuntimeProbe]::PostMessage($secondMain, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
         throw 'Second instance did not exit'
     }
@@ -106,7 +106,7 @@ try {
     [pscustomobject]@{NativeChild=$true;Topmost=$false;PerPixelComposition=$true;BackgroundMaxChannelDelta=$backgroundMaxDelta;BlankAreaHitTest=$true;SingleInstance=$true;MockIsolated=$true;DataDirectory=$testRoot;Screenshot=$Screenshot} | ConvertTo-Json
 } finally {
     if ($testProcess) {
-        $main = [TramoingRuntimeProbe]::Main($testProcess.Id)
+        $main = [TramoingRuntimeProbe]::FindMainWindow($testProcess.Id)
         if ($main -ne [IntPtr]::Zero) { [TramoingRuntimeProbe]::PostMessage($main, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
         $exited = $testProcess.WaitForExit(10000)
         [pscustomobject]@{CleanExit=$exited;ChildRemoved=(-not [TramoingRuntimeProbe]::IsWindow($badge))} | ConvertTo-Json

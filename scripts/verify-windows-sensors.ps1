@@ -1,10 +1,19 @@
 ﻿# Read-only smoke test of the real worker. Does not install a driver or elevate.
-param([ValidateSet('x64')][string]$Architecture = 'x64')
+param(
+    [ValidateSet('x64')][string]$Architecture = 'x64',
+    [string]$DotNet
+)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $path = Join-Path $root "dist/windows-$Architecture/sensors/tramoing-sensors.exe"
 $start = [Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $path
+if ($DotNet) {
+    # Exercise the worker protocol using a private SDK on development machines.
+    # The default exercises the shipped apphost with the system runtime.
+    $start.FileName = (Get-Command $DotNet -CommandType Application -ErrorAction Stop).Source
+    $start.Arguments = '"' + [IO.Path]::ChangeExtension($path, 'dll') + '"'
+}
 $start.UseShellExecute = $false
 $start.CreateNoWindow = $true
 $start.RedirectStandardInput = $true
@@ -27,7 +36,12 @@ try {
     $stream = $process.StandardOutput.BaseStream
     $header = New-Object byte[] 4
     $read = $stream.ReadAsync($header, 0, 4)
-    if ($read.Wait(500)) { throw 'Worker emitted data before the start handshake' }
+    if ($read.Wait(500)) {
+        if ($read.Result -eq 0 -and $process.WaitForExit(2000)) {
+            throw "Sensor worker exited before the start handshake (exit $($process.ExitCode)): $($process.StandardError.ReadToEnd())"
+        }
+        throw 'Worker emitted data before the start handshake'
+    }
     # Send exactly the same ASCII handshake as the Rust supervisor.
     $handshake = [Text.Encoding]::ASCII.GetBytes("start`n")
     $process.StandardInput.BaseStream.Write($handshake, 0, $handshake.Length)

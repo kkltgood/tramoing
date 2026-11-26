@@ -696,6 +696,51 @@ fn component_fallback_resumes_bytes_without_forwarding_source_etag() {
 }
 
 #[test]
+fn component_fallback_recovers_from_a_corrupt_prefix_from_the_primary() {
+    let (primary, first) = serve(2, |attempt, _, stream| {
+        if attempt == 0 {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbad")
+                .unwrap();
+        } else {
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        }
+    });
+    let (mirror, second) = serve(2, |attempt, request, stream| {
+        if attempt == 0 {
+            assert!(request.contains("range: bytes=3-\r\n"));
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef").unwrap();
+        } else {
+            assert!(!request.contains("range:"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef",
+                )
+                .unwrap();
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _rx) = channel();
+    let (_cancel, stop) = channel();
+    let path = component_fast(
+        &asset(primary, b"abcdef"),
+        &[mirror],
+        root.path(),
+        &tx,
+        &stop,
+    )
+    .unwrap()
+    .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+}
+
+#[test]
 fn component_pause_preserves_partial_and_unblocks_retry_wait() {
     let (url, server) = serve(1, |_, _, stream| {
         stream

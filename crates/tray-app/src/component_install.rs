@@ -58,6 +58,17 @@ pub struct DownloadItem {
     fallbacks: Vec<String>,
 }
 
+impl DownloadItem {
+    fn verified_in(&self, cache: &Path) -> Result<bool, String> {
+        let path = crate::update::download::component_path(&self.version, &cache.join(&self.id))?;
+        Ok(
+            std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == self.asset.size)
+                && crate::update::sha256_file(&path)
+                    .is_ok_and(|hash| hash.eq_ignore_ascii_case(&self.asset.sha256)),
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Inspection {
     pub supported: bool,
@@ -77,6 +88,48 @@ pub struct Progress {
 #[derive(Clone, Debug)]
 pub struct Prepared {
     root: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum CachedDownload {
+    Empty,
+    Partial(f32),
+    Ready(Prepared),
+}
+
+impl Inspection {
+    pub fn cached_download(&self, root: &Path) -> Result<CachedDownload, String> {
+        if self.items.is_empty() {
+            return Ok(CachedDownload::Empty);
+        }
+        let mut all_verified = true;
+        let mut saved_bytes = 0.0;
+        for item in &self.items {
+            let fraction = if item.verified_in(root)? {
+                1.0
+            } else {
+                all_verified = false;
+                crate::update::download::saved_progress(
+                    &item.asset,
+                    &item.version,
+                    &root.join(&item.id),
+                )
+                .unwrap_or(0.0)
+            };
+            saved_bytes += f64::from(fraction) * item.asset.size as f64;
+        }
+        if all_verified {
+            Ok(CachedDownload::Ready(Prepared {
+                root: root.to_owned(),
+            }))
+        } else if saved_bytes > 0.0 {
+            Ok(CachedDownload::Partial(
+                (saved_bytes / self.total_bytes as f64) as f32,
+            ))
+        } else {
+            Ok(CachedDownload::Empty)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +431,56 @@ mod tests {
         config.component.as_mut().unwrap().sha256.clear();
         assert!(validate_configuration(&config).is_err());
     }
+
+    #[test]
+    fn inspection_restores_progress_and_only_offers_verified_installers() {
+        use crate::update::download::component_path;
+        use sha2::{Digest, Sha256};
+
+        let mut config = config();
+        let runtime = &mut config.dependencies[0];
+        runtime.size = 4;
+        runtime.sha256 = format!("{:x}", Sha256::digest(b"abcd"));
+        let sensor = config.component.as_mut().unwrap();
+        sensor.size = 4;
+        sensor.sha256 = format!("{:x}", Sha256::digest(b"efgh"));
+        let state = SystemState {
+            driver_ok: true,
+            ..Default::default()
+        };
+        let inspection = plan(&config, &state, true).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cached = || inspection.cached_download(root.path()).unwrap();
+        assert!(matches!(cached(), CachedDownload::Empty));
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+
+        let path = |item: &DownloadItem| {
+            let path = component_path(&item.version, &root.path().join(&item.id)).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        };
+        let runtime = path(&inspection.items[0]);
+        let sensor = &inspection.items[1];
+        let final_path = path(sensor);
+        let partial = final_path.with_file_name(format!(
+            "{}-{}.part",
+            crate::update::PLATFORM,
+            sensor.asset.sha256
+        ));
+        std::fs::write(runtime, b"abcd").unwrap();
+        std::fs::write(&partial, b"ef").unwrap();
+        assert!(matches!(cached(), CachedDownload::Partial(pct) if pct == 0.75));
+        std::fs::write(&partial, b"efgh").unwrap();
+        assert!(matches!(cached(), CachedDownload::Partial(pct) if pct == 1.0));
+        std::fs::remove_file(partial).unwrap();
+        std::fs::write(&final_path, b"oops").unwrap();
+        assert!(matches!(cached(), CachedDownload::Partial(pct) if pct == 0.5));
+        std::fs::write(final_path, b"efgh").unwrap();
+        assert!(
+            matches!(cached(), CachedDownload::Ready(prepared) if prepared.root == root.path())
+        );
+    }
+
     #[test]
     fn installed_driver_needing_restart_is_not_reinstalled() {
         let result = plan(
