@@ -17,6 +17,15 @@ fn installer_restarts_do_not_activate_an_existing_panel() {
         (vec!["--after-update"], None),
         (vec!["--after-update", "--settings"], Some("settings")),
         (vec!["--show"], Some("show")),
+        (vec!["--check-update"], Some("check-update")),
+        (
+            vec!["--after-update", "--check-update"],
+            Some("check-update"),
+        ),
+        (
+            vec!["--settings", "--check-update"],
+            Some("settings-check-update"),
+        ),
         (vec![], Some("show")),
     ] {
         let _ = std::fs::remove_file(&activation);
@@ -27,6 +36,7 @@ fn installer_restarts_do_not_activate_an_existing_panel() {
             .env_remove("TM_SHOW_ON_START")
             .env_remove("TM_AFTER_INSTALL")
             .env_remove("TM_VIEW")
+            .env_remove("TM_FORCE_UPDATE")
             .output()
             .unwrap();
         assert!(output.status.success(), "{flags:?}: {output:?}");

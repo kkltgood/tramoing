@@ -312,8 +312,8 @@ pub fn run() -> ! {
             supervisor.tick();
             let ok = unsafe { ConnectNamedPipe(handle, null_mut()) };
             let code = unsafe { GetLastError() };
-            if ok == 0 && code != ERROR_PIPE_CONNECTED {
-                if code == ERROR_NO_DATA {
+            if ok != 0 || code != ERROR_PIPE_CONNECTED {
+                if ok == 0 && code == ERROR_NO_DATA {
                     unsafe { DisconnectNamedPipe(handle) };
                 }
                 std::thread::sleep(Duration::from_millis(50));

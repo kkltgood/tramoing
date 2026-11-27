@@ -1364,8 +1364,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
-        if let Some(settings) = crate::instance::take_activation() {
-            self.view = if settings { View::Settings } else { View::Main };
+        if let Some(activation) = crate::instance::take_activation() {
+            self.force_update_check |= activation.check_update;
+            self.view = if activation.settings {
+                View::Settings
+            } else {
+                View::Main
+            };
             self.transition = None;
             if let Some(rect) = self.panel_anchor(ctx) {
                 self.open(ctx, rect);

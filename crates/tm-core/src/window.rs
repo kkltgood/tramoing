@@ -65,12 +65,15 @@ impl History {
         self.slots.resize(self.slots.len() + count, (0, 0));
     }
 
-    fn add(&mut self, rx: u64, tx: u64) {
-        if let Some(slot) = self.slots.back_mut() {
+    fn add_at(&mut self, offset: usize, rx: u64, tx: u64) {
+        if let Some(index) = self.slots.len().checked_sub(offset + 1) {
+            let slot = &mut self.slots[index];
             let updated = (slot.0.saturating_add(rx), slot.1.saturating_add(tx));
-            for sum in &mut self.sums {
-                sum.0 += (updated.0 - slot.0) as u128;
-                sum.1 += (updated.1 - slot.1) as u128;
+            for (sum, window) in self.sums.iter_mut().zip(CACHED_WINDOWS) {
+                if offset < window {
+                    sum.0 += (updated.0 - slot.0) as u128;
+                    sum.1 += (updated.1 - slot.1) as u128;
+                }
             }
             *slot = updated;
         }
@@ -129,7 +132,7 @@ impl WindowTracker {
     /// 推入这一秒的增量。同一应用的多条记录会合并，缺的应用自动补 0。
     pub fn push(&mut self, deltas: &[(AppKey, u64, u64)]) {
         self.advance(1);
-        self.add_deltas(deltas);
+        self.add_deltas_at(0, deltas);
     }
 
     fn advance(&mut self, count: usize) {
@@ -144,24 +147,31 @@ impl WindowTracker {
         self.total.advance(count, self.max_slots);
     }
 
-    fn add_deltas(&mut self, deltas: &[(AppKey, u64, u64)]) {
+    fn add_deltas_at(&mut self, offset: usize, deltas: &[(AppKey, u64, u64)]) {
+        if offset >= self.total.slots.len() {
+            return;
+        }
         for (app, rx, tx) in deltas {
             if let Some(history) = self.per_app.get_mut(app) {
-                history.add(*rx, *tx);
+                history.add_at(offset, *rx, *tx);
             } else {
                 let mut history = History::zeros(self.total.slots.len());
-                history.add(*rx, *tx);
+                history.add_at(offset, *rx, *tx);
                 self.per_app.insert(app.clone(), history);
             }
-            self.total.add(*rx, *tx);
+            self.total.add_at(offset, *rx, *tx);
         }
     }
 
     /// 按真实单调时钟推进；超时/休眠期间补空桶，同一秒的数据合并。
+    /// 积压帧回填原来的秒桶；已过保留期或早于首次观测的数据不进入窗口。
     /// 输入为观测到的增量，无法从累计采样反推丢失期间的逐包时间。
     pub fn push_at(&mut self, now: std::time::Instant, deltas: &[(AppKey, u64, u64)]) {
         let started = *self.started.get_or_insert(now);
-        self.elapsed = now.saturating_duration_since(started).as_secs_f64();
+        if now < started {
+            return;
+        }
+        self.elapsed = self.elapsed.max(now.duration_since(started).as_secs_f64());
         let Some(clock) = self.clock else {
             self.clock = Some(now);
             self.push(deltas);
@@ -172,7 +182,12 @@ impl WindowTracker {
             self.advance(elapsed.min(self.max_slots as u64) as usize);
             self.clock = Some(clock + std::time::Duration::from_secs(elapsed));
         }
-        self.add_deltas(deltas);
+        // clock 指向当前秒桶的起点；不足一秒的迟到也属于前一个桶。
+        let age = clock.saturating_duration_since(now);
+        let offset = age
+            .as_secs()
+            .saturating_add(u64::from(age.subsec_nanos() != 0));
+        self.add_deltas_at(offset.min(self.max_slots as u64) as usize, deltas);
     }
 
     pub fn bytes(&self, secs: usize) -> Vec<(AppKey, u64, u64)> {
@@ -423,6 +438,61 @@ mod tests {
         let t = std::time::Instant::now();
         w.push_at(t, &[(app("a"), 1000, 0)]);
         w.push_at(t + std::time::Duration::from_secs(61), &[]);
+        assert!(w.bytes(60).is_empty());
+        assert_eq!(w.total_rate(60), (0.0, 0.0));
+    }
+
+    #[test]
+    fn queued_samples_keep_their_original_buckets_after_the_clock_advances() {
+        let start = Instant::now();
+        let mut w = WindowTracker::default();
+        w.push_at(start, &[]);
+        w.push_at(start + Duration::from_secs(121), &[]);
+        w.push_at(start + Duration::from_secs(1), &[(app("old"), 6000, 1200)]);
+        w.push_at(start + Duration::from_secs(120), &[(app("recent"), 60, 6)]);
+        assert_eq!(w.bytes(60), vec![(app("recent"), 60, 6)]);
+        assert_eq!(w.total_rate(300), (6060.0 / 121.0, 1206.0 / 121.0));
+        assert_eq!(&w.series(3)[..], &[0.0, 60.0, 0.0]);
+
+        w.push_at(start + Duration::from_secs(301), &[]);
+        assert_eq!(w.bytes(300), vec![(app("recent"), 60, 6)]);
+        w.push_at(start + Duration::from_secs(421), &[]);
+        assert!(w.bytes(300).is_empty());
+    }
+
+    #[test]
+    fn late_samples_respect_subsecond_boundaries_without_rewinding_warmup() {
+        let start = Instant::now();
+        let mut w = WindowTracker::new(60);
+        w.push_at(start, &[]);
+        w.push_at(start + Duration::from_millis(5500), &[]);
+        w.push_at(start + Duration::from_millis(4999), &[(app("a"), 55, 0)]);
+        assert!(w.bytes(1).is_empty());
+        assert_eq!(w.rates(60), vec![(app("a"), 10.0, 0.0)]);
+        w.push_at(start + Duration::from_secs(5), &[(app("a"), 11, 0)]);
+        assert_eq!(w.bytes(1), vec![(app("a"), 11, 0)]);
+        assert_eq!(w.series(2), vec![55.0, 11.0]);
+    }
+
+    #[test]
+    fn expired_samples_are_dropped_and_late_saturated_buckets_expire_cleanly() {
+        let start = Instant::now();
+        let mut w = WindowTracker::new(60);
+        w.push_at(start, &[]);
+        w.push_at(start + Duration::from_secs(120), &[]);
+        for at in [
+            start - Duration::from_secs(1),
+            start + Duration::from_secs(60),
+        ] {
+            w.push_at(at, &[(app("expired"), 100, 0)]);
+        }
+        assert_eq!(w.app_count(), 0);
+        for _ in 0..2 {
+            w.push_at(start + Duration::from_secs(61), &[(app("a"), u64::MAX, 0)]);
+        }
+        assert_eq!(w.bytes(60), vec![(app("a"), u64::MAX, 0)]);
+        assert!(w.bytes(59).is_empty());
+        w.push_at(start + Duration::from_secs(121), &[]);
         assert!(w.bytes(60).is_empty());
         assert_eq!(w.total_rate(60), (0.0, 0.0));
     }

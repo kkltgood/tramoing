@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 
-use crate::proto::{Frame, ProcEntry};
+use crate::proto::{Frame, ProcEntry, ENTRY_FIXED, FRAME_OVERHEAD, MAX_FRAME_BYTES, MAX_NAME};
+
+const OVERFLOW_NAME: &str = "其他应用（采集容量上限）";
 
 /// 流量方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,16 +128,33 @@ impl AppAccumulator {
         self.seq += 1;
         self.apps
             .retain(|_, (_, _, seen)| self.seq.saturating_sub(*seen) <= 600);
+        // Reserve one overflow row and use the v2 entry size even when this
+        // batch can still be encoded as v1. Long paths never enlarge a frame
+        // beyond the same bound enforced by both encoder and pipe receiver.
+        let mut bytes = FRAME_OVERHEAD
+            + ENTRY_FIXED
+            + OVERFLOW_NAME.len()
+            + self
+                .apps
+                .keys()
+                .filter(|name| name.as_str() != OVERFLOW_NAME)
+                .map(|name| ENTRY_FIXED + name.len())
+                .sum::<usize>();
         for p in deltas.procs {
-            // 极端工作负载超过协议容量时保留总量，归到一个明确的汇总行。
-            let name = if !self.apps.contains_key(&p.name)
-                && self.apps.len() >= crate::proto::MAX_PROCS as usize - 1
+            let is_new = !self.apps.contains_key(&p.name);
+            let name = if p.name.len() > MAX_NAME
+                || (is_new
+                    && (self.apps.len() >= crate::proto::MAX_PROCS as usize - 1
+                        || bytes + ENTRY_FIXED + p.name.len() > MAX_FRAME_BYTES))
             {
-                "其他应用（采集容量上限）".to_owned()
+                OVERFLOW_NAME.to_owned()
             } else {
                 p.name
             };
-            let entry = self.apps.entry(name).or_insert_with(|| {
+            let entry = self.apps.entry(name).or_insert_with_key(|name| {
+                if name != OVERFLOW_NAME {
+                    bytes += ENTRY_FIXED + name.len();
+                }
                 self.next_id = self.next_id.wrapping_add(1);
                 (self.next_id, Counter::default(), self.seq)
             });
@@ -188,6 +207,68 @@ mod tests {
         let frame = apps.update(raw.drain_with(|pid| format!("{pid}.exe")));
         assert_eq!(frame.procs.iter().map(|p| p.rx).sum::<u64>(), 4999);
         assert!(Frame::decode(&frame.encode().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn long_path_capacity_keeps_total_bytes_and_encodes_within_transport_limit() {
+        let mut apps = AppAccumulator::default();
+        let mut expected = 0;
+        for batch in 0..3 {
+            let entries = (0..100)
+                .map(|pid| {
+                    expected += 1;
+                    ProcEntry {
+                        pid,
+                        rx: 1,
+                        tx: 0,
+                        name: format!("C:\\{}-{}-{pid}.exe", "测".repeat(30000), batch),
+                    }
+                })
+                .collect();
+            let frame = apps.update(Frame::new(batch, entries));
+            let encoded = frame.encode().unwrap();
+            assert!(encoded.len() <= MAX_FRAME_BYTES);
+            assert_eq!(Frame::decode(&encoded).unwrap(), frame);
+            assert_eq!(frame.procs.iter().map(|p| p.rx).sum::<u64>(), expected);
+            assert!(frame.procs.iter().any(|p| p.name == OVERFLOW_NAME));
+            assert!(frame
+                .procs
+                .iter()
+                .filter(|p| p.name != OVERFLOW_NAME)
+                .all(|p| p.name.ends_with(".exe")));
+        }
+    }
+
+    #[test]
+    fn capacity_is_reclaimed_after_long_path_entries_expire() {
+        let mut apps = AppAccumulator::default();
+        let name = "微".repeat(MAX_NAME / 3);
+        let first = apps.update(Frame::new(
+            1,
+            vec![ProcEntry {
+                pid: 1,
+                rx: 7,
+                tx: 0,
+                name,
+            }],
+        ));
+        assert_eq!(first.procs.len(), 1);
+        for seq in 0..601 {
+            apps.update(Frame::new(seq, Vec::new()));
+        }
+        let frame = apps.update(Frame::new(
+            700,
+            vec![ProcEntry {
+                pid: 2,
+                rx: 9,
+                tx: 0,
+                name: "new.exe".into(),
+            }],
+        ));
+        assert_eq!(frame.procs.len(), 1);
+        assert_eq!(frame.procs[0].name, "new.exe");
+        assert_eq!(frame.procs[0].rx, 9);
+        assert!(frame.encode().is_ok());
     }
 
     fn name_of(pid: u32) -> String {

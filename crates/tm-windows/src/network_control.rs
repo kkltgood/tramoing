@@ -224,6 +224,51 @@ pub(crate) fn request_named<R: serde::Serialize, T: serde::de::DeserializeOwned>
     Ok(reply)
 }
 
+/// Shared by statistics and control: only SYSTEM and the current account,
+/// medium-integrity clients, no remote clients, and no pre-existing server.
+pub(crate) fn create_restricted_pipe(name: &str, access: u32) -> Result<OwnedHandle, String> {
+    let sid = crate::scheduled_task::current_user_sid()?;
+    // 不使用 Everyone/Authenticated Users，也不允许远程管道访问。
+    // Medium 标签允许普通权限界面写入由提权助手创建的管道。
+    let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})S:(ML;;NW;;;ME)"));
+    let mut descriptor: *mut c_void = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(error("设置网络控制访问权限失败"));
+    }
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let name = wide(name);
+    let raw = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            access | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            65536,
+            65536,
+            0,
+            &security,
+        )
+    };
+    let creation_error = (raw == INVALID_HANDLE_VALUE).then(|| error("创建网络控制通道失败"));
+    unsafe { LocalFree(descriptor) };
+    if let Some(error) = creation_error {
+        return Err(error);
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
 pub struct Server(OwnedHandle);
 
 impl Server {
@@ -232,45 +277,7 @@ impl Server {
     }
 
     pub(crate) fn create_named(name: &str) -> Result<Self, String> {
-        let sid = crate::scheduled_task::current_user_sid()?;
-        // 不使用 Everyone/Authenticated Users，也不允许远程管道访问。
-        // Medium 标签允许普通权限界面写入由提权助手创建的管道。
-        let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})S:(ML;;NW;;;ME)"));
-        let mut descriptor: *mut c_void = null_mut();
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                1,
-                &mut descriptor,
-                null_mut(),
-            )
-        } == 0
-        {
-            return Err(error("设置网络控制访问权限失败"));
-        }
-        let security = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor,
-            bInheritHandle: 0,
-        };
-        let name = wide(name);
-        let raw = unsafe {
-            CreateNamedPipeW(
-                name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                65536,
-                65536,
-                0,
-                &security,
-            )
-        };
-        unsafe { LocalFree(descriptor) };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(error("创建网络控制通道失败"));
-        }
-        Ok(Self(unsafe { OwnedHandle::from_raw_handle(raw) }))
+        create_restricted_pipe(name, PIPE_ACCESS_DUPLEX).map(Self)
     }
 
     pub(crate) fn raw_handle(&self) -> HANDLE {
@@ -282,8 +289,8 @@ impl Server {
         loop {
             let ok = unsafe { ConnectNamedPipe(handle, null_mut()) };
             let code = unsafe { GetLastError() };
-            if ok == 0 && code != ERROR_PIPE_CONNECTED {
-                if code == ERROR_NO_DATA {
+            if ok != 0 || code != ERROR_PIPE_CONNECTED {
+                if ok == 0 && code == ERROR_NO_DATA {
                     unsafe { DisconnectNamedPipe(handle) };
                 }
                 std::thread::sleep(Duration::from_millis(50));

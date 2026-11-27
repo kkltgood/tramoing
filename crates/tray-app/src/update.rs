@@ -11,7 +11,9 @@
 //! 默认读取官方 GitHub Release 的 latest.json 附件，不依赖 GitHub API 配额。
 //! 可通过 TRAMOING_UPDATE_URL 覆盖地址或用空值禁用，见 docs/development.md。
 
+mod cache;
 pub(crate) mod download;
+mod install;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -163,7 +165,6 @@ pub enum Event {
         path: PathBuf,
     },
     DownloadFailed(String),
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     InstallPrepared(Result<(), String>),
 }
 
@@ -219,7 +220,6 @@ pub enum Phase {
         path: PathBuf,
         launch_error: Option<String>,
     },
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Installing {
         version: String,
         path: PathBuf,
@@ -539,6 +539,17 @@ impl Updater {
     }
 
     pub fn restore_download(&mut self) {
+        let root = self.root.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("update-cache-cleanup".into())
+            .spawn(move || {
+                if let Err(error) = cache::remove_obsolete(&root, CURRENT) {
+                    log::warn!(target: "tramoing::update", "清理旧更新缓存失败：{error}");
+                }
+            })
+        {
+            log::warn!(target: "tramoing::update", "无法启动更新缓存清理：{error}");
+        }
         self.restore_download_from(self.root.clone());
     }
 
@@ -701,54 +712,58 @@ impl Updater {
 
     /// 只有确认启动成功，界面才能退出。失败时保留已校验的包并允许重试。
     pub fn install(&mut self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            if !self.prepare_install() {
-                return false;
-            }
-            let Phase::Ready { version, path, .. } = self.phase.clone() else {
-                return false;
-            };
-            self.set(Phase::Installing {
-                version: version.clone(),
-                path: path.clone(),
-            });
-            let complete = self.terminal_sender();
-            if let Err(error) = std::thread::Builder::new()
-                .name("update-install".into())
-                .spawn(move || {
-                    let result = tm_macos::installation::start_update(&path, &version);
-                    complete(Event::InstallPrepared(result));
-                })
+        self.install_with(|path, version| {
+            #[cfg(target_os = "macos")]
+            return tm_macos::installation::start_update(path, version);
+            #[cfg(not(target_os = "macos"))]
             {
-                let _ = self.tx.send(Event::InstallPrepared(Err(format!(
-                    "无法启动更新：{error}"
-                ))));
+                let _ = version;
+                run_installer(path)
             }
-            false
-        }
-        #[cfg(not(target_os = "macos"))]
-        self.install_with(run_installer)
+        })
     }
 
-    #[cfg(any(not(target_os = "macos"), test))]
-    fn install_with(&mut self, launch: impl FnOnce(&Path) -> Result<(), String>) -> bool {
+    fn install_with(
+        &mut self,
+        launch: impl FnOnce(&Path, &str) -> Result<(), String> + Send + 'static,
+    ) -> bool {
         if !self.prepare_install() {
             return false;
         }
-        let Phase::Ready { path, .. } = &self.phase else {
+        let Phase::Ready { version, path, .. } = self.phase.clone() else {
             return false;
         };
-        match launch(path) {
-            Ok(()) => {
-                self.set(Phase::Restarting);
-                true
-            }
-            Err(error) => {
-                self.install_error(error);
-                false
-            }
+        let Some(asset) = self
+            .pending_download
+            .as_ref()
+            .filter(|pending| pending.release.version == version)
+            .and_then(|pending| pending.release.asset.clone())
+        else {
+            self.install_error("缺少更新校验信息，请重新检查更新".into());
+            return false;
+        };
+        self.set(Phase::Installing {
+            version: version.clone(),
+            path: path.clone(),
+        });
+        let complete = self.terminal_sender();
+        if let Err(error) = std::thread::Builder::new()
+            .name("update-install".into())
+            .spawn(move || {
+                // Use the expected digest already held by this task, never reload it
+                // from the writable pending.json while preparing an installation.
+                let result =
+                    install::with_verified(&path, &asset, |verified| launch(verified, &version));
+                complete(Event::InstallPrepared(result));
+            })
+        {
+            let _ = self.tx.send(Event::InstallPrepared(Err(format!(
+                "无法启动更新：{error}"
+            ))));
         }
+        // All platforms now finish asynchronously. poll() requests exit only
+        // after verification and the native installation handoff have succeeded.
+        false
     }
 
     /// 把后台事件吸收进状态。返回 `true` 表示状态变了，界面需要重画。
@@ -1090,7 +1105,7 @@ mod tests {
 
     fn settle(updater: &mut Updater) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while updater.is_busy() {
+        while updater.is_busy() && updater.phase != Phase::Restarting {
             updater.poll();
             assert!(Instant::now() < deadline, "updater worker did not finish");
             std::thread::sleep(Duration::from_millis(5));
@@ -1132,10 +1147,11 @@ mod tests {
         );
         assert_eq!(next.take_install_action(), None);
         assert!(!next.is_install_deferred());
-        assert!(!next.install_with(|installer| {
-            assert_eq!(installer, path);
+        assert!(!next.install_with(|installer, _| {
+            assert_eq!(std::fs::read(installer).unwrap(), b"abc");
             Err("cancelled".into())
         }));
+        settle(&mut next);
         let ready_with_error = next.phase.clone();
         assert!(next.can_check());
         next.check_source(Some("file:///not-an-update-source".into()));
@@ -1150,7 +1166,8 @@ mod tests {
         assert!(matches!(after_cancel.phase, Phase::Ready { .. }));
         assert_eq!(after_cancel.take_install_action(), None);
         assert!(after_cancel.can_check());
-        assert!(after_cancel.install_with(|_| Ok(())));
+        assert!(!after_cancel.install_with(|_, _| Ok(())));
+        settle(&mut after_cancel);
         assert_eq!(after_cancel.phase, Phase::Restarting);
     }
 
@@ -1459,35 +1476,85 @@ mod tests {
 
     #[test]
     fn cancelled_or_failed_install_keeps_the_verified_package_for_retry() {
-        let path = PathBuf::from("verified-setup.exe");
         let mut updater = Updater::new();
         let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("verified-setup.exe");
+        std::fs::write(&path, b"abc").unwrap();
         updater.root = root.path().to_owned();
         updater.pending_download = Some(test_pending());
         updater.set(Phase::Ready {
-            version: "1.2.3".into(),
+            version: "999.0.0".into(),
             path: path.clone(),
             launch_error: None,
         });
         for error in ["cancelled authorization", "failed to start installer"] {
-            assert!(!updater.install_with(|_| Err(error.into())));
+            assert!(!updater.install_with(move |_, _| Err(error.into())));
+            settle(&mut updater);
             assert!(!updater.can_auto_check());
             updater.tick();
             assert_eq!(
                 updater.phase,
                 Phase::Ready {
-                    version: "1.2.3".into(),
+                    version: "999.0.0".into(),
                     path: path.clone(),
                     launch_error: Some(error.into()),
                 }
             );
         }
-        assert!(updater.install_with(|retry| {
-            assert_eq!(retry, path);
+        assert!(!updater.install_with(|retry, _| {
+            assert_eq!(std::fs::read(retry).unwrap(), b"abc");
             Ok(())
         }));
+        settle(&mut updater);
         assert_eq!(updater.phase, Phase::Restarting);
-        assert!(!updater.install_with(|_| panic!("installer launched twice")));
+        assert!(!updater.install_with(|_, _| panic!("installer launched twice")));
+    }
+
+    #[test]
+    fn install_rechecks_ready_bytes_against_in_memory_metadata_on_a_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let pending = test_pending();
+        pending.save(root.path()).unwrap();
+        let path = download::installer_path(&pending.release.version, root.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"abc").unwrap();
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        settle(&mut updater);
+        assert!(matches!(updater.phase, Phase::Ready { .. }));
+
+        // The task has already accepted its manifest. Replacing both the cache
+        // and the saved metadata must not change this task's expected digest.
+        std::fs::write(&path, b"bad").unwrap();
+        let mut changed = pending;
+        changed.release.asset.as_mut().unwrap().sha256 = sha256_file(&path).unwrap();
+        changed.save(root.path()).unwrap();
+        assert!(!updater.install_with(|_, _| panic!("changed installer launched")));
+        settle(&mut updater);
+        assert!(matches!(
+            updater.phase,
+            Phase::Ready {
+                launch_error: Some(_),
+                ..
+            }
+        ));
+
+        std::fs::write(&path, b"abc").unwrap();
+        let (started, worker_started) = channel();
+        let (finish, wait_to_finish) = channel();
+        assert!(!updater.install_with(move |installer, _| {
+            assert_eq!(std::fs::read(installer).unwrap(), b"abc");
+            started.send(()).unwrap();
+            wait_to_finish.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        }));
+        assert!(matches!(updater.phase, Phase::Installing { .. }));
+        worker_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        updater.poll();
+        assert!(matches!(updater.phase, Phase::Installing { .. }));
+        finish.send(()).unwrap();
+        settle(&mut updater);
+        assert_eq!(updater.phase, Phase::Restarting);
     }
 
     #[cfg(windows)]

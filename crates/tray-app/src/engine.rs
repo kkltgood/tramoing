@@ -16,6 +16,32 @@ const RESTART_AFTER: Duration = Duration::from_secs(15);
 pub const TREND_SAMPLES: usize = 60;
 type Deltas = Vec<(AppKey, u64, u64)>;
 
+#[derive(Debug, PartialEq, Eq)]
+struct SampleTimes {
+    source: Instant,
+    observed: Instant,
+    wall: SystemTime,
+}
+
+/// 将源单调时间映射到本机日历时间，积压帧不能被记入消费时的分钟。
+/// Windows 跨进程锚点可能因首帧延迟暂时超前；限制窗口落点，但保留源间隔算速率。
+fn sample_times(
+    source: Option<Instant>,
+    received_at: Instant,
+    received_wall: SystemTime,
+) -> SampleTimes {
+    let source = source.unwrap_or(received_at);
+    let observed = source.min(received_at);
+    let wall = received_wall
+        .checked_sub(received_at.duration_since(observed))
+        .unwrap_or(UNIX_EPOCH);
+    SampleTimes {
+        source,
+        observed,
+        wall,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WindowedRates {
     pub min1: Vec<AppRate>,
@@ -279,11 +305,11 @@ where
                             last_good = Instant::now();
                             error = None;
                             backoff = 1;
-                            rates =
-                                Some(calc.update(s.sampled_at().unwrap_or(last_good), &samples));
+                            let times = sample_times(s.sampled_at(), last_good, SystemTime::now());
+                            rates = Some(calc.update(times.source, &samples));
                             let deltas = calc.take_deltas();
-                            tracker.push_at(last_good, &deltas);
-                            pending.add(SystemTime::now(), &deltas);
+                            tracker.push_at(times.observed, &deltas);
+                            pending.add(times.wall, &deltas);
                         }
                         Err(SamplerError::Timeout) => {
                             if last_good.elapsed() >= STALE_AFTER {
@@ -552,6 +578,80 @@ mod tests {
         assert_eq!(store.totals_between(120, 180).unwrap()[0].rx, 20);
         pending.flush(&mut store).unwrap();
         assert_eq!(store.totals_between(0, 180).unwrap()[0].rx, 1254);
+    }
+
+    #[test]
+    fn queued_samples_keep_source_minutes_and_expire_from_live_windows() {
+        let start = Instant::now();
+        let wall_start = UNIX_EPOCH + Duration::from_secs(120);
+        let mut calc = RateCalculator::with_smoothing(1.0);
+        let mut tracker = WindowTracker::new(MAX_SLOTS);
+        let mut pending = Pending::default();
+        calc.update(start, &[tm_core::ProcSample::new(1, "app", 0, 0)]);
+        tracker.push_at(start, &[]);
+        let consumed = start + Duration::from_secs(121);
+        for (seconds, total) in [(1, 6000), (2, 12000), (61, 18000), (120, 24000)] {
+            let times = sample_times(
+                Some(start + Duration::from_secs(seconds)),
+                consumed,
+                wall_start + Duration::from_secs(121),
+            );
+            calc.update(
+                times.source,
+                &[tm_core::ProcSample::new(1, "app", total, 0)],
+            );
+            let deltas = calc.take_deltas();
+            tracker.push_at(times.observed, &deltas);
+            pending.add(times.wall, &deltas);
+            // UI 时间推进会发生在每个积压帧之后，下一帧必须能回填旧桶。
+            tracker.push_at(consumed, &[]);
+        }
+        assert_eq!(tracker.bytes(60), vec![(AppKey::from("app"), 6000, 0)]);
+        assert_eq!(tracker.bytes(300), vec![(AppKey::from("app"), 24000, 0)]);
+        let mut store = Store::open_memory().unwrap();
+        pending.flush(&mut store).unwrap();
+        for (minute, bytes) in [(120, 12000), (180, 6000), (240, 6000)] {
+            assert_eq!(
+                store.totals_between(minute, minute + 60).unwrap()[0].rx,
+                bytes
+            );
+        }
+        assert_eq!(calc.session_total(), (24000, 0));
+    }
+
+    #[test]
+    fn source_clock_jitter_preserves_rate_intervals_without_future_history() {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(120);
+        assert_eq!(
+            sample_times(None, now, wall),
+            SampleTimes {
+                source: now,
+                observed: now,
+                wall
+            }
+        );
+        let past = now - Duration::from_millis(1500);
+        assert_eq!(
+            sample_times(Some(past), now, wall),
+            SampleTimes {
+                source: past,
+                observed: past,
+                wall: UNIX_EPOCH + Duration::from_millis(118500)
+            }
+        );
+        let mut calc = RateCalculator::with_smoothing(1.0);
+        calc.update(now, &[tm_core::ProcSample::new(1, "app", 0, 0)]);
+        // 首帧晚到 0.9 秒，下一帧仅隔 0.1 秒收到，源时间仍相隔一秒。
+        let times = sample_times(
+            Some(now + Duration::from_secs(1)),
+            now + Duration::from_millis(100),
+            wall + Duration::from_millis(100),
+        );
+        calc.update(times.source, &[tm_core::ProcSample::new(1, "app", 1000, 0)]);
+        assert_eq!(calc.total_bps(), (1000.0, 0.0));
+        assert_eq!(times.observed, now + Duration::from_millis(100));
+        assert_eq!(times.wall, wall + Duration::from_millis(100));
     }
 
     #[test]

@@ -265,7 +265,11 @@ fn run(args: &[String]) -> eframe::Result<()> {
             .iter()
             .any(|arg| matches!(arg.as_str(), "--after-install" | "--after-update"))
             && std::env::var_os("TM_AFTER_INSTALL").is_none());
-    let _instance = match instance::Instance::acquire(activate_existing) {
+    let activation = activate_existing.then(|| instance::Activation {
+        settings: std::env::var("TM_VIEW").as_deref() == Ok("settings"),
+        check_update: std::env::var_os("TM_FORCE_UPDATE").is_some(),
+    });
+    let _instance = match instance::Instance::acquire(activation) {
         Ok(Some(instance)) => instance,
         Ok(None) => return Ok(()),
         Err(e) => {
