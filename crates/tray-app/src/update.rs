@@ -14,10 +14,9 @@
 pub(crate) mod download;
 
 use std::io::Read;
-#[cfg(any(not(target_os = "macos"), test))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +95,59 @@ pub struct Available {
     pub homepage: String,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum InstallAction {
+    Prompt { version: String },
+    InstallOnLaunch,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum InstallPolicy {
+    #[default]
+    Ask,
+    NextLaunch,
+    Manual,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum DownloadMode {
+    #[default]
+    Paused,
+    Automatic,
+    Exhausted,
+}
+
+impl DownloadMode {
+    fn restored_error(self) -> Option<String> {
+        (self == Self::Exhausted).then(|| {
+            "自动下载已停止，请重试或手动下载 / Download stopped; retry or download manually".into()
+        })
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct PendingDownload {
+    #[serde(flatten)]
+    release: Available,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    install_policy: InstallPolicy,
+    #[serde(default)]
+    download_mode: DownloadMode,
+}
+
+impl PendingDownload {
+    fn save(&self, root: &Path) -> Result<(), String> {
+        serde_json::to_vec(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| tm_store::files::atomic_write(&root.join("pending.json"), &bytes))
+            .map_err(|error| format!("无法保存更新任务：{error}"))
+    }
+}
+
 /// 后台线程发回界面的事件。
 pub enum Event {
     /// `None` = 已是最新
@@ -124,7 +176,14 @@ pub struct Updater {
     /// 「已是最新」赖在页脚不走，用户会以为下次检查也是这个结论。
     phase_at: Instant,
     download_stop: Option<Sender<()>>,
-    pending_download: Option<(Available, PathBuf)>,
+    root: PathBuf,
+    pending_download: Option<PendingDownload>,
+    check_result: Option<Result<Option<String>, String>>,
+    ready_before_check: Option<Phase>,
+    download_error: Option<String>,
+    install_action: Option<InstallAction>,
+    verifying_cache: bool,
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +206,7 @@ pub enum Phase {
     Pausing {
         version: String,
         pct: f32,
+        error: Option<String>,
     },
     Paused {
         version: String,
@@ -176,6 +236,10 @@ impl Default for Updater {
 
 impl Updater {
     pub fn new() -> Self {
+        Self::with_waker(|| {})
+    }
+
+    pub fn with_waker(wake: impl Fn() + Send + Sync + 'static) -> Self {
         let (tx, rx) = channel();
         Self {
             tx,
@@ -183,8 +247,92 @@ impl Updater {
             phase: Phase::Idle,
             phase_at: Instant::now(),
             download_stop: None,
+            root: tm_store::data_dir().join("update"),
             pending_download: None,
+            check_result: None,
+            ready_before_check: None,
+            download_error: None,
+            install_action: None,
+            verifying_cache: false,
+            wake: Arc::new(wake),
         }
+    }
+
+    fn terminal_sender(&self) -> impl FnOnce(Event) + Send + 'static {
+        let tx = self.tx.clone();
+        let wake = self.wake.clone();
+        move |event| {
+            if tx.send(event).is_ok() {
+                wake();
+            }
+        }
+    }
+
+    pub fn take_check_result(&mut self) -> Option<Result<Option<String>, String>> {
+        self.check_result.take()
+    }
+
+    pub fn take_download_error(&mut self) -> Option<String> {
+        self.download_error.take()
+    }
+
+    pub fn release_page(&self) -> &str {
+        let release = match &self.phase {
+            Phase::Available(available) => Some(available),
+            _ => self
+                .pending_download
+                .as_ref()
+                .map(|pending| &pending.release),
+        };
+        release
+            .map(|available| available.homepage.as_str())
+            .filter(|url| http_url(url).is_ok())
+            .unwrap_or(RELEASES_URL)
+    }
+
+    pub fn take_install_action(&mut self) -> Option<InstallAction> {
+        self.install_action.take()
+    }
+
+    pub fn is_install_deferred(&self) -> bool {
+        self.pending_download
+            .as_ref()
+            .is_some_and(|pending| pending.install_policy == InstallPolicy::NextLaunch)
+    }
+
+    fn update_pending(&mut self, policy: InstallPolicy, mode: DownloadMode) -> Result<(), String> {
+        self.update_pending_with(policy, mode, PendingDownload::save)
+    }
+
+    fn update_pending_with(
+        &mut self,
+        policy: InstallPolicy,
+        mode: DownloadMode,
+        save: impl FnOnce(&PendingDownload, &Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let pending = self.pending_download.as_mut().ok_or("没有待安装的更新")?;
+        pending.install_policy = policy;
+        pending.download_mode = mode;
+        if let Err(error) = save(pending, &self.root) {
+            pending.install_policy = InstallPolicy::Manual;
+            self.install_action = None;
+            if let Err(cleanup) = std::fs::remove_file(self.root.join("pending.json")) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("{error}；也无法清除旧的更新任务：{cleanup}"));
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn defer_install(&mut self) -> Result<(), String> {
+        if !matches!(self.phase, Phase::Ready { .. }) {
+            return Err("更新安装包尚未就绪".into());
+        }
+        self.update_pending(InstallPolicy::NextLaunch, DownloadMode::Paused)?;
+        self.install_action = None;
+        Ok(())
     }
 
     fn set(&mut self, phase: Phase) {
@@ -219,23 +367,41 @@ impl Updater {
         matches!(self.phase, Phase::Idle | Phase::Latest | Phase::Error(_))
     }
 
+    pub fn can_check(&self) -> bool {
+        if let Phase::Ready { launch_error, .. } = &self.phase {
+            return self.install_action.is_none()
+                && !self.is_install_deferred()
+                && (launch_error.is_some()
+                    || self
+                        .pending_download
+                        .as_ref()
+                        .is_some_and(|pending| pending.install_policy == InstallPolicy::Manual));
+        }
+        self.can_auto_check()
+            || matches!(
+                self.phase,
+                Phase::Available(_) | Phase::Paused { error: Some(_), .. }
+            )
+    }
+
     /// 起一个线程去拉清单。重复调用是安全的：正在查/正在下时直接忽略。
     pub fn check(&mut self) {
         self.check_source(manifest_url());
     }
 
     fn check_source(&mut self, source: Option<String>) {
-        if self.is_busy() {
+        if !self.can_check() {
             return;
         }
+        self.ready_before_check =
+            matches!(self.phase, Phase::Ready { .. }).then(|| self.phase.clone());
+        self.download_error = None;
         let Some(url) = source else {
-            self.set(Phase::Error(
-                "未配置更新源 / Update source not configured".into(),
-            ));
+            self.check_failed("未配置更新源 / Update source not configured".into());
             return;
         };
         self.set(Phase::Checking);
-        let tx = self.tx.clone();
+        let complete = self.terminal_sender();
         if let Err(e) = std::thread::Builder::new()
             .name("update-check".into())
             .spawn(move || {
@@ -245,37 +411,62 @@ impl Updater {
                     Ok(available) => Event::Checked(available),
                     Err(e) => Event::Failed(e),
                 };
-                let _ = tx.send(ev);
+                complete(ev);
             })
         {
-            self.set(Phase::Error(format!("无法启动更新检查：{e}")));
+            self.check_failed(format!("无法启动更新检查：{e}"));
         }
     }
 
-    /// 开始下载安装包。`asset` 为空（清单没给本平台的包）时什么也不做。
-    pub fn download(&mut self, avail: &Available) {
-        self.download_into(avail, tm_store::data_dir().join("update"));
+    fn check_failed(&mut self, error: String) {
+        self.check_result = Some(Err(error.clone()));
+        if let Some(ready) = self.ready_before_check.take() {
+            self.set(ready);
+        } else if let Some(pending) = &self.pending_download {
+            let version = pending.release.version.clone();
+            let pct = pending
+                .release
+                .asset
+                .as_ref()
+                .and_then(|asset| download::saved_progress(asset, &version, &self.root))
+                .unwrap_or(0.0);
+            self.set(Phase::Paused {
+                version,
+                pct,
+                error: Some(error),
+            });
+        } else {
+            self.set(Phase::Error(error));
+        }
     }
 
-    fn download_into(&mut self, avail: &Available, root: PathBuf) {
+    fn download(&mut self, avail: &Available, start_new_round: bool) {
         if self.is_busy() {
             return;
         }
         let Some(asset) = avail.asset.clone() else {
             return;
         };
-        let saved = serde_json::to_vec(avail)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| tm_store::files::atomic_write(&root.join("pending.json"), &bytes));
+        let root = self.root.clone();
+        let pending = PendingDownload {
+            release: avail.clone(),
+            platform: PLATFORM.into(),
+            install_policy: InstallPolicy::Ask,
+            download_mode: DownloadMode::Automatic,
+        };
+        let saved = pending.save(&root);
+        let version = avail.version.clone();
+        self.pending_download = Some(pending);
+        self.install_action = None;
+        self.download_error = None;
+        self.verifying_cache = false;
+        let pct = download::saved_progress(&asset, &version, &root).unwrap_or(0.0);
         if let Err(error) = saved {
-            self.set(Phase::Error(format!("无法保存下载任务：{error}")));
+            self.download_failed(version, pct, error);
             return;
         }
-        let version = avail.version.clone();
-        self.pending_download = Some((avail.clone(), root.clone()));
-        let pct = download::saved_progress(&asset, &version, &root).unwrap_or(0.0);
         self.start_download_task(version.clone(), pct, move |tx, stopped| {
-            download::run(&asset, &version, tx, &root, stopped)
+            download::run(&asset, &version, tx, &root, stopped, start_new_round)
         });
     }
 
@@ -294,22 +485,24 @@ impl Updater {
             pct,
         });
         let tx = self.tx.clone();
+        let complete = self.terminal_sender();
+        let completed_version = version.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("update-download".into())
-            .spawn(move || match work(&tx, &stopped) {
-                Ok(Some(path)) => {
-                    let _ = tx.send(Event::Downloaded { version, path });
-                }
-                Ok(None) => {
-                    let _ = tx.send(Event::DownloadPaused);
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::DownloadFailed(e));
-                }
+            .spawn(move || {
+                complete(match work(&tx, &stopped) {
+                    Ok(Some(path)) => Event::Downloaded {
+                        version: completed_version,
+                        path,
+                    },
+                    Ok(None) => Event::DownloadPaused,
+                    Err(error) => Event::DownloadFailed(error),
+                });
             })
         {
             self.download_stop = None;
-            self.set(Phase::Error(format!("无法启动下载：{e}")));
+            self.verifying_cache = false;
+            self.download_failed(version, pct, format!("无法启动下载：{e}"));
         }
     }
 
@@ -317,34 +510,58 @@ impl Updater {
         if let Phase::Downloading { version, pct } | Phase::Retrying { version, pct, .. } =
             self.phase.clone()
         {
+            let error = if self.pending_download.is_some() {
+                self.update_pending(InstallPolicy::Ask, DownloadMode::Paused)
+                    .err()
+            } else {
+                None
+            };
+            if let Some(error) = &error {
+                log::error!(target: "tramoing::update", "无法保存暂停状态：{error}");
+            }
             if let Some(stop) = &self.download_stop {
                 let _ = stop.send(());
             }
-            self.set(Phase::Pausing { version, pct });
+            self.set(Phase::Pausing {
+                version,
+                pct,
+                error,
+            });
         }
     }
 
     pub fn resume_download(&mut self) {
         if matches!(self.phase, Phase::Paused { .. }) {
-            if let Some((available, root)) = self.pending_download.clone() {
-                self.download_into(&available, root);
+            if let Some(pending) = self.pending_download.clone() {
+                self.download(&pending.release, true);
             }
         }
     }
 
-    /// Restore the explicitly requested download without starting network traffic.
-    /// The user can continue from the footer even if today's update check already ran.
     pub fn restore_download(&mut self) {
-        self.restore_download_from(tm_store::data_dir().join("update"));
+        self.restore_download_from(self.root.clone());
     }
 
     fn restore_download_from(&mut self, root: PathBuf) {
+        if !matches!(self.phase, Phase::Idle) || self.pending_download.is_some() {
+            return;
+        }
+        self.root = root.clone();
         let Ok(file) = std::fs::File::open(root.join("pending.json")) else {
             return;
         };
-        let Ok(available) = serde_json::from_reader::<_, Available>(file.take(1024 * 1024)) else {
+        let Ok(mut pending) = serde_json::from_reader::<_, PendingDownload>(file.take(1024 * 1024))
+        else {
             return;
         };
+        if pending.platform.is_empty() {
+            pending.platform = PLATFORM.into();
+            pending.install_policy = InstallPolicy::Ask;
+            pending.download_mode = DownloadMode::Paused;
+        } else if pending.platform != PLATFORM {
+            return;
+        }
+        let available = &pending.release;
         let Ok(version) = parse_version(&available.version) else {
             return;
         };
@@ -355,37 +572,129 @@ impl Updater {
             let _ = std::fs::remove_file(root.join("pending.json"));
             return;
         }
-        let Some(asset) = &available.asset else {
+        let Some(asset) = available.asset.clone() else {
             return;
         };
         if http_url(&asset.url).is_err() {
             return;
         }
-        let Some(pct) = download::saved_progress(asset, &available.version, &root) else {
+        let Some(pct) = download::saved_progress(&asset, &available.version, &root) else {
             return;
         };
+        let version = available.version.clone();
+        let error = pending.download_mode.restored_error();
         self.set(Phase::Paused {
-            version: available.version.clone(),
+            version: version.clone(),
             pct,
-            error: None,
+            error,
         });
-        self.pending_download = Some((available.clone(), root.clone()));
-        if download::installer_path(&available.version, &root).is_ok_and(|path| path.is_file()) {
+        self.pending_download = Some(pending);
+        if download::installer_path(&version, &root).is_ok_and(|path| path.is_file()) {
             // Hashing a large installer must not block startup or the UI. Reuse the
             // download lifecycle to prevent checks/resumes from racing this worker.
-            let asset = asset.clone();
-            let version = available.version;
+            self.verifying_cache = true;
             self.start_download_task(version.clone(), pct, move |_, stopped| {
                 download::restore(&asset, &version, &root, stopped)
             });
+        } else {
+            self.after_incomplete_cache();
         }
+    }
+
+    fn after_incomplete_cache(&mut self) {
+        let Some(pending) = &self.pending_download else {
+            return;
+        };
+        if pending.install_policy == InstallPolicy::Ask
+            && pending.download_mode == DownloadMode::Automatic
+        {
+            let release = pending.release.clone();
+            self.download(&release, false);
+        } else if pending.install_policy == InstallPolicy::NextLaunch {
+            if let Err(error) = self.update_pending(InstallPolicy::Manual, DownloadMode::Paused) {
+                log::warn!(target: "tramoing::update", "{error}");
+                if let Phase::Paused { error: shown, .. } = &mut self.phase {
+                    *shown = Some(error);
+                }
+            }
+        }
+    }
+
+    fn download_failed(&mut self, version: String, pct: f32, mut error: String) {
+        if let Err(save_error) = self.update_pending(InstallPolicy::Ask, DownloadMode::Exhausted) {
+            error = format!("{error}；{save_error}");
+        }
+        log::warn!(target: "tramoing::update", "下载失败：{error}");
+        self.download_error = Some(error.clone());
+        self.set(Phase::Paused {
+            version,
+            pct,
+            error: Some(error),
+        });
+    }
+
+    fn forget_pending(&mut self) {
+        self.install_action = None;
+        self.download_error = None;
+        if self.pending_download.take().is_some() {
+            if let Err(error) = std::fs::remove_file(self.root.join("pending.json")) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(target: "tramoing::update", "无法移除过期的更新任务：{error}");
+                }
+            }
+        }
+    }
+
+    fn verified(&mut self, version: String, path: PathBuf) {
+        self.download_stop = None;
+        self.set(Phase::Ready {
+            version: version.clone(),
+            path,
+            launch_error: None,
+        });
+        match self
+            .pending_download
+            .as_ref()
+            .map(|pending| pending.install_policy)
+        {
+            Some(InstallPolicy::NextLaunch) => {
+                match self.update_pending(InstallPolicy::Manual, DownloadMode::Paused) {
+                    Ok(()) => self.install_action = Some(InstallAction::InstallOnLaunch),
+                    Err(error) => self.install_error(error),
+                }
+            }
+            Some(InstallPolicy::Ask) => {
+                self.install_action = Some(InstallAction::Prompt { version })
+            }
+            _ => {}
+        }
+    }
+
+    fn install_error(&mut self, error: String) {
+        log::error!(target: "tramoing::update", "启动更新失败：{error}");
+        self.install_action = None;
+        if let Phase::Ready { launch_error, .. } = &mut self.phase {
+            *launch_error = Some(error);
+        }
+    }
+
+    fn prepare_install(&mut self) -> bool {
+        if !matches!(self.phase, Phase::Ready { .. }) {
+            return false;
+        }
+        self.install_action = None;
+        if let Err(error) = self.update_pending(InstallPolicy::Manual, DownloadMode::Paused) {
+            self.install_error(error);
+            return false;
+        }
+        true
     }
 
     fn download_progress(&self) -> Option<(String, f32)> {
         match &self.phase {
             Phase::Downloading { version, pct }
             | Phase::Retrying { version, pct, .. }
-            | Phase::Pausing { version, pct } => Some((version.clone(), *pct)),
+            | Phase::Pausing { version, pct, .. } => Some((version.clone(), *pct)),
             _ => None,
         }
     }
@@ -394,6 +703,9 @@ impl Updater {
     pub fn install(&mut self) -> bool {
         #[cfg(target_os = "macos")]
         {
+            if !self.prepare_install() {
+                return false;
+            }
             let Phase::Ready { version, path, .. } = self.phase.clone() else {
                 return false;
             };
@@ -401,12 +713,12 @@ impl Updater {
                 version: version.clone(),
                 path: path.clone(),
             });
-            let tx = self.tx.clone();
+            let complete = self.terminal_sender();
             if let Err(error) = std::thread::Builder::new()
                 .name("update-install".into())
                 .spawn(move || {
                     let result = tm_macos::installation::start_update(&path, &version);
-                    let _ = tx.send(Event::InstallPrepared(result));
+                    complete(Event::InstallPrepared(result));
                 })
             {
                 let _ = self.tx.send(Event::InstallPrepared(Err(format!(
@@ -421,20 +733,19 @@ impl Updater {
 
     #[cfg(any(not(target_os = "macos"), test))]
     fn install_with(&mut self, launch: impl FnOnce(&Path) -> Result<(), String>) -> bool {
-        let Phase::Ready {
-            path, launch_error, ..
-        } = &mut self.phase
-        else {
+        if !self.prepare_install() {
+            return false;
+        }
+        let Phase::Ready { path, .. } = &self.phase else {
             return false;
         };
         match launch(path) {
             Ok(()) => {
-                *launch_error = None;
+                self.set(Phase::Restarting);
                 true
             }
             Err(error) => {
-                log::error!(target: "tramoing::update", "启动更新失败：{error}");
-                *launch_error = Some(error);
+                self.install_error(error);
                 false
             }
         }
@@ -447,29 +758,37 @@ impl Updater {
             changed = true;
             match ev {
                 Event::Checked(Some(a)) => {
+                    self.ready_before_check = None;
                     log_line(&format!(
                         "发现新版本 {}（当前 {CURRENT}，发布于 {}）",
                         a.version, a.pub_date
                     ));
-                    self.set(Phase::Available(a));
+                    self.check_result = Some(Ok(Some(a.version.clone())));
+                    self.set(Phase::Available(a.clone()));
+                    if a.asset.is_some() {
+                        self.download(&a, true);
+                    } else {
+                        self.forget_pending();
+                    }
                 }
                 Event::Checked(None) => {
+                    self.ready_before_check = None;
                     log_line("已是最新版本");
+                    self.check_result = Some(Ok(None));
+                    self.forget_pending();
                     self.set(Phase::Latest);
                 }
                 Event::Failed(e) => {
                     // 失败必须落盘：release 是 GUI 子系统，没有 stderr，
                     // 线上「怎么从来不提示」只能靠这个文件查。
                     log::error!(target: "tramoing::update", "检查更新失败：{e}");
-                    self.set(Phase::Error(e));
+                    self.check_failed(e);
                 }
                 Event::Progress(pct) => {
-                    if let Some((version, _)) = self.download_progress() {
-                        if matches!(self.phase, Phase::Pausing { .. }) {
-                            self.set(Phase::Pausing { version, pct });
-                        } else {
-                            self.set(Phase::Downloading { version, pct });
-                        }
+                    if let Phase::Pausing { pct: current, .. } = &mut self.phase {
+                        *current = pct;
+                    } else if let Some((version, _)) = self.download_progress() {
+                        self.set(Phase::Downloading { version, pct });
                     }
                 }
                 Event::DownloadRetrying { delay } => {
@@ -485,34 +804,65 @@ impl Updater {
                 }
                 Event::DownloadPaused => {
                     self.download_stop = None;
+                    let verifying_cache = std::mem::take(&mut self.verifying_cache);
+                    let user_paused = matches!(self.phase, Phase::Pausing { .. });
                     if let Some((version, pct)) = self.download_progress() {
+                        let error = if let Phase::Pausing { error, .. } = &self.phase {
+                            error.clone()
+                        } else {
+                            self.pending_download
+                                .as_ref()
+                                .and_then(|pending| pending.download_mode.restored_error())
+                        };
                         self.set(Phase::Paused {
                             version,
                             pct,
-                            error: None,
+                            error,
                         });
+                        if verifying_cache && !user_paused {
+                            self.after_incomplete_cache();
+                        }
                     }
                 }
                 Event::Downloaded { version, path } => {
-                    self.download_stop = None;
+                    if !matches!(self.download_progress(), Some((ref expected, _)) if *expected == version)
+                    {
+                        continue;
+                    }
                     // Keep the task until its version is installed, including when
                     // the user quits after download but before confirming installation.
                     log_line(&format!("已下载 {}：{}", version, path.display()));
-                    self.set(Phase::Ready {
-                        version,
-                        path,
-                        launch_error: None,
-                    });
+                    self.verifying_cache = false;
+                    if let Phase::Pausing {
+                        error: Some(error), ..
+                    } = &self.phase
+                    {
+                        self.download_stop = None;
+                        self.set(Phase::Paused {
+                            version,
+                            pct: 1.0,
+                            error: Some(error.clone()),
+                        });
+                    } else {
+                        self.verified(version, path);
+                    }
                 }
                 Event::DownloadFailed(e) => {
                     self.download_stop = None;
-                    log::error!(target: "tramoing::update", "下载失败：{e}");
-                    if let Some((version, pct)) = self.download_progress() {
+                    self.verifying_cache = false;
+                    if let Phase::Pausing {
+                        version,
+                        pct,
+                        error,
+                    } = self.phase.clone()
+                    {
                         self.set(Phase::Paused {
                             version,
                             pct,
-                            error: Some(e),
+                            error,
                         });
+                    } else if let Some((version, pct)) = self.download_progress() {
+                        self.download_failed(version, pct, e);
                     } else {
                         self.set(Phase::Error(e));
                     }
@@ -559,8 +909,16 @@ fn available_update(
         version: remote.to_string(),
         notes: m.notes,
         pub_date: m.pub_date,
-        asset: m.platforms.get(platform).cloned(),
-        homepage: m.homepage,
+        asset: m
+            .platforms
+            .get(platform)
+            .filter(|asset| download::valid_sha256(&asset.sha256) && http_url(&asset.url).is_ok())
+            .cloned(),
+        homepage: if http_url(&m.homepage).is_ok() {
+            m.homepage
+        } else {
+            RELEASES_URL.to_owned()
+        },
     }))
 }
 
@@ -710,6 +1068,363 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn test_pending() -> PendingDownload {
+        PendingDownload {
+            release: Available {
+                version: "999.0.0".into(),
+                notes: String::new(),
+                pub_date: String::new(),
+                homepage: RELEASES_URL.into(),
+                asset: Some(Asset {
+                    url: "http://127.0.0.1:0/package".into(),
+                    sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                        .into(),
+                    size: 3,
+                }),
+            },
+            platform: PLATFORM.into(),
+            install_policy: InstallPolicy::Ask,
+            download_mode: DownloadMode::Automatic,
+        }
+    }
+
+    fn settle(updater: &mut Updater) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updater.is_busy() {
+            updater.poll();
+            assert!(Instant::now() < deadline, "updater worker did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn later_only_installs_once_on_a_new_launch_after_reverification() {
+        let root = tempfile::tempdir().unwrap();
+        let pending = test_pending();
+        pending.save(root.path()).unwrap();
+        let path = download::installer_path(&pending.release.version, root.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"abc").unwrap();
+
+        let restore = || {
+            let mut updater = Updater::new();
+            updater.restore_download_from(root.path().to_owned());
+            settle(&mut updater);
+            updater
+        };
+        let mut first = restore();
+        assert!(matches!(
+            first.take_install_action(),
+            Some(InstallAction::Prompt { .. })
+        ));
+        assert!(!first.can_check());
+        first.defer_install().unwrap();
+        assert!(first.is_install_deferred());
+        first.restore_download();
+        assert!(first.take_install_action().is_none());
+        assert!(!first.can_check());
+        drop(first);
+
+        let mut next = restore();
+        assert_eq!(
+            next.take_install_action(),
+            Some(InstallAction::InstallOnLaunch)
+        );
+        assert_eq!(next.take_install_action(), None);
+        assert!(!next.is_install_deferred());
+        assert!(!next.install_with(|installer| {
+            assert_eq!(installer, path);
+            Err("cancelled".into())
+        }));
+        let ready_with_error = next.phase.clone();
+        assert!(next.can_check());
+        next.check_source(Some("file:///not-an-update-source".into()));
+        assert_eq!(next.phase, Phase::Checking);
+        settle(&mut next);
+        assert_eq!(next.phase, ready_with_error);
+        assert!(matches!(next.take_check_result(), Some(Err(_))));
+        assert_eq!(next.take_install_action(), None);
+        drop(next);
+
+        let mut after_cancel = restore();
+        assert!(matches!(after_cancel.phase, Phase::Ready { .. }));
+        assert_eq!(after_cancel.take_install_action(), None);
+        assert!(after_cancel.can_check());
+        assert!(after_cancel.install_with(|_| Ok(())));
+        assert_eq!(after_cancel.phase, Phase::Restarting);
+    }
+
+    #[test]
+    fn deferred_installation_never_runs_for_a_damaged_missing_stale_or_other_platform_package() {
+        for (bytes, version, platform) in [
+            (Some("bad"), "999.0.0", PLATFORM),
+            (None, "999.0.0", PLATFORM),
+            (Some("abc"), CURRENT, PLATFORM),
+            (Some("abc"), "999.0.0", "different-platform"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut pending = test_pending();
+            pending.release.version = version.to_owned();
+            pending.platform = platform.to_owned();
+            pending.install_policy = InstallPolicy::NextLaunch;
+            pending.download_mode = DownloadMode::Paused;
+            pending.save(root.path()).unwrap();
+            if let Some(body) = bytes {
+                let path = download::installer_path(version, root.path()).unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, body).unwrap();
+            }
+            let mut updater = Updater::new();
+            updater.restore_download_from(root.path().to_owned());
+            settle(&mut updater);
+            assert!(matches!(updater.phase, Phase::Idle | Phase::Paused { .. }));
+            assert_eq!(updater.take_install_action(), None);
+            assert!(!updater.is_install_deferred());
+        }
+    }
+
+    #[test]
+    fn restarted_automatic_download_resumes_bytes_even_if_the_destination_is_corrupt() {
+        for corrupt_destination in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (url, server) = serve_download(|mut stream| {
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nConnection: close\r\n\r\nbc").unwrap();
+            });
+            let mut pending = test_pending();
+            let asset = pending.release.asset.as_mut().unwrap();
+            asset.url = url;
+            let hash = asset.sha256.clone();
+            pending.save(root.path()).unwrap();
+            let dest = download::installer_path(&pending.release.version, root.path()).unwrap();
+            let dir = dest.parent().unwrap();
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(format!("{PLATFORM}-{hash}.part")), b"a").unwrap();
+            if corrupt_destination {
+                std::fs::write(&dest, b"bad").unwrap();
+            }
+            let mut updater = Updater::new();
+            updater.restore_download_from(root.path().to_owned());
+            settle(&mut updater);
+            server.join().unwrap();
+            assert!(matches!(updater.phase, Phase::Ready { .. }));
+            assert_eq!(std::fs::read(dest).unwrap(), b"abc");
+            assert!(matches!(
+                updater.take_install_action(),
+                Some(InstallAction::Prompt { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_obeys_the_existing_retry_budget_until_the_user_restarts_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (url, server) = serve_download(|mut stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+                .unwrap();
+        });
+        let mut pending = test_pending();
+        let asset = pending.release.asset.as_mut().unwrap();
+        asset.url = url;
+        let version_dir = root.path().join(&pending.release.version);
+        std::fs::create_dir(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(format!("{PLATFORM}-{}.attempts", asset.sha256)),
+            (download::MAX_RETRIES + 1).to_string(),
+        )
+        .unwrap();
+        pending.save(root.path()).unwrap();
+
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        settle(&mut updater);
+        assert!(matches!(
+            updater.phase,
+            Phase::Paused { error: Some(_), .. }
+        ));
+        assert!(updater.take_download_error().is_some());
+        updater.resume_download();
+        settle(&mut updater);
+        server.join().unwrap();
+        assert!(matches!(updater.phase, Phase::Ready { .. }));
+    }
+
+    #[test]
+    fn explicit_pause_and_retry_exhaustion_survive_restart_without_network_or_repeated_prompts() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut pending = test_pending();
+        pending.release.asset.as_mut().unwrap().url =
+            format!("http://{}/setup", listener.local_addr().unwrap());
+        pending.save(root.path()).unwrap();
+        let mut first = Updater::new();
+        first.root = root.path().to_owned();
+        let version = pending.release.version.clone();
+        first.pending_download = Some(pending);
+        first.set(Phase::Downloading {
+            version: version.clone(),
+            pct: 0.5,
+        });
+        first.pause_download();
+        drop(first);
+
+        let mut next = Updater::new();
+        next.restore_download_from(root.path().to_owned());
+        assert!(matches!(next.phase, Phase::Paused { error: None, .. }));
+        assert!(!next.can_check());
+        next.set(Phase::Downloading { version, pct: 0.5 });
+        next.tx
+            .send(Event::DownloadFailed("8 retries exhausted".into()))
+            .unwrap();
+        next.poll();
+        assert_eq!(
+            next.take_download_error().as_deref(),
+            Some("8 retries exhausted")
+        );
+        assert_eq!(next.take_download_error(), None);
+        assert_eq!(next.release_page(), RELEASES_URL);
+        drop(next);
+
+        let mut restored = Updater::new();
+        restored.restore_download_from(root.path().to_owned());
+        assert!(matches!(
+            restored.phase,
+            Phase::Paused { error: Some(_), .. }
+        ));
+        assert_eq!(restored.take_download_error(), None);
+        assert!(restored.can_check());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn a_new_check_replaces_an_exhausted_task_only_after_receiving_a_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let mut pending = test_pending();
+        pending.download_mode = DownloadMode::Exhausted;
+        pending.release.homepage = "https://example.com/old".into();
+        pending.save(root.path()).unwrap();
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        updater.check_source(None);
+        assert!(matches!(updater.take_check_result(), Some(Err(_))));
+        assert!(matches!(
+            updater.phase,
+            Phase::Paused { error: Some(_), .. }
+        ));
+        assert_eq!(updater.release_page(), "https://example.com/old");
+
+        let mut latest = manifest("1000.0.0");
+        latest.homepage = "https://example.com/new".into();
+        let mut no_digest = pending.release.asset.clone().unwrap();
+        no_digest.sha256.clear();
+        latest.platforms.insert(PLATFORM.into(), no_digest);
+        let newer = available_update(latest, CURRENT, PLATFORM).unwrap();
+        updater.tx.send(Event::Checked(newer)).unwrap();
+        updater.poll();
+        assert!(matches!(&updater.phase, Phase::Available(item) if item.asset.is_none()));
+        assert_eq!(
+            updater.take_check_result(),
+            Some(Ok(Some("1000.0.0".into())))
+        );
+        assert_eq!(updater.release_page(), "https://example.com/new");
+        assert!(!root.path().join("pending.json").exists());
+
+        pending.save(root.path()).unwrap();
+        let mut updater = Updater::new();
+        updater.restore_download_from(root.path().to_owned());
+        updater.tx.send(Event::Checked(None)).unwrap();
+        updater.poll();
+        assert_eq!(updater.phase, Phase::Latest);
+        assert_eq!(updater.take_check_result(), Some(Ok(None)));
+        assert_eq!(updater.release_page(), RELEASES_URL);
+        assert!(!root.path().join("pending.json").exists());
+    }
+
+    #[test]
+    fn an_explicit_pause_wins_over_a_racing_transfer_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut updater = Updater::new();
+        updater.root = root.path().to_owned();
+        let pending = test_pending();
+        pending.save(root.path()).unwrap();
+        updater.set(Phase::Downloading {
+            version: pending.release.version.clone(),
+            pct: 0.5,
+        });
+        updater.pending_download = Some(pending);
+        updater
+            .tx
+            .send(Event::DownloadFailed("stopped".into()))
+            .unwrap();
+        updater.pause_download();
+        updater.poll();
+        assert!(matches!(updater.phase, Phase::Paused { error: None, .. }));
+        assert!(updater.take_download_error().is_none());
+    }
+
+    #[test]
+    fn failure_to_save_revokes_the_old_automatic_task_without_deleting_the_package() {
+        for mode in [DownloadMode::Paused, DownloadMode::Exhausted] {
+            let root = tempfile::tempdir().unwrap();
+            let mut pending = test_pending();
+            pending.install_policy = InstallPolicy::NextLaunch;
+            pending.save(root.path()).unwrap();
+            let installer =
+                download::installer_path(&pending.release.version, root.path()).unwrap();
+            std::fs::create_dir_all(installer.parent().unwrap()).unwrap();
+            std::fs::write(&installer, b"abc").unwrap();
+            let mut updater = Updater::new();
+            updater.root = root.path().to_owned();
+            updater.pending_download = Some(pending);
+            updater.install_action = Some(InstallAction::InstallOnLaunch);
+            let error = updater
+                .update_pending_with(InstallPolicy::Ask, mode, |_, _| Err("no space left".into()));
+            assert_eq!(error.unwrap_err(), "no space left");
+            assert!(!updater.is_install_deferred());
+            assert_eq!(updater.take_install_action(), None);
+            assert!(!root.path().join("pending.json").exists());
+            let mut next = Updater::new();
+            next.restore_download_from(root.path().to_owned());
+            assert_eq!(next.phase, Phase::Idle);
+            assert_eq!(next.take_install_action(), None);
+            assert_eq!(std::fs::read(installer).unwrap(), b"abc");
+        }
+    }
+
+    #[test]
+    fn an_unwritable_pause_surfaces_the_error_even_when_verification_already_completed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("pending.json")).unwrap();
+        let mut pending = test_pending();
+        pending.install_policy = InstallPolicy::NextLaunch;
+        let version = pending.release.version.clone();
+        let mut updater = Updater::new();
+        updater.root = root.path().to_owned();
+        updater.pending_download = Some(pending);
+        updater.set(Phase::Downloading {
+            version: version.clone(),
+            pct: 0.0,
+        });
+        updater.pause_download();
+        updater
+            .tx
+            .send(Event::Downloaded {
+                version,
+                path: root.path().join("verified"),
+            })
+            .unwrap();
+        updater.poll();
+        assert!(
+            matches!(&updater.phase, Phase::Paused { error: Some(message), .. } if message.contains("无法清除旧的更新任务"))
+        );
+        assert!(!updater.is_install_deferred());
+        assert_eq!(updater.take_install_action(), None);
+    }
+
     #[test]
     fn preparing_an_update_only_requests_exit_after_the_worker_is_ready() {
         let mut updater = Updater::new();
@@ -746,6 +1461,9 @@ mod tests {
     fn cancelled_or_failed_install_keeps_the_verified_package_for_retry() {
         let path = PathBuf::from("verified-setup.exe");
         let mut updater = Updater::new();
+        let root = tempfile::tempdir().unwrap();
+        updater.root = root.path().to_owned();
+        updater.pending_download = Some(test_pending());
         updater.set(Phase::Ready {
             version: "1.2.3".into(),
             path: path.clone(),
@@ -768,13 +1486,8 @@ mod tests {
             assert_eq!(retry, path);
             Ok(())
         }));
-        assert!(matches!(
-            updater.phase,
-            Phase::Ready {
-                launch_error: None,
-                ..
-            }
-        ));
+        assert_eq!(updater.phase, Phase::Restarting);
+        assert!(!updater.install_with(|_| panic!("installer launched twice")));
     }
 
     #[cfg(windows)]
@@ -950,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn background_check_and_download_reach_ready_only_after_verification() {
+    fn background_check_automatically_downloads_and_wakes_the_ui_after_verification() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -965,11 +1678,7 @@ mod tests {
         .to_string();
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
-            for (target, body) in [
-                ("/latest.json", manifest.as_str()),
-                ("/setup.exe", "abc"),
-                ("/setup.exe", "bad"),
-            ] {
+            for (target, body) in [("/latest.json", manifest.as_str()), ("/setup.exe", "abc")] {
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
@@ -1000,26 +1709,21 @@ mod tests {
                 .unwrap();
             }
         });
-        let wait_for_result = |updater: &mut Updater| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while updater.is_busy() {
-                updater.poll();
-                assert!(Instant::now() < deadline, "background update timed out");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
         let root = tempfile::tempdir().unwrap();
-        let mut updater = Updater::new();
+        let (wake, wakes) = channel();
+        let mut updater = Updater::with_waker(move || wake.send(()).unwrap());
+        updater.root = root.path().to_owned();
         updater.check_source(Some(format!("http://{address}/latest.json")));
         assert_eq!(updater.phase, Phase::Checking);
-        wait_for_result(&mut updater);
-        let Phase::Available(available) = updater.phase.clone() else {
-            panic!("expected update, got {:?}", updater.phase);
-        };
-        assert!(!updater.can_auto_check());
-        updater.download_into(&available, root.path().to_owned());
-        assert!(matches!(updater.phase, Phase::Downloading { .. }));
-        wait_for_result(&mut updater);
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        updater.poll();
+        assert_eq!(
+            updater.take_check_result(),
+            Some(Ok(Some("999.0.0".into())))
+        );
+        assert_eq!(updater.take_check_result(), None);
+        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        updater.poll();
         let Phase::Ready { version, path, .. } = updater.phase.clone() else {
             panic!("expected verified download, got {:?}", updater.phase);
         };
@@ -1027,18 +1731,12 @@ mod tests {
         assert_eq!(path.parent().unwrap(), root.path().join("999.0.0"));
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
         assert!(!updater.can_auto_check());
-
-        // A corrupt retry must never offer installation or replace the verified file.
-        updater.download_into(&available, root.path().to_owned());
-        wait_for_result(&mut updater);
-        assert!(
-            matches!(&updater.phase, Phase::Paused { error: Some(error), .. } if error.contains("sha256"))
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
         assert_eq!(
-            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            3
+            updater.take_install_action(),
+            Some(InstallAction::Prompt { version })
         );
+        assert_eq!(updater.take_install_action(), None);
+        assert!(wakes.try_recv().is_err());
         server.join().unwrap();
     }
 
@@ -1456,7 +2154,8 @@ mod tests {
             }),
         };
         let mut updater = Updater::new();
-        updater.download_into(&available, root.path().to_owned());
+        updater.root = root.path().to_owned();
+        updater.download(&available, true);
         let completed_path = loop {
             match updater.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 Event::Downloaded { path, .. } => break path,

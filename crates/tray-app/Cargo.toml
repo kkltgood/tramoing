@@ -22,6 +22,7 @@ tm-diagnostics = { path = "../tm-diagnostics" }
 tm-sampler = { path = "../tm-sampler" }
 tm-store = { path = "../tm-store" }
 eframe = "0.33"
+libc = "0.2"
 # 只为了把 eframe/winit 的内部告警接到 stderr（见 main.rs 的 `TM_LOG`）。
 # 没有它，多 viewport 出问题时只能看到一个「什么都没画」的窗口。
 log = "0.4"
@@ -46,7 +47,6 @@ url = "2"
 # 不能都当普通依赖，否则在 Windows 上会把 macOS 的 libproc FFI 也编进去。
 [target.'cfg(target_os = "macos")'.dependencies]
 tm-macos = { path = "../tm-macos" }
-libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"

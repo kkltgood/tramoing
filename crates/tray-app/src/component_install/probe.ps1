@@ -88,27 +88,72 @@ function Test-LegacySensorPayload([string]$SensorRoot) {
 }
 
 function Test-X64DotNetRuntime([string]$Location, [version]$Minimum) {
-    $hosts = Get-ChildItem -LiteralPath (Join-Path $Location 'host\fxr') -Directory -ErrorAction SilentlyContinue
-    if (-not ($hosts | Where-Object { [IO.File]::Exists((Join-Path $_.FullName 'hostfxr.dll')) })) { return $false }
-    $versions = Get-ChildItem -LiteralPath (Join-Path $Location 'shared\Microsoft.NETCore.App') -Directory -ErrorAction SilentlyContinue
-    foreach ($entry in $versions) {
-        $version = $null
-        if (-not [version]::TryParse($entry.Name, [ref]$version) -or
-            $version.Major -ne $Minimum.Major -or $version.Minor -ne $Minimum.Minor -or $version -lt $Minimum) { continue }
-        if (-not [IO.File]::Exists((Join-Path $entry.FullName 'System.Private.CoreLib.dll')) -or
-            -not [IO.File]::Exists((Join-Path $entry.FullName 'hostpolicy.dll'))) { continue }
-        # A copied runtime of another architecture is unusable by the x64 apphost.
+    function Get-RuntimeVersion($Directory) {
+        $pattern = '\A(?<core>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))' +
+            '(?:-(?<pre>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z'
+        if ($Directory.Name -cnotmatch $pattern) { return }
+        $core = $null
+        if (-not [version]::TryParse($Matches.core, [ref]$core)) { return }
+        $labels = @()
+        if ($Matches.pre) {
+            $labels = $Matches.pre.Split('.')
+            if ($labels -match '^0[0-9]+$') { return }
+        }
+        return [pscustomobject]@{ Core=$core; Labels=$labels; Path=$Directory.FullName }
+    }
+
+    function Compare-RuntimeVersion($Left, $Right) {
+        $order = $Left.Core.CompareTo($Right.Core)
+        if ($order -ne 0) { return $order }
+        if (-not $Left.Labels.Count -or -not $Right.Labels.Count) {
+            return $Right.Labels.Count.CompareTo($Left.Labels.Count)
+        }
+        for ($index = 0; $index -lt [Math]::Min($Left.Labels.Count, $Right.Labels.Count); $index++) {
+            $leftLabel = $Left.Labels[$index]
+            $rightLabel = $Right.Labels[$index]
+            $leftNumeric = $leftLabel -match '^[0-9]+$'
+            $rightNumeric = $rightLabel -match '^[0-9]+$'
+            if ($leftNumeric -ne $rightNumeric) { return $rightNumeric.CompareTo($leftNumeric) }
+            if ($leftNumeric -and $leftLabel.Length -ne $rightLabel.Length) { return $leftLabel.Length.CompareTo($rightLabel.Length) }
+            $order = [string]::CompareOrdinal($leftLabel, $rightLabel)
+            if ($order -ne 0) { return $order }
+        }
+        return $Left.Labels.Count.CompareTo($Right.Labels.Count)
+    }
+
+    function Test-X64Library([string]$Path) {
         try {
-            $reader = [IO.BinaryReader]::new([IO.File]::OpenRead((Join-Path $entry.FullName 'coreclr.dll')))
+            $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($Path))
             try {
-                if ($reader.ReadUInt16() -ne 0x5a4d) { continue }
+                if ($reader.ReadUInt16() -ne 0x5a4d) { return $false }
                 $reader.BaseStream.Position = 0x3c
                 $reader.BaseStream.Position = $reader.ReadUInt32()
-                if ($reader.ReadUInt32() -eq 0x4550 -and $reader.ReadUInt16() -eq 0x8664) { return $true }
+                return $reader.ReadUInt32() -eq 0x4550 -and $reader.ReadUInt16() -eq 0x8664
             } finally { $reader.Dispose() }
-        } catch { continue }
+        } catch { return $false }
     }
-    return $false
+
+    $latestHost = $null
+    foreach ($entry in Get-ChildItem -LiteralPath (Join-Path $Location 'host\fxr') -Directory -Force -ErrorAction SilentlyContinue) {
+        $candidate = Get-RuntimeVersion $entry
+        if ($candidate -and (-not $latestHost -or (Compare-RuntimeVersion $candidate $latestHost) -gt 0)) {
+            $latestHost = $candidate
+        }
+    }
+    if (-not $latestHost -or -not (Test-X64Library (Join-Path $latestHost.Path 'hostfxr.dll'))) { return $false }
+
+    $framework = $null
+    foreach ($entry in Get-ChildItem -LiteralPath (Join-Path $Location 'shared\Microsoft.NETCore.App') -Directory -Force -ErrorAction SilentlyContinue) {
+        $candidate = Get-RuntimeVersion $entry
+        if (-not $candidate -or $candidate.Labels.Count -or $candidate.Core.Major -ne $Minimum.Major -or
+            $candidate.Core.Minor -ne $Minimum.Minor -or $candidate.Core -lt $Minimum) { continue }
+        if ((-not $framework -or $candidate.Core -gt $framework.Core) -and
+            [IO.File]::Exists((Join-Path $candidate.Path 'Microsoft.NETCore.App.deps.json'))) {
+            $framework = $candidate
+        }
+    }
+    return $null -ne $framework -and [IO.File]::Exists((Join-Path $framework.Path 'System.Private.CoreLib.dll')) -and
+        [IO.File]::Exists((Join-Path $framework.Path 'hostpolicy.dll')) -and (Test-X64Library (Join-Path $framework.Path 'coreclr.dll'))
 }
 
 $runtime = @($cfg.manifest.dependencies | Where-Object { $_.id -eq 'dotnet' })[0]

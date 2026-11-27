@@ -75,25 +75,65 @@ try {
         [IO.File]::WriteAllBytes($path, $bytes)
     }
 
-    $hostDir = New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/10.0.2') -Force
-    [IO.File]::WriteAllText((Join-Path $hostDir.FullName 'hostfxr.dll'), 'host', $encoding)
+    $hostDir = New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/10.0.9') -Force
+    $olderHost = Join-Path $hostDir.FullName 'hostfxr.dll'
+    New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/backup') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/99.0.0.1') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/099.0.0') -Force | Out-Null
     $framework = New-Item -ItemType Directory -Path (Join-Path $directory 'shared/Microsoft.NETCore.App/10.0.2') -Force
-    foreach ($name in @('hostpolicy.dll', 'System.Private.CoreLib.dll')) {
-        [IO.File]::WriteAllText((Join-Path $framework.FullName $name), 'library', $encoding)
-    }
+    [IO.File]::WriteAllText((Join-Path $framework.FullName 'System.Private.CoreLib.dll'), 'library', $encoding)
+    $frameworkDeps = Join-Path $framework.FullName 'Microsoft.NETCore.App.deps.json'
+    [IO.File]::WriteAllText($frameworkDeps, '{"runtimeTarget":{"name":".NETCoreApp,Version=v10.0/win-x64"},"targets":{},"libraries":{}}', $encoding)
     $core = Join-Path $framework.FullName 'coreclr.dll'
     $header = New-Object byte[] 72
     $header[0] = 0x4d; $header[1] = 0x5a; $header[0x3c] = 64
     $header[64] = 0x50; $header[65] = 0x45
     $header[68] = 0x64; $header[69] = 0x86
     [IO.File]::WriteAllBytes($core, $header)
+    [IO.File]::WriteAllBytes($olderHost, $header)
+    [IO.File]::WriteAllBytes((Join-Path $framework.FullName 'hostpolicy.dll'), $header)
     if (-not (Test-X64DotNetRuntime $directory ([version]'10.0.0'))) { throw 'Compatible global runtime without MSI inventory was missed' }
+    $depsBytes = [IO.File]::ReadAllBytes($frameworkDeps)
+    Remove-Item -LiteralPath $frameworkDeps
+    if (Test-X64DotNetRuntime $directory ([version]'10.0.0')) { throw 'Framework missing its .deps.json was accepted' }
+    [IO.File]::WriteAllBytes($frameworkDeps, $depsBytes)
+    if (-not (Test-X64DotNetRuntime $directory ([version]'10.0.0'))) { throw 'Restored framework manifest was not recognized' }
+
+    $newerDir = New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/10.0.10') -Force
+    if (Test-X64DotNetRuntime $directory ([version]'10.0.0')) { throw 'Working 10.0.9 host masked a missing 10.0.10 host' }
+    $newerHost = Join-Path $newerDir.FullName 'hostfxr.dll'
+    $armHeader = [byte[]]$header.Clone()
+    $armHeader[69] = 0xaa
+    [IO.File]::WriteAllBytes($newerHost, $armHeader)
+    if (Test-X64DotNetRuntime $directory ([version]'10.0.0')) { throw 'ARM64 hostfxr was reported as x64' }
+    [IO.File]::WriteAllBytes($newerHost, $header)
+    Remove-Item -LiteralPath $olderHost
+    if (-not (Test-X64DotNetRuntime $directory ([version]'10.0.0'))) { throw 'Incomplete 10.0.9 host masked a working 10.0.10 host' }
+
+    $firstPreview = New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/11.0.0-preview.9') -Force
+    [IO.File]::WriteAllBytes((Join-Path $firstPreview.FullName 'hostfxr.dll'), $header)
+    New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/11.0.0-preview.10') -Force | Out-Null
+    if (Test-X64DotNetRuntime $directory ([version]'10.0.0')) { throw 'An older host masked a missing 11.0.0-preview.10 host' }
+    $releaseHostDir = New-Item -ItemType Directory -Path (Join-Path $directory 'host/fxr/11.0.0') -Force
+    [IO.File]::WriteAllBytes((Join-Path $releaseHostDir.FullName 'hostfxr.dll'), $header)
+    if (-not (Test-X64DotNetRuntime $directory ([version]'10.0.0'))) { throw 'An incomplete preview masked a working final host' }
     foreach ($minimum in @('10.0.3', '11.0.0')) {
         if (Test-X64DotNetRuntime $directory ([version]$minimum)) { throw "Incompatible runtime accepted for $minimum" }
     }
-    $header[68] = 0x64; $header[69] = 0xaa
-    [IO.File]::WriteAllBytes($core, $header)
+    [IO.File]::WriteAllBytes($core, $armHeader)
     if (Test-X64DotNetRuntime $directory ([version]'10.0.0')) { throw 'ARM64 coreclr was reported as x64' }
+    [IO.File]::WriteAllBytes($core, $header)
+
+    $newerFramework = New-Item -ItemType Directory -Path (Join-Path $directory 'shared/Microsoft.NETCore.App/10.0.10') -Force
+    $newerCore = Join-Path $newerFramework.FullName 'coreclr.dll'
+    Copy-Item -LiteralPath (Join-Path $framework.FullName 'System.Private.CoreLib.dll') -Destination $newerFramework.FullName
+    [IO.File]::WriteAllBytes((Join-Path $newerFramework.FullName 'hostpolicy.dll'), $header)
+    [IO.File]::WriteAllBytes($newerCore, $armHeader)
+    if (-not (Test-X64DotNetRuntime $directory ([version]'10.0.0'))) { throw 'Unlisted framework patch masked a usable older patch' }
+    Copy-Item -LiteralPath $frameworkDeps -Destination $newerFramework.FullName
+    if (Test-X64DotNetRuntime $directory ([version]'10.0.0')) { throw 'Working older patch masked ARM64 coreclr in the selected newer framework' }
+    [IO.File]::WriteAllBytes($newerCore, $header)
+    if (-not (Test-X64DotNetRuntime $directory ([version]'10.0.0'))) { throw 'Repaired newer framework was not recognized' }
     Write-Host 'Sensor payload validation passed, including legacy dependencies and global runtime version/architecture checks.'
 } finally {
     if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }

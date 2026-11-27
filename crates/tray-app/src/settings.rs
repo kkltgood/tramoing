@@ -32,6 +32,17 @@ pub enum LangMode {
     Selected(Lang),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpdateCheckResult {
+    #[default]
+    Unknown,
+    Pending,
+    Latest,
+    Available(String),
+    Failed(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// 是否显示菜单栏 / 系统托盘中的应用图标，与网速和性能显示独立。
@@ -72,6 +83,7 @@ pub struct Settings {
     /// 存盘而不是只放内存：这个程序是常驻托盘的，用户可能几周不退出，
     /// 每次启动都发一次请求既没必要，也会让「每天最多一次」失效。
     pub last_check: i64,
+    pub(crate) last_check_result: UpdateCheckResult,
 }
 
 impl Default for Settings {
@@ -94,11 +106,41 @@ impl Default for Settings {
             display_colors: DisplayColors::default(),
             update_check: true,
             last_check: 0,
+            last_check_result: UpdateCheckResult::Unknown,
         }
     }
 }
 
 impl Settings {
+    pub(crate) fn last_check_local_time(&self) -> Option<String> {
+        if self.last_check <= 0 {
+            return None;
+        }
+        let timestamp = self.last_check as libc::time_t;
+        if i128::from(timestamp) != i128::from(self.last_check) {
+            return None;
+        }
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        #[cfg(unix)]
+        let valid = unsafe { !libc::localtime_r(&timestamp, &mut local).is_null() };
+        #[cfg(windows)]
+        let valid = unsafe { libc::localtime_s(&mut local, &timestamp) == 0 };
+        if !valid {
+            return None;
+        }
+        let year = local
+            .tm_year
+            .checked_add(1900)
+            .filter(|year| *year <= 9999)?;
+        Some(format!(
+            "{year:04}-{:02}-{:02} {:02}:{:02}",
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min
+        ))
+    }
+
     pub fn path() -> PathBuf {
         tm_store::data_dir().join("settings.conf")
     }
@@ -283,8 +325,16 @@ impl Settings {
                         s.last_check = n.max(0);
                     }
                 }
+                "last_check_result" => {
+                    if let Ok(result) = serde_json::from_str(v) {
+                        s.last_check_result = result;
+                    }
+                }
                 _ => {} // 未知键忽略：旧版本写的字段不该让新版本报错
             }
+        }
+        if s.last_check == 0 {
+            s.last_check_result = UpdateCheckResult::Unknown;
         }
         (s.tray_icon, s.tray_badge) = resolve_tray_visibility(
             legacy_tray,
@@ -337,7 +387,8 @@ impl Settings {
              cpu_color={}\n\
              gpu_color={}\n\
              update_check={}\n\
-             last_check={}\n",
+             last_check={}\n\
+             last_check_result={}\n",
             self.max_apps,
             serde_json::to_string(&self.pinned_apps).expect("application keys are strings"),
             self.retention_days,
@@ -362,7 +413,9 @@ impl Settings {
             serialize_color(self.display_colors.cpu),
             serialize_color(self.display_colors.gpu),
             if self.update_check { "on" } else { "off" },
-            self.last_check
+            self.last_check,
+            serde_json::to_string(&self.last_check_result)
+                .expect("update check results are strings"),
         )
     }
 }
@@ -508,6 +561,7 @@ mod tests {
             },
             update_check: false,
             last_check: 1_700_000_000,
+            last_check_result: UpdateCheckResult::Available("1.2.3".into()),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
@@ -747,6 +801,84 @@ mod tests {
             assert!(!settings.update_check);
             assert_eq!(Settings::parse(&settings.serialize()), settings);
         }
+    }
+
+    #[test]
+    fn check_history_migrates_without_assuming_success() {
+        let timestamp = 1_700_000_000;
+        for value in [
+            "",
+            "last_check_result=not-json",
+            "last_check_result=\"future\"",
+        ] {
+            let settings = Settings::parse(&format!(
+                "update_check=off\nlast_check={timestamp}\n{value}"
+            ));
+            assert_eq!(settings.last_check, timestamp);
+            assert_eq!(settings.last_check_result, UpdateCheckResult::Unknown);
+            assert!(!settings.update_check);
+        }
+        let saved = "last_check_result=\"latest\"";
+        assert_eq!(
+            Settings::parse(saved).last_check_result,
+            UpdateCheckResult::Unknown
+        );
+        assert_eq!(
+            Settings::parse(&format!("{saved}\nlast_check={timestamp}")).last_check_result,
+            UpdateCheckResult::Latest
+        );
+    }
+
+    #[test]
+    fn check_history_roundtrips_on_one_line_and_survives_restart() {
+        for result in [
+            UpdateCheckResult::Unknown,
+            UpdateCheckResult::Pending,
+            UpdateCheckResult::Latest,
+            UpdateCheckResult::Available("1.12.0-rc.1".into()),
+            UpdateCheckResult::Failed(
+                "超时\r\nupdate_check=off\nlast_check=0\n\"detail\"\\".into(),
+            ),
+        ] {
+            let settings = Settings {
+                last_check: 1_700_000_000,
+                last_check_result: result,
+                ..Settings::default()
+            };
+            let saved = settings.serialize();
+            assert_eq!(
+                saved
+                    .lines()
+                    .filter(|line| line.starts_with("last_check_result="))
+                    .count(),
+                1
+            );
+            assert!(!saved
+                .lines()
+                .any(|line| matches!(line, "update_check=off" | "last_check=0")));
+            assert_eq!(Settings::parse(&saved), settings);
+        }
+    }
+
+    #[test]
+    fn check_history_formats_system_local_time_without_changing_throttle() {
+        let settings = Settings::default();
+        assert_eq!(settings.last_check_local_time(), None);
+        let settings = Settings {
+            last_check: 1_700_000_039,
+            ..settings
+        };
+        let displayed = settings.last_check_local_time().unwrap();
+        assert_eq!(displayed.len(), 16);
+        assert!(displayed.starts_with("2023-11-"));
+        assert_eq!(displayed.as_bytes()[10], b' ');
+        assert_eq!(displayed.as_bytes()[13], b':');
+        assert_eq!(settings.last_check, 1_700_000_039);
+        let settings = Settings {
+            last_check: i64::MAX,
+            ..settings
+        };
+        assert_eq!(settings.last_check_local_time(), None);
     }
 
     #[test]

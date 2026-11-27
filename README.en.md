@@ -25,7 +25,8 @@ These screenshots show a Windows demo instance. macOS shares the panel layout; p
 - **Traffic history:** local SQLite storage, configurable retention, CSV export, and per-app traffic alerts.
 - **Windows application firewall controls:** block or restore network access for a selected executable, including connections through local proxies. Requires the bundled administrator helper.
 - **Error reporting:** errors offer to export diagnostic logs through a dialog; reports stay on your device and are not uploaded automatically.
-- **Desktop integration:** light/dark/system themes, a language dropdown with system preference, Simplified Chinese and English, animated settings tabs, optional launch at login, and in-app updates. Language changes apply and save immediately; translation resources support adding more languages. Downloads support pause/resume, automatic retries after disconnections, and saved progress across app restarts; the complete installer must pass SHA-256 verification.
+- **Desktop integration:** light/dark/system themes, a language dropdown with system preference, Simplified Chinese and English, animated settings tabs, and optional launch at login. Language changes apply and save immediately; translation resources support adding more languages.
+- **In-app updates:** **Settings → General → Startup & updates** shows the time and result of the last check. Automatic and manual checks both download a newer compatible installer when the release provides a valid SHA-256. You choose when to install it.
 
 ## Download and install
 
@@ -41,6 +42,14 @@ Download the installer for your system and processor from [GitHub Releases](http
 Windows installers include the matching network collection helper; administrator permission is required to install it. On macOS, open the DMG and drag Tramoing to Applications, or double-click the app and confirm installation. A fresh installation reveals the panel once near its menu bar item; upgrades restart in the background. Linux is not supported.
 
 Every package has a SHA-256 checksum. Windows installers are currently unsigned; macOS packages use ad-hoc signing and are not Developer ID signed or notarized.
+
+### In-app updates
+
+Automatic checks are on by default. Once the app has been running for 10 seconds, it checks if it has never checked before or its last check was at least 24 hours ago. It does not check while closed or while the computer is asleep.
+
+If the first download attempt fails, the app retries up to eight times, waiting 2, 4, 8, 16, then 30 seconds for each of the last four retries. Partial progress does not reset that limit. An active download resumes after an unexpected exit using only the retries it had left. If the retries run out, choose **Open release page** to get the installer in your browser or **Resume download** to start a fresh round of retries with any reusable data. Paused downloads and partial downloads from older versions also require a manual resume.
+
+Once the installer passes SHA-256 verification, choose **Restart and update** to install now or **Install on next launch** to keep working. In the latter case, the next launch verifies the cached installer offline before attempting installation. Without a choice, nothing is installed. Windows may still ask for administrator approval.
 
 ## Temperature and network limitations
 

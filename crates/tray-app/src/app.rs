@@ -1,5 +1,7 @@
 //! 托盘弹窗主体：状态栏图标 + 无边框弹出面板。
 
+mod update_ui;
+
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
@@ -306,6 +308,7 @@ pub struct App {
     diagnostics_job: Option<crate::export::ExportJob<Result<std::path::PathBuf, String>>>,
     diagnostics_result: Option<Result<std::path::PathBuf, String>>,
     error_prompt: Option<crate::error_dialog::Prompt>,
+    update_prompt: Option<update_ui::UpdatePrompt>,
     /// 更新检测。网络动作全在后台线程，这里只是把事件攒成可画的状态。
     update: crate::update::Updater,
     #[cfg(windows)]
@@ -533,8 +536,11 @@ impl App {
             diagnostics_job: None,
             diagnostics_result: None,
             error_prompt: None,
+            update_prompt: None,
             update: {
-                let mut updater = crate::update::Updater::new();
+                let wake = ctx.clone();
+                let mut updater =
+                    crate::update::Updater::with_waker(move || wake.request_repaint());
                 if std::env::var_os("TM_FORCE_MOCK").is_none() {
                     updater.restore_download();
                 }
@@ -615,6 +621,20 @@ impl App {
                     Ok("error-prompt") => {
                         log::error!(target: "tramoing::preview", "采集连接暂时中断，正在尝试重新连接。");
                     }
+                    Ok("update-ready") => {
+                        let version = "1.2.3".to_owned();
+                        app.update.phase = crate::update::Phase::Ready {
+                            version: version.clone(),
+                            path: tm_store::data_dir().join("preview-only"),
+                            launch_error: None,
+                        };
+                        app.update_prompt = Some(update_ui::UpdatePrompt::restart(version));
+                    }
+                    Ok("update-download-failed") => {
+                        app.update_prompt = Some(update_ui::UpdatePrompt::download_failed(
+                            "HTTP 503 · Service Unavailable".into(),
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -628,13 +648,8 @@ impl App {
     ///
     /// 判断放在每帧跑，而不是起一个定时线程：省一个线程，也让「关掉自动检查」
     /// 这种改动立刻生效，不用等定时器下一轮。
-    ///
-    /// **macOS 上实际是「第一次打开面板时查」**：那边收起面板走
-    /// `Visible(false)`，隐藏后 eframe 不再调 `update()`（见 `park_window`），
-    /// 这一段自然也不会跑。不是 bug —— 用户点开面板那一刻正好能看到
-    /// 「正在检查更新…」，反而比在后台悄悄查更清楚。
     fn maybe_check_update(&mut self) -> bool {
-        if self.update.is_busy() {
+        if !self.update.can_check() {
             return false;
         }
         // `--mock` 是离线演示模式，不该悄悄往外发请求；
@@ -650,9 +665,11 @@ impl App {
         {
             false
         } else {
+            let now = unix_now();
             self.started_at.elapsed() >= UPDATE_FIRST_DELAY
-                && (unix_now() < self.settings.last_check
-                    || unix_now() - self.settings.last_check >= UPDATE_INTERVAL_SECS)
+                && (self.settings.last_check <= 0
+                    || now < self.settings.last_check
+                    || now.saturating_sub(self.settings.last_check) >= UPDATE_INTERVAL_SECS)
         };
         if !due {
             return false;
@@ -664,13 +681,15 @@ impl App {
 
     /// 手动与自动检查共享时间戳，手动检查后不再紧接着重复发起每日检查。
     fn check_update(&mut self) {
-        if self.update.is_busy() {
+        if !self.update.can_check() {
             return;
         }
         // 先落盘再发请求：查的过程中进程被关掉，下次启动不该立刻再来一次。
         self.settings.last_check = unix_now();
+        self.settings.last_check_result = crate::settings::UpdateCheckResult::Pending;
         self.settings.save();
         self.update.check();
+        self.record_update_check_result();
     }
 
     /// 延迟创建状态栏图标，失败则过几秒重试。
@@ -796,7 +815,7 @@ impl App {
     }
 
     pub fn close(&mut self, ctx: &egui::Context) {
-        if self.error_prompt.is_some() {
+        if self.error_prompt.is_some() || self.has_update_prompt() {
             return;
         }
         #[cfg(windows)]
@@ -1244,6 +1263,16 @@ impl App {
         self.tray_icon_rect(ctx)
     }
 
+    fn reveal_panel_for_prompt(&mut self, ctx: &egui::Context) {
+        if !self.visible {
+            if let Some(anchor) = self.panel_anchor(ctx) {
+                self.open(ctx, anchor);
+            } else {
+                self.show_on_start = true;
+            }
+        }
+    }
+
     fn session(&self) -> (u64, u64) {
         self.latest
             .as_ref()
@@ -1362,6 +1391,8 @@ impl eframe::App for App {
         if self.update.poll() {
             ctx.request_repaint();
         }
+        self.record_update_check_result();
+        self.service_update_install_action(ctx);
         if self.update.phase == crate::update::Phase::Restarting {
             crate::update::log_line("升级已准备完成，正在保存历史并退出");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1513,6 +1544,7 @@ impl eframe::App for App {
                 // 一失焦就收起会导致「刚起来就没了」，根本没法核对界面。
                 && !self.keep_open_on_blur
                 && self.error_prompt.is_none()
+                && !self.has_update_prompt()
                 && !matches!(self.update.phase, crate::update::Phase::Installing { .. } | crate::update::Phase::Restarting)
                 && self.shown_at.elapsed() > HIDE_DEBOUNCE
             {
@@ -1644,7 +1676,11 @@ impl App {
                 ));
             }
         }
-        self.show_error_prompt(ctx, &palette, lang);
+        if self.has_update_prompt() {
+            self.show_update_prompt(ctx, &palette, lang);
+        } else {
+            self.show_error_prompt(ctx, &palette, lang);
+        }
     }
 
     fn poll_error_prompt(&mut self, ctx: &egui::Context) {
@@ -1659,12 +1695,8 @@ impl App {
                 self.error_prompt = Some(crate::error_dialog::Prompt::new(errors));
             }
         }
-        if self.error_prompt.is_some() && !self.visible {
-            if let Some(rect) = self.panel_anchor(ctx) {
-                self.open(ctx, rect);
-            } else {
-                self.show_on_start = true;
-            }
+        if self.error_prompt.is_some() {
+            self.reveal_panel_for_prompt(ctx);
         }
     }
 
@@ -1943,15 +1975,17 @@ impl App {
                         .color(p.subtext),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if settings_action(ui, p, lang.t("ui.check_now"), !self.update.is_busy())
+                        if settings_action(ui, p, lang.t("ui.check_now"), self.update.can_check())
                             .clicked()
                         {
                             self.check_update();
                         }
                     });
                 });
+                self.update_check_history(ui, p, lang);
                 settings_separator(ui, p);
                 let mut page = None;
+                let release_page = self.update.release_page();
                 ui.horizontal(|ui| {
                     ui.set_height(30.0);
                     ui.add_space(2.0);
@@ -1971,7 +2005,7 @@ impl App {
                             )
                             .clicked()
                         {
-                            page = Some(crate::update::RELEASES_URL);
+                            page = Some(release_page);
                         }
                     });
                 });
@@ -3585,7 +3619,7 @@ impl App {
             Phase::Checking => (lang.t("ui.checking").to_owned(), false),
             Phase::Latest => (lang.t("ui.up_to_date").to_owned(), false),
             Phase::Available(a) => (
-                lang.format("update.available", &[("version", &a.version)]),
+                lang.format("update.release_page", &[("version", &a.version)]),
                 true,
             ),
             Phase::Downloading { version, pct } => (
@@ -3633,7 +3667,12 @@ impl App {
                 true,
             ),
             Phase::Ready { version, .. } => {
-                (lang.format("update.ready", &[("version", version)]), true)
+                let key = if self.update.is_install_deferred() {
+                    "update.deferred"
+                } else {
+                    "update.ready"
+                };
+                (lang.format(key, &[("version", version)]), true)
             }
             Phase::Installing { .. } => (lang.t("ui.preparing_update").to_owned(), false),
             Phase::Restarting => (lang.t("ui.restarting").to_owned(), false),
@@ -3657,17 +3696,16 @@ impl App {
         match &self.update.phase.clone() {
             // 清单里没有本平台的包时退而求其次：打开下载页。
             // 直接什么都不做的话，用户看到「可点」却点不动，比不提示更糟。
-            Phase::Available(a) if a.asset.is_none() => {
-                if let Err(e) = crate::update::open_url(&a.homepage) {
+            Phase::Available(_) => {
+                if let Err(e) = crate::update::open_url(self.update.release_page()) {
                     self.toast = Some((e, Instant::now()));
                 }
             }
-            Phase::Available(a) => self.update.download(a),
             Phase::Downloading { .. } | Phase::Retrying { .. } => self.update.pause_download(),
             Phase::Paused { .. } => self.update.resume_download(),
-            Phase::Ready { .. } if self.update.install() && cfg!(windows) => {
-                crate::update::log_line("升级程序已启动，正在保存历史并退出");
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            Phase::Ready { version, .. } => {
+                self.update_prompt = Some(update_ui::UpdatePrompt::restart(version.clone()));
+                ctx.request_repaint();
             }
             _ => {}
         }

@@ -13,6 +13,7 @@ use super::{
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const MAX_RETRIES: u32 = 8;
 
 #[cfg(any(windows, test))]
 pub(crate) fn component_path(version: &str, root: &Path) -> Result<PathBuf, String> {
@@ -109,7 +110,7 @@ fn component_with_agent(
         let url = http_url(source)?;
         let mut no_progress = 0;
         let mut failures = 0;
-        let mut reused_prefix = download.len()? > 0;
+        download.has_inherited_prefix = download.len()? > 0;
         loop {
             if stopped(Some(stop)) {
                 download.sync()?;
@@ -141,10 +142,9 @@ fn component_with_agent(
                     download.sync()?;
                     return Ok(None);
                 }
-                Err(AttemptError::ChecksumMismatch) if reused_prefix => {
+                Err(AttemptError::ChecksumMismatchWithInheritedPrefix) => {
                     // The saved prefix may be corrupt even when this source is good.
                     // attempt() discarded it. Give this source one try from zero.
-                    reused_prefix = false;
                     continue;
                 }
                 Err(error) => {
@@ -225,11 +225,16 @@ pub(super) fn restore(
     Ok(Some(path))
 }
 
+pub(super) fn valid_sha256(value: &str) -> bool {
+    let hash = value.trim();
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub(crate) fn saved_progress(asset: &Asset, version: &str, root: &Path) -> Option<f32> {
-    let hash = asset.sha256.trim().to_ascii_lowercase();
-    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !valid_sha256(&asset.sha256) {
         return None;
     }
+    let hash = asset.sha256.trim().to_ascii_lowercase();
     let path = root
         .join(parse_version(version).ok()?.to_string())
         .join(format!("{PLATFORM}-{hash}.part"));
@@ -270,15 +275,19 @@ pub(super) fn run(
     tx: &Sender<Event>,
     root: &Path,
     stop: &Receiver<()>,
+    new_round: bool,
 ) -> Result<Option<PathBuf>, String> {
     run_with_agent(
         asset,
         version,
         tx,
         root,
-        &download_agent(IDLE_TIMEOUT),
         stop,
-        retry_delay,
+        TransferPolicy {
+            client: &download_agent(IDLE_TIMEOUT),
+            new_round,
+            delay: retry_delay,
+        },
     )
 }
 
@@ -290,61 +299,106 @@ fn stopped(stop: Option<&Receiver<()>>) -> bool {
     stop.is_some_and(|stop| !matches!(stop.try_recv(), Err(TryRecvError::Empty)))
 }
 
+struct TransferPolicy<'a, Delay> {
+    client: &'a ureq::Agent,
+    new_round: bool,
+    delay: Delay,
+}
+
 fn run_with_agent(
+    asset: &Asset,
+    version: &str,
+    tx: &Sender<Event>,
+    root: &Path,
+    stop: &Receiver<()>,
+    policy: TransferPolicy<'_, impl Fn(u32) -> Duration>,
+) -> Result<Option<PathBuf>, String> {
+    let canonical_version = parse_version(version)?.to_string();
+    let url = http_url(&asset.url)?;
+    if !valid_sha256(&asset.sha256) {
+        return Err("清单没有提供有效的 sha256，已跳过下载".into());
+    }
+    log_line(&format!(
+        "下载 {version}：清单大小 {} 字节，来源 {}",
+        asset.size,
+        url.host_str().unwrap_or_default(),
+    ));
+    let attempts_path = root.join(canonical_version).join(format!(
+        "{PLATFORM}-{}.attempts",
+        asset.sha256.trim().to_ascii_lowercase()
+    ));
+    let mut attempts = if policy.new_round {
+        0
+    } else {
+        match File::open(&attempts_path) {
+            Ok(file) => serde_json::from_reader::<_, u32>(file.take(32))
+                .map_err(|error| format!("无法读取下载重试次数：{error}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(format!("无法打开下载重试记录：{error}")),
+        }
+    };
+    loop {
+        if stopped(Some(stop)) {
+            return Ok(None);
+        }
+        if attempts > MAX_RETRIES {
+            return Err(format!(
+                "自动重试已达 {MAX_RETRIES} 次上限 / Automatic retry limit reached"
+            ));
+        }
+        attempts += 1;
+        tm_store::files::atomic_write(&attempts_path, attempts.to_string().as_bytes())
+            .map_err(|error| format!("无法保存下载重试次数：{error}"))?;
+        let message = match transfer(asset, version, tx, root, policy.client, stop) {
+            Ok(Some(path)) => {
+                let _ = std::fs::remove_file(&attempts_path);
+                return Ok(Some(path));
+            }
+            Ok(None) => return Ok(None),
+            Err(message) if attempts > MAX_RETRIES => return Err(message),
+            Err(message) => message,
+        };
+        let wait = (policy.delay)(attempts - 1);
+        log::warn!(target: "tramoing::update", "{message}；{} 秒后自动重试（{attempts}/{MAX_RETRIES}）", wait.as_secs());
+        let _ = tx.send(Event::DownloadRetrying { delay: wait });
+        match stop.recv_timeout(wait) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+fn transfer(
     asset: &Asset,
     version: &str,
     tx: &Sender<Event>,
     root: &Path,
     client: &ureq::Agent,
     stop: &Receiver<()>,
-    delay: impl Fn(u32) -> Duration,
 ) -> Result<Option<PathBuf>, String> {
     let mut download = PartialDownload::open(asset, version, root)?;
-    let url = http_url(&asset.url)?;
-    log_line(&format!(
-        "下载 {version}：清单大小 {} 字节，已保留 {} 字节，来源 {}",
-        asset.size,
-        download.len()?,
-        url.host_str().unwrap_or_default(),
-    ));
-    let mut failures = 0;
     loop {
         if stopped(Some(stop)) {
-            download.sync()?;
-            return Ok(None);
+            break;
         }
         let before = download.len()?;
         download.progress(tx)?;
-        match download.attempt(client, url.as_str(), tx, Some(stop)) {
-            Ok(true) => return download.finish().map(Some),
-            Ok(false) => failures = 0, // A server may return a shorter valid range.
-            Err(AttemptError::Paused) => {
-                download.sync()?;
-                return Ok(None);
-            }
+        match download.attempt(client, &asset.url, tx, Some(stop)) {
+            Ok(true) if !stopped(Some(stop)) => return download.finish().map(Some),
+            Ok(true) | Err(AttemptError::Paused) => break,
+            Ok(false) if download.len()? > before => continue,
+            Ok(false) => return Err("续传范围已重置，将从头下载".into()),
             Err(error) => {
                 download.sync()?;
-                if stopped(Some(stop)) {
-                    return Ok(None);
-                }
-                let AttemptError::Retry(message) = error else {
-                    return Err(error.message());
-                };
-                if download.len()? > before {
-                    failures = 0;
-                }
-                let wait = delay(failures);
-                failures = failures.saturating_add(1);
-                // Ordinary disconnects are recoverable: do not trigger an error dialog.
-                log::warn!(target: "tramoing::update", "{message}；保留进度，{} 秒后继续", wait.as_secs());
-                let _ = tx.send(Event::DownloadRetrying { delay: wait });
-                match stop.recv_timeout(wait) {
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(None),
-                }
+                download.progress(tx)?;
+                return Err(error.message());
             }
         }
     }
+    if let Err(error) = download.sync() {
+        log::warn!(target: "tramoing::update", "暂停下载时无法保存进度：{error}");
+    }
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -352,6 +406,7 @@ enum AttemptError {
     Retry(String),
     Failed(String),
     ChecksumMismatch,
+    ChecksumMismatchWithInheritedPrefix,
     Paused,
 }
 
@@ -359,7 +414,9 @@ impl AttemptError {
     fn message(self) -> String {
         match self {
             Self::Retry(message) | Self::Failed(message) => message,
-            Self::ChecksumMismatch => "sha256 不匹配，已丢弃损坏的下载内容，请重试".into(),
+            Self::ChecksumMismatch | Self::ChecksumMismatchWithInheritedPrefix => {
+                "sha256 不匹配，已丢弃损坏的下载内容，请重试".into()
+            }
             Self::Paused => "下载已暂停，进度已保存".into(),
         }
     }
@@ -400,16 +457,17 @@ struct PartialDownload {
     state_path: PathBuf,
     dest: PathBuf,
     state: PartialState,
+    has_inherited_prefix: bool,
     size: u64,
     hash: String,
 }
 
 impl PartialDownload {
     fn open(asset: &Asset, version: &str, root: &Path) -> Result<Self, String> {
-        let hash = asset.sha256.trim().to_ascii_lowercase();
-        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !valid_sha256(&asset.sha256) {
             return Err("清单没有提供有效的 sha256，已跳过下载".into());
         }
+        let hash = asset.sha256.trim().to_ascii_lowercase();
         let version = parse_version(version)?.to_string();
         http_url(&asset.url)?;
         let dir = root.join(&version);
@@ -437,6 +495,7 @@ impl PartialDownload {
             state_path,
             dest: installer_path(&version, root)?,
             state,
+            has_inherited_prefix: false,
             size: asset.size,
             hash,
         };
@@ -489,10 +548,21 @@ impl PartialDownload {
         self.file
             .set_len(0)
             .map_err(|e| format!("重置下载缓存失败：{e}"))?;
+        self.has_inherited_prefix = false;
         self.file
             .rewind()
             .map_err(|e| format!("重置下载位置失败：{e}"))?;
         self.sync()
+    }
+
+    fn discard_checksum_mismatch(&mut self) -> Result<AttemptError, String> {
+        let mismatch = if self.has_inherited_prefix {
+            AttemptError::ChecksumMismatchWithInheritedPrefix
+        } else {
+            AttemptError::ChecksumMismatch
+        };
+        self.reset()?;
+        Ok(mismatch)
     }
 
     fn progress(&self, tx: &Sender<Event>) -> Result<(), String> {
@@ -568,8 +638,7 @@ impl PartialDownload {
                 if self.matches_hash()? {
                     return Ok(true);
                 }
-                self.reset()?;
-                return Err(AttemptError::ChecksumMismatch);
+                return Err(self.discard_checksum_mismatch()?);
             }
             // The range is no longer satisfiable. Retry once from zero; a 416 at zero is fatal.
             self.reset()?;
@@ -701,8 +770,7 @@ impl PartialDownload {
                     "下载尚未完成（已保留 {written} 字节）"
                 )));
             }
-            self.reset()?;
-            return Err(AttemptError::ChecksumMismatch);
+            return Err(self.discard_checksum_mismatch()?);
         }
         self.progress(tx)?;
         Ok(true)

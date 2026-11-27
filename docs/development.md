@@ -153,6 +153,7 @@ TM_DATA_DIR="$PWD/target/demo-data" \
 | `TM_CAPTURE_STATE=network-add\|network-add-invalid\|network-add-offline` | Windows 添加应用面板：默认表单、路径错误、联网助手离线；仅注入演示状态，不修改系统网络规则 |
 | `TM_CAPTURE_STATE=settings-general\|settings-statusbar\|settings-statistics` | 设置页三个页签；可配合 `TM_SETTINGS_SCROLL` 检查长内容，Windows 截图实例不创建任务栏统计项 |
 | `TM_CAPTURE_STATE=error-prompt` | 隔离演示实例注入可恢复错误，验证弹框及导出交互 |
+| `TM_CAPTURE_STATE=update-ready\|update-download-failed` | 离线预览更新就绪与手动下载提示框，可配合临时设置切换语言和主题；不下载或安装软件 |
 | `TM_CAPTURE_STATE=settings-color-download\|settings-color-gpu` | 打开下载或 GPU 选色面板，检查深浅主题和中英文布局 |
 
 截图来自应用自身渲染，不代表真实桌面点击或焦点行为已通过验证。
@@ -245,7 +246,7 @@ DMG 的中英文背景、Retina 图片和图标位置由 `packaging/macos/dmg-se
 | 操作 | 结果 |
 | --- | --- |
 | 推送分支代码 | 执行 CI 检查，不创建 Release |
-| 向 `opensource` 推送 `v0.2.2` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
+| 向 `opensource` 推送 `v0.2.3` 这样的标签 | 检查版本、运行测试、打包四个系统/架构组合并发布 Release 和更新清单 |
 | Actions → Release packages → Run workflow，`tag` 留空 | 试打包所选分支，安装包保存在该次运行的 Artifacts 中 14 天 |
 | Run workflow 填入已存在的版本标签 | 重试该标签的发布；也可对失败的运行使用 Re-run failed jobs |
 
@@ -262,15 +263,15 @@ git config --local --add credential.https://github.com/kkltgood/tramoing.git.hel
 
 macOS 系统代理不一定会被 Git 或 GitHub CLI 使用。若终端无法连接而浏览器正常，可在确认本机代理端口后为 `opensource` 单独设置 `git config --local remote.opensource.proxy http://127.0.0.1:7897`，并在 `gh` 命令前添加 `HTTPS_PROXY=http://127.0.0.1:7897`；换了端口时同步修改，不再使用代理时通过 `git config --local --unset remote.opensource.proxy` 清除。
 
-发布步骤（以 `0.2.2` 为例）：
+发布步骤（以 `0.2.3` 为例）：
 
-1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本，并同步更新 `Cargo.lock` 中的工作区版本。可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.2.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明。文件缺失或为空时回退到 GitHub 自动说明。
+1. 确认根 `Cargo.toml` 的 `[workspace.package].version` 是准备发布的版本，并同步更新 `Cargo.lock` 中的工作区版本。可运行一次 `cargo check --workspace` 更新锁文件，再执行常规检查。将本次更新说明保存为 `docs/releases/v0.2.3.md`，发布脚本会用它生成 GitHub Release 正文和 `latest.json` 中的更新说明。文件缺失或为空时回退到 GitHub 自动说明。
 2. 提交要发布的代码并推送分支和标签：
 
    ```sh
    git push opensource main
-   git tag -a v0.2.2 -m "Release v0.2.2"
-   git push opensource v0.2.2
+   git tag -a v0.2.3 -m "Release v0.2.3"
+   git push opensource v0.2.3
    ```
 
 3. 在 Actions 查看构建进度，成功后到 [Releases](https://github.com/kkltgood/tramoing/releases) 下载。后续发布请替换为新的版本号。
@@ -296,13 +297,19 @@ Windows 安装程序暂未配置代码签名；macOS 的 ad-hoc 签名不等于 
 
 默认更新源为 `https://github.com/kkltgood/tramoing/releases/latest/download/latest.json`，源码构建和官方安装包均可直接使用，不需要 GitHub 令牌，也不占用 GitHub API 的匿名请求配额。上面的发布流程自动提供该附件。首次发布带清单的版本前，检查会提示“更新清单尚未发布”，不会误报已是最新版。
 
-新安装默认 `update_check=on`；旧配置已有的 `update_check=off` 会保留，可在设置 → 通用 → 启动与更新中开启。自动检查有 10 秒启动延迟和 24 小时间隔；macOS 收起后不驱动界面帧，检查可能延迟至面板展开。手动检查使用该区域的“检查更新”按钮或 `--check-update`，不受自动检查开关和间隔限制。`--mock` 不自动联网，但仍可显式手动检查。
+新安装默认 `update_check=on`；旧配置已有的 `update_check=off` 会保留。设置 → 通用 → 启动与更新显示上次发起检查的本地时间及结果。发起请求时先保存时间，结束时保存检查结果；进程中途退出或升级前只有时间记录，不会显示为检查成功。这里记录的是版本检查，而不是后续下载或安装的结果。程序运行且系统未休眠时，启动满 10 秒才判断是否到期，距上次检查不足 24 小时不会自动再查。手动检查使用该区域的“检查更新”按钮，或启动时传入 `--check-update`，不受自动检查开关和间隔限制。`--mock` 不自动检查新版本，但仍可显式手动检查。
 
-发现新版本后，点击提示下载本平台安装包。下载在后台进行，核对文件大小及 SHA-256 后才显示安装入口；检查间隔到期也不会清除待下载提示或已就绪的安装包。下载没有总时限，连接和读写分别设置超时；断网及临时 HTTP 错误按 2、4、8、16、30 秒退避重试。下载缓存按版本、平台和预期 SHA-256 隔离，使用独占文件锁、HTTP Range / If-Range 和强 ETag 续传；拒绝压缩响应和错误的范围，服务端返回完整文件时从零写入。用户可暂停/继续，已请求的任务通过 `update/pending.json` 恢复为暂停状态，重启不自动联网下载。完整校验后才原子替换可安装文件。
+手动与自动检查共用同一流程。发现新版本且清单有本平台的下载地址和有效 SHA-256 时，立即在后台下载；没有可用安装包时，用户仍可手动打开发布页。检查间隔到期不会清除未处理的任务。
 
-Windows 点击“更新并重启”后以 `/UPDATE /APP_PID=<当前进程> /D=<当前程序目录>` 启动安装器。NSIS 要求 `/D=` 为最后一个参数，含空格时也不加引号。UAC 取消或启动失败时保留当前程序和下载包，界面显示重试入口；启动成功后程序正常退出并提交历史，安装器最多等待 15 秒，超时不改动安装文件。随后更新主程序及助手，只显示进度页，成功后通过 Explorer 以普通权限重新启动，保留配置、历史和自启设置。
+下载没有总时限，连接和读写分别设置超时。首次尝试失败后最多自动重试 8 次，依次等待 2、4、8、16、30、30、30、30 秒。同一轮中收到新数据不会重置次数；意外退出后的自动续传沿用本轮剩余次数。耗尽后暂停并提示手动下载：用户可打开浏览器前往发布页，也可点“继续下载”，复用可用的部分数据并开始新一轮重试。两种选择都不会让应用跳过校验。
 
-macOS 点击“更新并重启”后在后台只读挂载 DMG，不打开 Finder。安装模块校验 bundle ID、清单版本、代码签名及已签名安装的 Team ID，将完整应用复制到原安装目录旁的独立暂存目录，再次校验后启动独立助手。助手确认就绪后才让主程序正常退出；以 PID 和进程启动时间等待旧进程结束，20 秒超时则停止替换。旧 bundle 重命名为备份，再将新 bundle 放到原路径；替换或 `open` 命令失败时尝试恢复旧 bundle。新应用通过 LaunchServices 打开，原路径、自启设置、用户配置和历史不变。准备失败不退出旧程序；启动请求成功不等于应用不会稍后崩溃，不以此宣称覆盖所有运行故障。若恢复失败，错误中保留备份路径供恢复。
+下载缓存按版本、平台和预期 SHA-256 隔离，使用独占文件锁、HTTP Range / If-Range 和强 ETag 续传；拒绝压缩响应和错误的范围，服务端返回完整文件时从零写入。只有通过完整校验后才原子替换可安装文件。下次启动时，完整的本地安装包会先离线复验。本版记录为下载中的任务若因进程意外退出而中断，会自动续传；明确暂停、重试耗尽或旧版未记录下载状态的不完整任务不会自动联网，需手动继续。
+
+包校验通过后弹框询问是否重启。选择“重启并更新”立即进入安装流程；选择“下次启动时更新”只记录对这个更新包的选择，不影响当前会话。下次启动复验缓存成功后才尝试安装，不再下载；该自动安装请求只使用一次，失败不会在之后每次启动时反复拉起安装器。没有做过选择的已下载包只提示，不会擅自安装。
+
+Windows 以 `/UPDATE /APP_PID=<当前进程> /D=<当前程序目录>` 启动安装器。NSIS 要求 `/D=` 为最后一个参数，含空格时也不加引号。UAC 取消或启动失败时保留当前程序和下载包，界面显示重试入口；启动成功后程序正常退出并提交历史，安装器最多等待 15 秒，超时不改动安装文件。随后更新主程序及助手，只显示进度页，成功后通过 Explorer 以普通权限重新启动，保留配置、历史和自启设置。
+
+macOS 在后台只读挂载 DMG，不打开 Finder。安装模块校验 bundle ID、清单版本、代码签名及已签名安装的 Team ID，将完整应用复制到原安装目录旁的独立暂存目录，再次校验后启动独立助手。助手确认就绪后才让主程序正常退出；以 PID 和进程启动时间等待旧进程结束，20 秒超时则停止替换。旧 bundle 重命名为备份，再将新 bundle 放到原路径；替换或 `open` 命令失败时尝试恢复旧 bundle。新应用通过 LaunchServices 打开，原路径、自启设置、用户配置和历史不变。准备失败不退出旧程序；启动请求成功不等于应用不会稍后崩溃，不以此宣称覆盖所有运行故障。若恢复失败，错误中保留备份路径供恢复。
 
 新安装包也会识别已有的安装目录及旧产品名：旧客户端没有传入 `/UPDATE` 时，首次升级到新安装包就能跳过目录、组件和完成页。全新安装仍保留原来的安装向导。升级需要替换 Program Files 内文件及更新采集助手计划任务，系统管理员授权提示仍然必要。
 
@@ -346,7 +353,7 @@ Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHard
 
 `packaging/windows/package-sensors.ps1` 生成 `dist/Tramoing-Sensors-<version>-windows-x64-setup.exe`、对应 `.sha256` 和 `dist/sensors-component.json`。完整 `build.ps1` 在 Rust 编译前准备组件，并通过 `TRAMOING_SENSOR_COMPONENT_MANIFEST` 将生成清单嵌入主程序。清单固定组件架构、版本、协议、文件大小、SHA-256 和下载来源；组件源文件或发布输入变化时必须更新组件版本，已经发布的同版本文件不能被覆盖。独立组件发布不标记为主程序 latest，避免影响原有更新入口。
 
-打开设置中的温度区域只执行本机检查，不触发联网。点击“下载所需组件”后才开始下载，下载全部校验完成后点击“安装并启用”。检测会分别检查组件兼容性、.NET 运行时种类/架构/版本以及 PawnIO 状态；已有可用组件或依赖直接复用。旧版 self-contained 组件在兼容时继续使用，不为了迁移而强制重装 .NET。
+打开设置中的温度区域只执行本机检查，不触发联网。点击“下载所需组件”后才开始下载，下载全部校验完成后点击“安装并启用”。检测会分别检查组件兼容性、.NET 运行时种类/架构/版本以及 PawnIO 状态；已有可用组件或依赖直接复用。检查系统 .NET 时，只认宿主实际选择的最高版本 `hostfxr` 目录，且兼容的框架目录必须包含 `Microsoft.NETCore.App.deps.json`。旧版 self-contained 组件在兼容时继续使用，不为了迁移而强制重装 .NET。
 
 依赖来源顺序是：已安装且兼容的依赖 → 本地完整校验通过的缓存 → 清单锁定的官方 HTTPS 地址 → 独立依赖 Release 的固定附件地址。第三方安装器保留原始签名，官方源和备用源必须通过同一预期大小及 SHA-256，安装前另核验所需的发布者签名。`static/dependencies/manifest.json` 保留版本、来源和校验信息，安装器不进入 Git 历史。默认开发缓存是 `target/dependency-cache/`，原先保存在 `static/dependencies/` 的安装器也可作为被忽略的本地缓存继续保留。
 
@@ -356,7 +363,7 @@ Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHard
 
 已发布的依赖版本只校验复用，不能覆盖为其他内容；草稿上传中断可重试。更新依赖时修改可信清单并发布新的依赖版本，保留仍被已发布客户端引用的旧 Release。备用附件只有发布后才可用，提交清单或保留本地文件不等于上线。GitHub 备用和 PawnIO 官方源使用同一托管服务，无法解决 GitHub 整体不可达；无论来源如何变化都必须保持同一文件校验值。
 
-组件下载缓存位于数据目录的 `components/`。重启或在设置中重新检查时，程序会在本地重新校验缓存。全部所需安装包通过校验后可直接安装，部分下载会显示已保存的进度，点击继续后才联网。主源连续无进展时会切换备用源。跨镜像续传保留与 SHA-256 绑定的片段，并清除原来源的 ETag。如果已有片段导致完整文件校验失败，下载器会从当前来源重新下载一次。所有来源失败后仍可重试。
+组件下载缓存位于数据目录的 `components/`。重启或在设置中重新检查时，程序会在本地重新校验缓存。全部所需安装包通过校验后可直接安装，部分下载会显示已保存的进度，点击继续后才联网。主源连续无进展时会切换备用源。跨镜像续传保留与 SHA-256 绑定的片段，并清除原来源的 ETag。只有校验失败的文件实际包含先前保留的片段时，才从当前来源重下。若服务器忽略 `Range` 并返回了完整文件，校验失败后直接尝试下一来源，不重复下载同一份文件。所有来源失败后仍可重试。
 
 开发机只有便携 .NET SDK 时，可用 `scripts/verify-windows-sensors.ps1 -DotNet <dotnet.exe 路径>` 验证 worker 握手。使用 `scripts/verify-component-dependencies.ps1 -ExpectMissingRuntime` 可验证缺少系统运行时的场景。
 

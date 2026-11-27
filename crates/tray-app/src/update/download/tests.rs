@@ -66,9 +66,12 @@ fn run_fast(
         "1.2.3",
         tx,
         root,
-        &download_agent(Duration::from_millis(500)),
         stop,
-        |_| Duration::from_millis(10),
+        TransferPolicy {
+            client: &download_agent(Duration::from_millis(500)),
+            new_round: true,
+            delay: |_| Duration::from_millis(10),
+        },
     )
 }
 
@@ -239,9 +242,12 @@ fn waiting_for_network_can_be_paused_without_losing_progress() {
             "1.2.3",
             &tx,
             &root_path,
-            &download_agent(Duration::from_millis(500)),
             &stop,
-            |_| Duration::from_secs(30),
+            TransferPolicy {
+                client: &download_agent(Duration::from_millis(500)),
+                new_round: true,
+                delay: |_| Duration::from_secs(30),
+            },
         )
     });
     loop {
@@ -266,11 +272,12 @@ fn waiting_for_network_can_be_paused_without_losing_progress() {
 }
 
 #[test]
-fn retryable_http_errors_recover_but_permanent_errors_stop() {
-    let (url, server) = serve(3, |attempt, _, stream| {
+fn retrying_recovers_from_service_errors_and_a_late_release_asset() {
+    let (url, server) = serve(4, |attempt, _, stream| {
         let response = match attempt {
             0 => "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             1 => "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            2 => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             _ => "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
         };
         stream.write_all(response.as_bytes()).unwrap();
@@ -282,15 +289,40 @@ fn retryable_http_errors_recover_but_permanent_errors_stop() {
         .unwrap()
         .is_some());
     server.join().unwrap();
-    let (url, server) = serve(1, |_, _, stream| {
-        stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+#[test]
+fn partial_progress_does_not_replenish_the_retry_budget() {
+    let requests = MAX_RETRIES as usize + 1;
+    let total = requests + 1;
+    let (url, server) = serve(requests, move |attempt, request, stream| {
+        if attempt == 0 {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\nx"
+            )
             .unwrap();
+        } else {
+            assert!(request.contains(&format!("range: bytes={attempt}-\r\n")));
+            write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {attempt}-{}/{total}\r\nConnection: close\r\n\r\nx", total - attempt, total - 1).unwrap();
+        }
     });
-    assert!(run_fast(&asset(url, b"abc"), root.path(), &tx, &stop)
-        .unwrap_err()
-        .contains("404"));
+    let root = tempfile::tempdir().unwrap();
+    let payload = asset(url, &vec![b'x'; total]);
+    let (tx, events) = channel();
+    let (_cancel, stop) = channel();
+    assert!(run_fast(&payload, root.path(), &tx, &stop).is_err());
     server.join().unwrap();
+    assert_eq!(
+        events
+            .try_iter()
+            .filter(|event| matches!(event, Event::DownloadRetrying { .. }))
+            .count(),
+        MAX_RETRIES as usize
+    );
+    let partial = PartialDownload::open(&payload, "1.2.3", root.path()).unwrap();
+    assert_eq!(partial.len().unwrap(), requests as u64);
+    assert!(!partial.dest.exists());
 }
 
 #[test]
@@ -303,6 +335,72 @@ fn completed_partial_is_verified_without_a_network_request() {
     let (tx, _rx) = channel();
     let path = download_to(&asset, "1.2.3", &tx, root.path()).unwrap();
     assert_eq!(std::fs::read(path).unwrap(), b"abc");
+}
+
+#[test]
+fn automatic_relaunches_share_one_budget_until_an_explicit_new_round() {
+    let (url, server) = serve(MAX_RETRIES as usize + 2, |attempt, _, stream| {
+        let response: &[u8] = if attempt <= MAX_RETRIES as usize {
+            b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"
+        };
+        stream.write_all(response).unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let payload = asset(url, b"abc");
+    let (tx, events) = channel();
+    let client = download_agent(Duration::from_millis(500));
+    for attempt in 0..=MAX_RETRIES {
+        let (cancel, stop) = channel();
+        let result = run_with_agent(
+            &payload,
+            "1.2.3",
+            &tx,
+            root.path(),
+            &stop,
+            TransferPolicy {
+                client: &client,
+                new_round: attempt == 0,
+                delay: |retries| {
+                    assert_eq!(retries, attempt);
+                    cancel.send(()).unwrap();
+                    Duration::ZERO
+                },
+            },
+        );
+        if attempt == MAX_RETRIES {
+            assert!(result.unwrap_err().contains("503"));
+        } else {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+    assert_eq!(
+        events
+            .try_iter()
+            .filter(|event| matches!(event, Event::DownloadRetrying { .. }))
+            .count(),
+        MAX_RETRIES as usize
+    );
+    let (_cancel, stop) = channel();
+    let exhausted = run_with_agent(
+        &payload,
+        "1.2.3",
+        &tx,
+        root.path(),
+        &stop,
+        TransferPolicy {
+            client: &client,
+            new_round: false,
+            delay: |_| panic!("unexpected retry"),
+        },
+    );
+    assert!(exhausted.unwrap_err().contains("limit"));
+    let path = run_fast(&payload, root.path(), &tx, &stop)
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"abc");
+    server.join().unwrap();
 }
 
 #[test]
@@ -363,27 +461,43 @@ fn short_valid_ranges_continue_until_the_whole_file_is_verified() {
 }
 
 #[test]
-fn resumed_bytes_still_require_the_full_sha256_before_replacing_the_installer() {
-    let (url, server) = serve(1, |_, request, stream| {
-        assert!(request.contains("range: bytes=3-\r\n"));
-        stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nBAD").unwrap();
-    });
+fn a_checksum_mismatch_retries_from_zero_before_replacing_the_installer() {
     let root = tempfile::tempdir().unwrap();
+    let destination = installer_path("1.2.3", root.path()).unwrap();
+    let (url, server) = serve(2, move |attempt, request, stream| {
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"previous verified installer"
+        );
+        if attempt == 0 {
+            assert!(request.contains("range: bytes=3-\r\n"));
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nBAD").unwrap();
+        } else {
+            assert!(!request.contains("\r\nrange:"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef",
+                )
+                .unwrap();
+        }
+    });
     let asset = asset(url, b"abcdef");
     let mut partial = PartialDownload::open(&asset, "1.2.3", root.path()).unwrap();
     partial.file.write_all(b"abc").unwrap();
     std::fs::write(&partial.dest, b"previous verified installer").unwrap();
-    let dest = partial.dest.clone();
-    let path = partial.path.clone();
     drop(partial);
-    let (tx, _rx) = channel();
+    let (tx, events) = channel();
     let (_cancel, stop) = channel();
-    assert!(run_fast(&asset, root.path(), &tx, &stop)
-        .unwrap_err()
-        .contains("sha256"));
+    let path = run_fast(&asset, root.path(), &tx, &stop).unwrap().unwrap();
     server.join().unwrap();
-    assert_eq!(std::fs::read(dest).unwrap(), b"previous verified installer");
-    assert!(std::fs::read(path).unwrap().is_empty());
+    assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+    assert_eq!(
+        events
+            .try_iter()
+            .filter(|event| matches!(event, Event::DownloadRetrying { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -444,7 +558,7 @@ fn compressed_range_responses_are_rejected_before_writing_bytes() {
 }
 
 #[test]
-fn a_failed_commit_preserves_verified_bytes_for_a_later_retry() {
+fn a_failed_commit_retries_without_refetching_the_verified_bytes() {
     let root = tempfile::tempdir().unwrap();
     let asset = asset("http://127.0.0.1:1/setup.exe".into(), b"abc");
     let mut partial = PartialDownload::open(&asset, "1.2.3", root.path()).unwrap();
@@ -454,12 +568,26 @@ fn a_failed_commit_preserves_verified_bytes_for_a_later_retry() {
     std::fs::create_dir(&destination).unwrap();
     drop(partial);
     let (tx, _rx) = channel();
-    assert!(download_to(&asset, "1.2.3", &tx, root.path())
-        .unwrap_err()
-        .contains("保存安装包失败"));
-    assert_eq!(std::fs::read(path).unwrap(), b"abc");
-    std::fs::remove_dir(destination).unwrap();
-    assert!(download_to(&asset, "1.2.3", &tx, root.path()).is_ok());
+    let (_cancel, stop) = channel();
+    let result = run_with_agent(
+        &asset,
+        "1.2.3",
+        &tx,
+        root.path(),
+        &stop,
+        TransferPolicy {
+            client: &download_agent(IDLE_TIMEOUT),
+            new_round: true,
+            delay: |retries| {
+                assert_eq!(retries, 0);
+                assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+                std::fs::remove_dir(&destination).unwrap();
+                Duration::ZERO
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(result, Some(destination));
 }
 
 #[test]
@@ -738,6 +866,52 @@ fn component_fallback_recovers_from_a_corrupt_prefix_from_the_primary() {
     first.join().unwrap();
     second.join().unwrap();
     assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+}
+
+#[test]
+fn component_discards_a_bad_source_once_the_saved_prefix_has_been_replaced() {
+    for (seed, interrupted) in [
+        (b"abc".as_slice(), false),
+        (b"abc", true),
+        (b"oldold", false),
+    ] {
+        let fallback_request = if interrupted { 2 } else { 1 };
+        let (url, server) = serve(fallback_request + 1, move |attempt, request, stream| {
+            if attempt == 0 {
+                assert!(request.starts_with("get /setup.exe "), "{request}");
+                assert_eq!(request.contains("range: bytes=3-\r\n"), seed.len() < 6);
+                let body = if interrupted { "bad" } else { "badbad" };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n{body}"
+                )
+                .unwrap();
+            } else if attempt < fallback_request {
+                assert!(request.starts_with("get /setup.exe "), "{request}");
+                assert!(request.contains("range: bytes=3-\r\n"), "{request}");
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 3-5/6\r\nConnection: close\r\n\r\nbad").unwrap();
+            } else {
+                assert!(request.starts_with("get /mirror.exe "), "{request}");
+                assert!(!request.contains("\r\nrange:"), "{request}");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef",
+                    )
+                    .unwrap();
+            }
+        });
+        let mirror = url.replace("/setup.exe", "/mirror.exe");
+        let asset = asset(url, b"abcdef");
+        let root = tempfile::tempdir().unwrap();
+        let mut partial = PartialDownload::open(&asset, "1.0.0", root.path()).unwrap();
+        partial.file.write_all(seed).unwrap();
+        drop(partial);
+        let (tx, _rx) = channel();
+        let (_cancel, stop) = channel();
+        let result = component_fast(&asset, &[mirror], root.path(), &tx, &stop);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(result.unwrap().unwrap()).unwrap(), b"abcdef");
+    }
 }
 
 #[test]
