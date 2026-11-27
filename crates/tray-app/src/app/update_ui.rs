@@ -67,7 +67,7 @@ impl UpdatePrompt {
             .frame(
                 egui::Frame::NONE
                     .fill(palette.surface)
-                    .stroke(Stroke::new(1.0, palette.border))
+                    .stroke(Stroke::new(1.0_f32, palette.border))
                     .corner_radius(14)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 8],
@@ -313,7 +313,7 @@ fn transfer_mark(ui: &mut egui::Ui, ink: Color32, cutout: Color32, ready: bool) 
     let painter = ui.painter();
     let start = rect.left_center() + egui::vec2(2.0, 0.0);
     let end = rect.right_center() - egui::vec2(8.0, 0.0);
-    let stroke = Stroke::new(1.5, ink);
+    let stroke = Stroke::new(1.5_f32, ink);
     painter.circle_filled(start, 2.0, ink);
     painter.line_segment(
         [
@@ -327,7 +327,7 @@ fn transfer_mark(ui: &mut egui::Ui, ink: Color32, cutout: Color32, ready: bool) 
         stroke,
     );
     painter.circle_filled(end, 7.5, ink);
-    let stroke = Stroke::new(1.6, cutout);
+    let stroke = Stroke::new(1.6_f32, cutout);
     if ready {
         painter.line(
             vec![
@@ -451,7 +451,7 @@ fn dialog_button(
             .atom_ui(ui);
         if let Some(rect) = button.rect(arrow) {
             let rect = rect.shrink(1.5);
-            let stroke = Stroke::new(1.4, ink);
+            let stroke = Stroke::new(1.4_f32, ink);
             ui.painter()
                 .line_segment([rect.left_bottom(), rect.right_top()], stroke);
             ui.painter().line(
@@ -466,7 +466,7 @@ fn dialog_button(
             ui.painter().rect_stroke(
                 response.rect.expand(2.0),
                 10,
-                Stroke::new(1.5, palette.accent),
+                Stroke::new(1.5_f32, palette.accent),
                 egui::StrokeKind::Outside,
             );
         }
