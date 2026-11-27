@@ -55,6 +55,10 @@ Windows 网络控制使用独立的账户 SID 命名管道；拒绝远程客户�
 
 ## 菜单栏与任务栏显示配置
 
+Windows 任务栏保留上下两行：标签、数值、单位和温度统一使用 Segoe UI 12 DIP 常规字重，方向箭头独立绘制。下载、上传、CPU 和 GPU 分别使用设置中的颜色，同一行的标签、数值、单位和温度保持同色；关闭彩色时整行按任务栏深浅主题使用中性色。网速数字保持固定小列宽，单位按当前两行实测宽度右对齐，消除多余的尾部空白；使用率和温度也按真实 GDI 字宽排列，不为 100% 和 150°C 长期预留空白。组间距为 6 DIP，标签后为 3 DIP，温度前与网速内容到 CPU/GPU 标签的间距一致（6 DIP 组间距加两侧各 1 DIP 边距），温度左对齐。总宽随读数或单位宽度调整，同宽文字刷新不改变布局；绘制、点击和拖动共用同一布局，较宽容器也不拉大组间距。透明背景保留灰度抗锯齿与最低命中 alpha，竖向任务栏需足够空间容纳当前最宽单组。
+
+可设置 `TM_BADGE_REVIEW_DIR` 并运行 `cargo test -p tm-windows --locked badge::surface::tests:: -- --nocapture` 导出生产 GDI 渲染的 PPM 对比图。该方式不创建真实任务栏窗口，覆盖深浅主题、缩放比例、两组顺序、极值与缺失温度；原生点击与 Explorer 挂接需另行验收。
+
 `Settings::tray_icon` 控制应用图标，`Settings::tray_badge` 控制实时网速，`performance_enabled` 控制 CPU/GPU；三个布尔开关相互独立。图标和网速默认开启，性能监控默认关闭。界面保留至少一个可点击入口；解析配置后若三项均关闭，则恢复图标，性能监控单独开启时不额外开启图标。
 
 macOS 的应用图标、网速和 CPU/GPU 各使用独立的 `NSStatusItem`，分别控制可见性和点击锚点；关闭时隐藏并保留原生项，重新开启不会清空其身份。各项采用稳定的 autosave 名称，应用设置优先于系统保存的可见性。
@@ -119,6 +123,8 @@ $env:TM_DATA_DIR = Join-Path $PWD 'target\demo-data'
 cargo run -p tray-app --locked -- --mock --show
 Remove-Item Env:TM_DATA_DIR
 ```
+
+Windows 调试界面时应使用上述 `--mock` 模式。直接运行 `target/debug/tramoing.exe` 并连接安装目录的采集助手会被进程身份校验拒绝：界面和助手必须来自同一目录，`TM_DATA_DIR` 只隔离数据，不改变管道的身份规则。验证真实采集时使用同一完整安装包部署的界面和助手；只替换或启动其中一个二进制不能完成升级验证。
 
 macOS：
 
