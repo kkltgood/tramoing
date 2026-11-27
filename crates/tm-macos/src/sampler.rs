@@ -19,9 +19,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tm_core::{AppKey, ProcSample};
+use tm_core::{AppKey, ConnectionReport, ProcSample};
 use tm_sampler::{Sampler, SamplerError};
 
 use crate::appid::AppResolver;
@@ -45,7 +45,7 @@ const PTY_ROWS: u16 = 60;
 const SYNTH_PID_BASE: u32 = 1_000_000;
 
 pub struct NettopSampler {
-    rx: Receiver<(Instant, Vec<FlowRow>)>,
+    rx: Receiver<(Instant, SystemTime, Vec<FlowRow>)>,
     child: Child,
     resolver: AppResolver,
     accounting: FlowAccounting,
@@ -58,6 +58,8 @@ pub struct NettopSampler {
     frames: u64,
     reader: Option<thread::JoinHandle<()>>,
     sampled_at: Option<Instant>,
+    connections: Option<crate::connections::Snapshot>,
+    connection_cutoff: Option<(u64, u64)>,
 }
 
 impl NettopSampler {
@@ -118,7 +120,7 @@ impl NettopSampler {
                         // 接收端没了（程序退出）就结束线程
                         // 在读线程记录帧到达时间，数据库阻塞后消费积压帧时
                         // 仍按原始间隔计算速率，不能按几毫秒的消费间隔计算。
-                        if tx.send((Instant::now(), rows)).is_err() {
+                        if tx.send((Instant::now(), SystemTime::now(), rows)).is_err() {
                             return;
                         }
                     }
@@ -126,7 +128,7 @@ impl NettopSampler {
                 // 进程退出后没有下一次表头来切帧，已读到的连接仍应交付。
                 let rows = parser.flush();
                 if !rows.is_empty() {
-                    let _ = tx.send((Instant::now(), rows));
+                    let _ = tx.send((Instant::now(), SystemTime::now(), rows));
                 }
             })
             .map_err(|e| {
@@ -148,6 +150,8 @@ impl NettopSampler {
             frames: 0,
             reader: Some(reader),
             sampled_at: None,
+            connections: None,
+            connection_cutoff: None,
         })
     }
 
@@ -159,17 +163,25 @@ impl NettopSampler {
 
 impl Sampler for NettopSampler {
     fn sample(&mut self) -> Result<Vec<ProcSample>, SamplerError> {
+        // A timeout/collector exit must invalidate details from the last good
+        // sample. Traffic counters keep their separate recovery semantics.
+        self.connections = None;
+        self.connection_cutoff = None;
         // 正常情况下 nettop 每 interval 给一帧，给 3 倍余量后仍没有就认为卡住了
         let wait = self
             .interval
             .saturating_mul(3)
             .saturating_add(Duration::from_secs(2));
-        let (at, rows) = match self.rx.recv_timeout(wait) {
+        let (at, wall, rows) = match self.rx.recv_timeout(wait) {
             Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => return Err(SamplerError::Timeout),
             Err(RecvTimeoutError::Disconnected) => return Err(SamplerError::Closed),
         };
         self.sampled_at = Some(at);
+        self.connection_cutoff = wall
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|time| (time.as_secs(), u64::from(time.subsec_micros())));
 
         self.frames += 1;
 
@@ -183,8 +195,12 @@ impl Sampler for NettopSampler {
             ..
         } = self;
         let frame = *frames;
+        let mut owners = HashMap::new();
         let deltas = accounting.update(&rows, |pid, name| {
-            AppKey::new(resolver.resolve(pid, name).key)
+            owners
+                .entry((pid, name.to_owned()))
+                .or_insert_with(|| AppKey::new(resolver.resolve(pid, name).key))
+                .clone()
         });
 
         for (app, d) in deltas {
@@ -227,7 +243,46 @@ impl Sampler for NettopSampler {
             out.push(ProcSample::new(pid, app.clone(), *rx, *tx));
         }
 
+        self.connections = Some(crate::connections::Snapshot {
+            rows,
+            owners: owners
+                .into_keys()
+                .map(|key| {
+                    let owner = self
+                        .connection_cutoff
+                        .and_then(|cutoff| self.resolver.cached_snapshot(key.0, &key.1, cutoff))
+                        .map(|identity| AppKey::new(identity.key));
+                    (key, owner)
+                })
+                .collect(),
+        });
+
         Ok(out)
+    }
+
+    fn connections(&mut self, app: &AppKey) -> Result<ConnectionReport, SamplerError> {
+        if self
+            .sampled_at
+            .is_none_or(|at| at.elapsed() > Duration::from_secs(5))
+        {
+            return Err(SamplerError::Source("连接快照已过期，正在等待新的采样 / Connection snapshot is stale; waiting for a fresh sample".into()));
+        }
+        let snapshot = self.connections.as_mut().ok_or_else(|| {
+            SamplerError::Source(
+                "当前没有可用的连接快照 / No current connection snapshot is available".into(),
+            )
+        })?;
+        let cutoff = self.connection_cutoff.ok_or_else(|| {
+            SamplerError::Source(
+                "无法验证连接快照时间 / Cannot verify the connection snapshot time".into(),
+            )
+        })?;
+        let resolver = &mut self.resolver;
+        Ok(snapshot.report(app, |pid, name| {
+            resolver
+                .resolve_snapshot(pid, name, cutoff)
+                .map(|identity| AppKey::new(identity.key))
+        }))
     }
 
     fn interval(&self) -> Duration {
@@ -265,6 +320,82 @@ impl NettopSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_cutoff_rejects_both_lazy_and_cached_newer_pid_identities() {
+        let mut sampler =
+            NettopSampler::spawn_command("/usr/bin/true", Duration::from_secs(1)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        sampler.rx = rx;
+        let pid = std::process::id();
+        let app = AppKey::new(crate::appid::identify(pid, "app").key);
+        // This PID exists now, but must not be assigned sockets from a frame
+        // captured before that process generation was born.
+        for (flow, bytes) in [
+            ("tcp4 127.0.0.1:8000<->*:*", 0),
+            ("tcp4 192.0.2.1:8000<->198.51.100.1:443", 100),
+        ] {
+            let mut parser = FlowParser::new();
+            parser.feed("time,,interface,state,bytes_in,bytes_out,");
+            parser.feed(&format!("t,app.{pid},,,0,0,"));
+            parser.feed(&format!("t,{flow},en0,Established,{bytes},0,"));
+            tx.send((
+                Instant::now(),
+                UNIX_EPOCH + Duration::from_secs(1),
+                parser.flush(),
+            ))
+            .unwrap();
+            sampler.sample().unwrap();
+            assert!(sampler.connections(&app).unwrap().connections.is_empty());
+        }
+    }
+
+    #[test]
+    fn connection_snapshots_replace_disappeared_rows_and_clear_after_failure() {
+        let mut sampler =
+            NettopSampler::spawn_command("/usr/bin/true", Duration::from_secs(1)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        sampler.rx = rx;
+        let app = AppKey::new("test-client");
+        assert!(sampler.connections(&app).is_err());
+        let mut parser = FlowParser::new();
+        parser.feed("time,,interface,state,bytes_in,bytes_out,");
+        parser.feed("t,test-client.999999,,,0,0,");
+        parser.feed("t,tcp6 ::1.8021<->*.*,lo0,Listen,0,0,");
+        let rows = parser.flush();
+        tx.send((Instant::now(), SystemTime::now(), rows.clone()))
+            .unwrap();
+        sampler.sample().unwrap();
+        let details = sampler.connections(&app).unwrap();
+        assert_eq!(details.connections.len(), 1);
+        assert_eq!(details.connections[0].pid, 999999);
+        assert_eq!(sampler.total_bytes("test-client"), Bytes::default());
+
+        tx.send((Instant::now(), SystemTime::now(), Vec::new()))
+            .unwrap();
+        sampler.sample().unwrap();
+        assert!(sampler.connections(&app).unwrap().connections.is_empty());
+
+        tx.send((
+            Instant::now() - Duration::from_secs(6),
+            SystemTime::now(),
+            rows.clone(),
+        ))
+        .unwrap();
+        sampler.sample().unwrap();
+        assert!(
+            sampler.connections(&app).is_err(),
+            "old queued frames are not current"
+        );
+
+        tx.send((Instant::now(), SystemTime::now(), rows)).unwrap();
+        sampler.sample().unwrap();
+        assert_eq!(sampler.connections(&app).unwrap().connections.len(), 1);
+        drop(tx);
+        assert!(matches!(sampler.sample(), Err(SamplerError::Closed)));
+        assert!(sampler.connections(&app).is_err());
+        assert!(sampler.connections.is_none());
+    }
 
     #[test]
     fn collector_exit_preserves_the_last_frame_without_a_following_header() {
@@ -345,8 +476,12 @@ printf 't,tcp4 192.0.2.1:50000<->198.51.100.1:443,en0,Established,100,0,\ntime,,
                 "t,tcp4 192.0.2.1:50000<->198.51.100.1:443,en0,Established,{},0,",
                 i * 1000
             ));
-            tx.send((start + Duration::from_secs(i), parser.flush()))
-                .unwrap();
+            tx.send((
+                start + Duration::from_secs(i),
+                SystemTime::now(),
+                parser.flush(),
+            ))
+            .unwrap();
         }
         let mut calc = tm_core::RateCalculator::with_smoothing(1.0);
         calc.set_new_counters_start_at_zero(true);

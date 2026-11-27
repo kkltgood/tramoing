@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use tm_core::ProcSample;
+use tm_core::{AppKey, ConnectionReport, ProcSample};
 
 /// 采样失败的原因。刻意做得很薄，避免为一个内部错误引入 anyhow。
 #[derive(Debug)]
@@ -51,6 +51,12 @@ impl From<std::io::Error> for SamplerError {
 /// 这样采样器不需要知道时间窗口，算法也只有一份。
 pub trait Sampler: Send {
     fn sample(&mut self) -> Result<Vec<ProcSample>, SamplerError>;
+
+    /// Current sockets owned by this application, queried only while details are visible.
+    /// This must not change traffic counters or infer the original destination of a proxy.
+    fn connections(&mut self, _app: &AppKey) -> Result<ConnectionReport, SamplerError> {
+        Err(SamplerError::Unsupported("应用连接详情"))
+    }
 
     /// 最近成功一帧的采集时间，映射到本进程的单调时钟。没有源时间戳时用接收时间。
     fn sampled_at(&self) -> Option<Instant> {
@@ -105,6 +111,64 @@ impl MockSampler {
 }
 
 impl Sampler for MockSampler {
+    fn connections(&mut self, app: &AppKey) -> Result<ConnectionReport, SamplerError> {
+        use tm_core::{
+            Connection, ConnectionEndpoint, ConnectionProtocol as P, ConnectionState as S,
+        };
+        let pid = match app.as_str() {
+            "/Applications/Google Chrome.app" => 1000,
+            "/Applications/Docker.app" => 1001,
+            "/Applications/Slack.app" => 1002,
+            "/Applications/WeChat.app" => 1003,
+            "/System/Library/CoreServices/mDNSResponder" => 1004,
+            _ => return Ok(ConnectionReport::default()),
+        };
+        let connections = [
+            (
+                P::Tcp4,
+                "192.0.2.10",
+                52148,
+                Some(("198.51.100.24", 443)),
+                S::Established,
+            ),
+            (
+                P::Tcp6,
+                "2001:db8::10",
+                52149,
+                Some(("2001:db8::25", 443)),
+                S::Established,
+            ),
+            (
+                P::Tcp4,
+                "127.0.0.1",
+                52150,
+                Some(("127.0.0.1", 7890)),
+                S::Established,
+            ),
+            (P::Tcp4, "", 8080, None, S::Listen),
+            (P::Udp4, "", 5353, None, S::Bound),
+        ]
+        .into_iter()
+        .map(|(protocol, local, port, remote, state)| Connection {
+            pid,
+            protocol,
+            local: ConnectionEndpoint {
+                address: local.into(),
+                port,
+            },
+            remote: remote.map(|(address, port)| ConnectionEndpoint {
+                address: address.into(),
+                port,
+            }),
+            state,
+        })
+        .collect();
+        Ok(ConnectionReport {
+            connections,
+            warning: None,
+        })
+    }
+
     fn sample(&mut self) -> Result<Vec<ProcSample>, SamplerError> {
         self.tick = self.tick.wrapping_add(1);
         let t = self.tick as f64;

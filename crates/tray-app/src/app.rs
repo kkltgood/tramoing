@@ -1,5 +1,6 @@
 //! 托盘弹窗主体：状态栏图标 + 无边框弹出面板。
 
+mod connections_ui;
 mod update_ui;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -95,6 +96,8 @@ const NUM_GAP: f32 = 6.0;
 /// 行末图钉的独立点击区域，与速率列之间留一点空隙。
 const PIN_SIZE: f32 = 26.0;
 const PIN_GAP: f32 = 4.0;
+/// 连接详情入口固定在行末，和置顶、断网按钮保持独立。
+const CONNECTION_ENTRY_W: f32 = 16.0;
 #[cfg(windows)]
 const NETWORK_BUTTON_W: f32 = PIN_SIZE;
 /// 右侧给滚动指示条留的过道。行盒不占这一条，指示条才不会压在描边上。
@@ -152,6 +155,7 @@ pub enum Window {
 pub enum View {
     Main,
     Settings,
+    Connections,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -292,8 +296,9 @@ pub struct App {
     network_panel: crate::network_panel::NetworkPanel,
     /// 采样线程读取的保留天数，改设置后即时生效
     retention: Arc<AtomicI64>,
-    /// 当前是主面板还是设置页
+    /// 当前主面板、设置或连接详情页。
     view: View,
+    connection_app: Option<AppKey>,
     settings_tab: SettingsTab,
     settings_transition: Option<(SettingsTab, Instant)>,
     /// 切页动画：`(从哪一页切过来的, 开始时刻)`，播完就清空。
@@ -517,6 +522,7 @@ impl App {
                 View::Main
             },
             settings_tab: SettingsTab::default(),
+            connection_app: None,
             settings_transition: None,
             // 首帧不播过渡：从托盘点开就直接是目标页
             transition: None,
@@ -600,6 +606,15 @@ impl App {
             let mut app = app;
             if crate::ui_capture::enabled() {
                 match std::env::var("TM_CAPTURE_STATE").as_deref() {
+                    Ok(
+                        "connections"
+                        | "connections-expanded"
+                        | "connections-duplicates"
+                        | "connections-long",
+                    ) => {
+                        app.connection_app = Some(AppKey::from("/Applications/Google Chrome.app"));
+                        app.view = View::Connections;
+                    }
                     Ok(
                         "settings-general"
                         | "settings-diagnostics-saved"
@@ -1559,6 +1574,11 @@ impl eframe::App for App {
         }
 
         self.draw(ctx);
+        self.rx.connections.select(
+            (self.visible && self.view == View::Connections)
+                .then(|| self.connection_app.clone())
+                .flatten(),
+        );
         #[cfg(debug_assertions)]
         crate::ui_capture::capture(ctx, self.started_at);
 
@@ -1623,7 +1643,7 @@ impl App {
                     // 方向跟着「去哪儿」走：进设置是往左推（新页从右边来），
                     // 返回是往右推（新页从左边回来）——和系统里「进入子页 / 退回上一页」
                     // 的手感一致，也让来回切换不会看起来是同一个动作。
-                    let dir = if matches!(view, View::Settings) {
+                    let dir = if matches!(view, View::Settings | View::Connections) {
                         1.0
                     } else {
                         -1.0
@@ -1754,6 +1774,7 @@ impl App {
         let salt = match view {
             View::Main => "page-main",
             View::Settings => "page-settings",
+            View::Connections => "page-connections",
         };
         let mut page = ui.new_child(egui::UiBuilder::new().id_salt(salt).max_rect(rect));
         page.set_clip_rect(inner);
@@ -1764,6 +1785,7 @@ impl App {
         match view {
             View::Main => self.main_body(&mut page, palette, lang),
             View::Settings => self.settings_body(&mut page, palette, lang),
+            View::Connections => self.connections_body(&mut page, palette, lang),
         }
     }
 
@@ -3065,6 +3087,7 @@ impl App {
                 color,
             );
             painter.rect_filled(pin_button_rect(rect).shrink(7.0), 3.0, color);
+            paint_connection_chevron(painter, connection_entry_rect(rect), color);
             if i + 1 < rows {
                 ui.add_space(ROW_GAP);
             }
@@ -3073,7 +3096,7 @@ impl App {
         ui.ctx().request_repaint();
     }
 
-    /// 一行：图标 + 名字 + 下行速率 + 上行速率 + 置顶按钮。
+    /// 一行：图标 + 名字 + 下行速率 + 上行速率 + 独立操作 + 连接入口。
     ///
     /// 速率固定列并右对齐；应用名使用剩余宽度按真实字体省略。
     fn row(&mut self, ui: &mut egui::Ui, r: &AppRate, p: &Palette) {
@@ -3093,6 +3116,7 @@ impl App {
         let (resp, pin_resp) = app_row_actions(ui, rect, r.app.as_str(), &mut self.settings);
         #[cfg(windows)]
         let network_resp = network_row_action(ui, rect, r.app.as_str());
+        let connection_resp = connection_row_action(ui, rect, r.app.as_str());
         let pinned = self.settings.is_pinned(r.app.as_str());
         if pin_resp.changed() {
             self.settings.save();
@@ -3108,7 +3132,7 @@ impl App {
         // 视线就知道「操作的是这个」。渐变是为了不闪。
         let t = ui.ctx().animate_bool_with_time(
             ui.id().with(("row-hover", r.app.as_str())),
-            resp.hovered() || pin_resp.hovered(),
+            resp.hovered() || pin_resp.hovered() || connection_resp.hovered(),
             0.12,
         );
         let painter = ui.painter();
@@ -3120,7 +3144,7 @@ impl App {
             egui::StrokeKind::Inside,
         );
 
-        // 数字与行末图钉分开，各自保留稳定的列宽。
+        // 数字与行末操作分开，各自保留稳定的列宽。
         let right = pin_resp.rect.left() - PIN_GAP;
 
         // 图标：真实图标直接贴；系统服务发齿轮；其余拿不到就用低饱和的字母块
@@ -3199,60 +3223,37 @@ impl App {
                 self.lang.t("apps.pin")
             }
         ));
-        let resp = resp.on_hover_text(format!("{}\n{}", name, tildify(r.app.as_str())));
+        let connection_label = format!("{} · {name}", self.lang.t("connections.open"));
+        for response in [&resp, &connection_resp] {
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    &connection_label,
+                )
+            });
+        }
+        paint_connection_chevron(
+            ui.painter(),
+            connection_resp.rect,
+            if resp.hovered() || connection_resp.hovered() {
+                p.accent
+            } else {
+                p.unit
+            },
+        );
+        surface::focus(ui.painter(), connection_resp.rect, &connection_resp, p);
+        let open_connections = resp.clicked() || connection_resp.clicked();
+        resp.on_hover_text(format!("{connection_label}\n{}", tildify(r.app.as_str())));
+        connection_resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(connection_label);
         #[cfg(windows)]
         self.network_button(ui, &network_resp, r.app.as_str(), p);
-        egui::Popup::from_toggle_button_response(&resp)
-            .width(280.0)
-            .frame(
-                egui::Frame::popup(ui.style())
-                    .fill(p.surface)
-                    .stroke(Stroke::new(1.0_f32, p.border))
-                    .corner_radius(12)
-                    .inner_margin(12),
-            )
-            .show(|ui| {
-                ui.label(
-                    RichText::new(&name)
-                        .font(theme::display_font(14.0))
-                        .color(p.text),
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(tildify(r.app.as_str()))
-                            .size(11.0)
-                            .color(p.subtext),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(10.0);
-                #[cfg(windows)]
-                if self.network_access.rule(r.app.as_str()).is_some() {
-                    ui.colored_label(
-                        p.warn,
-                        if self.network_access.verified
-                            && self
-                                .network_access
-                                .rule(r.app.as_str())
-                                .is_some_and(|r| r.complete)
-                        {
-                            self.lang.t("ui.blocked_use_allow_to_restore_access")
-                        } else {
-                            self.lang.t("ui.network_rules_need_verification")
-                        },
-                    );
-                }
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("↓ {}", format_speed(r.rx_bps))).color(p.download),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(format!("↑ {}", format_speed(r.tx_bps))).color(p.upload),
-                    );
-                });
-            });
+        if open_connections {
+            self.connection_app = Some(r.app.clone());
+            self.goto(View::Connections);
+        }
     }
 
     #[cfg(windows)]
@@ -4983,6 +4984,10 @@ fn app_list_rates_with_restrictions(
 }
 
 fn pin_button_rect(row: egui::Rect) -> egui::Rect {
+    let row = egui::Rect::from_min_max(
+        row.min,
+        row.max - Vec2::new(CONNECTION_ENTRY_W + PIN_GAP, 0.0),
+    );
     #[cfg(windows)]
     let row = egui::Rect::from_min_max(
         row.min,
@@ -4998,7 +5003,7 @@ fn pin_button_rect(row: egui::Rect) -> egui::Rect {
 fn network_row_action(ui: &mut egui::Ui, row: egui::Rect, app: &str) -> egui::Response {
     let rect = egui::Rect::from_center_size(
         egui::pos2(
-            row.right() - ROW_PAD_X - NETWORK_BUTTON_W / 2.0,
+            connection_entry_rect(row).left() - PIN_GAP - NETWORK_BUTTON_W / 2.0,
             row.center().y,
         ),
         Vec2::new(NETWORK_BUTTON_W, PIN_SIZE),
@@ -5008,6 +5013,36 @@ fn network_row_action(ui: &mut egui::Ui, row: egui::Rect, app: &str) -> egui::Re
         ui.id().with(("app-network", app)),
         egui::Sense::click(),
     )
+}
+
+fn connection_entry_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            row.right() - ROW_PAD_X - CONNECTION_ENTRY_W / 2.0,
+            row.center().y,
+        ),
+        Vec2::new(CONNECTION_ENTRY_W, PIN_SIZE),
+    )
+}
+
+fn connection_row_action(ui: &mut egui::Ui, row: egui::Rect, app: &str) -> egui::Response {
+    ui.interact(
+        connection_entry_rect(row),
+        ui.id().with(("app-connections-entry", app)),
+        egui::Sense::click(),
+    )
+}
+
+fn paint_connection_chevron(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let center = rect.center();
+    painter.add(egui::Shape::line(
+        vec![
+            center + egui::vec2(-1.5, -3.5),
+            center + egui::vec2(2.0, 0.0),
+            center + egui::vec2(-1.5, 3.5),
+        ],
+        Stroke::new(1.2, color),
+    ));
 }
 
 /// 详情与置顶使用独立点击区域，状态都绑定完整应用键，排序改变后焦点仍跟着应用。
@@ -5022,7 +5057,7 @@ fn app_row_actions(
         egui::Rect::from_min_max(row.min, egui::pos2(pin_rect.left() - PIN_GAP, row.bottom()));
     let details = ui.interact(
         details_rect,
-        ui.id().with(("app-details", app)),
+        ui.id().with(("app-connections", app)),
         egui::Sense::click(),
     );
     let mut pin = ui.interact(
@@ -6102,7 +6137,49 @@ mod tests {
     }
 
     #[test]
-    fn pin_actions_accept_pointer_and_keyboard_without_opening_details() {
+    fn app_row_columns_leave_room_for_names_and_separate_navigation() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let row = egui::Rect::from_min_size(
+                    egui::pos2(16.0, 24.0),
+                    Vec2::new(
+                        WINDOW_W - 2.0 * f32::from(PANEL_PADDING) - SCROLL_GUTTER,
+                        ROW_BOX_H,
+                    ),
+                );
+                let (details, pin) = app_row_actions(ui, row, "app", &mut settings);
+                let entry = connection_row_action(ui, row, "app");
+                assert!(row.contains_rect(details.rect));
+                assert!(row.contains_rect(pin.rect));
+                assert!(row.contains_rect(entry.rect));
+                assert_eq!(entry.rect.width(), CONNECTION_ENTRY_W);
+                assert_eq!(entry.rect.right(), row.right() - ROW_PAD_X);
+                assert!(!details.rect.intersects(pin.rect));
+                assert!(!details.rect.intersects(entry.rect));
+                assert!(!pin.rect.intersects(entry.rect));
+                let name_left = row.left() + ROW_PAD_X + icons::ICON_PT + 9.0;
+                let name_right = pin.rect.left() - PIN_GAP - NUM_W_TX - NUM_GAP - NUM_W_RX - 5.0;
+                assert!(name_right - name_left >= 60.0, "应用名仍需保留可读空间");
+                #[cfg(windows)]
+                {
+                    let network = network_row_action(ui, row, "app");
+                    assert!(row.contains_rect(network.rect));
+                    assert!(!network.rect.intersects(details.rect));
+                    assert!(!network.rect.intersects(pin.rect));
+                    assert!(!network.rect.intersects(entry.rect));
+                    assert_eq!(network.rect.left() - pin.rect.right(), PIN_GAP);
+                    assert_eq!(entry.rect.left() - network.rect.right(), PIN_GAP);
+                }
+                #[cfg(not(windows))]
+                assert_eq!(entry.rect.left() - pin.rect.right(), PIN_GAP);
+            });
+        });
+    }
+
+    #[test]
+    fn pin_actions_and_direct_connection_entry_accept_pointer_and_keyboard() {
         for dark in [false, true] {
             let ctx = egui::Context::default();
             ctx.set_theme(if dark {
@@ -6118,8 +6195,12 @@ mod tests {
             let mut settings = Settings::default();
             let mut pin_at = egui::Pos2::ZERO;
             let mut details_at = egui::Pos2::ZERO;
+            let mut entry_at = egui::Pos2::ZERO;
             let mut pin_id = None;
-            for frame in 0..8 {
+            let mut details_id = None;
+            let mut entry_id = None;
+            for frame in 0..12 {
+                let mut opened_app = None;
                 let mut input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -6128,18 +6209,27 @@ mod tests {
                     time: Some(frame as f64 / 60.0),
                     ..Default::default()
                 };
-                if matches!(frame, 1 | 2 | 6 | 7) {
-                    let pos = if frame < 3 { pin_at } else { details_at };
+                if matches!(frame, 1 | 2 | 6 | 7 | 9 | 10) {
+                    let pos = match frame {
+                        1 | 2 => pin_at,
+                        6 | 7 => details_at,
+                        _ => entry_at,
+                    };
                     input.events.push(egui::Event::PointerMoved(pos));
                     input.events.push(egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
-                        pressed: matches!(frame, 1 | 6),
+                        pressed: matches!(frame, 1 | 6 | 9),
                         modifiers: egui::Modifiers::NONE,
                     });
                 }
-                if frame == 3 || frame == 4 {
-                    ctx.memory_mut(|m| m.request_focus(pin_id.unwrap()));
+                if matches!(frame, 3 | 4 | 8 | 11) {
+                    let id = match frame {
+                        3 | 4 => pin_id,
+                        8 => details_id,
+                        _ => entry_id,
+                    };
+                    ctx.memory_mut(|m| m.request_focus(id.unwrap()));
                     input.events.push(egui::Event::Key {
                         key: if frame == 3 {
                             egui::Key::Space
@@ -6148,6 +6238,17 @@ mod tests {
                         },
                         physical_key: None,
                         pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    input.events.push(egui::Event::Key {
+                        key: if frame == 3 {
+                            egui::Key::Space
+                        } else {
+                            egui::Key::Enter
+                        },
+                        physical_key: None,
+                        pressed: false,
                         repeat: false,
                         modifiers: egui::Modifiers::NONE,
                     });
@@ -6166,7 +6267,10 @@ mod tests {
                                     );
                                     let (details, pin) =
                                         app_row_actions(ui, rect, rate.app.as_str(), &mut settings);
+                                    let entry = connection_row_action(ui, rect, rate.app.as_str());
                                     assert!(!details.rect.intersects(pin.rect));
+                                    assert!(!entry.rect.intersects(pin.rect));
+                                    assert!(!entry.rect.intersects(details.rect));
                                     paint_pin_button(
                                         ui,
                                         &pin,
@@ -6176,22 +6280,29 @@ mod tests {
                                     if rate.app.as_str() == "watched" {
                                         pin_at = pin.rect.center();
                                         details_at = details.rect.center();
+                                        entry_at = entry.rect.center();
                                         assert_eq!(*pin_id.get_or_insert(pin.id), pin.id);
+                                        assert_eq!(
+                                            *details_id.get_or_insert(details.id),
+                                            details.id
+                                        );
+                                        assert_eq!(*entry_id.get_or_insert(entry.id), entry.id);
                                     }
-                                    egui::Popup::from_toggle_button_response(&details).show(|ui| {
-                                        ui.label("App details");
-                                    });
+                                    if details.clicked() || entry.clicked() {
+                                        opened_app = Some(rate.app.clone());
+                                    }
                                 });
                                 ui.add_space(ROW_GAP);
                             }
                         });
                 });
-                if frame < 7 {
-                    assert!(!egui::Popup::is_any_open(&ctx), "置顶不能打开详情弹窗");
-                } else {
-                    assert!(egui::Popup::is_any_open(&ctx), "点击行主体仍可查看详情");
-                }
-                assert_eq!(settings.is_pinned("watched"), matches!(frame, 2 | 4..=7));
+                assert_eq!(
+                    opened_app.as_ref().map(AppKey::as_str),
+                    matches!(frame, 7 | 8 | 10 | 11).then_some("watched"),
+                    "只有行主体和箭头直接打开连接页；置顶保持独立，frame {frame}"
+                );
+                assert!(!egui::Popup::is_any_open(&ctx));
+                assert_eq!(settings.is_pinned("watched"), matches!(frame, 2 | 4..=11));
                 assert!(!settings.is_pinned("fast"));
             }
         }
@@ -6238,9 +6349,12 @@ mod tests {
                         ui.allocate_exact_size(Vec2::new(360.0, ROW_BOX_H), egui::Sense::hover());
                     let (details, pin) = app_row_actions(ui, row, "test.exe", &mut settings);
                     let network = network_row_action(ui, row, "test.exe");
+                    let entry = connection_row_action(ui, row, "test.exe");
                     assert!(!network.rect.intersects(pin.rect));
                     assert!(!network.rect.intersects(details.rect));
+                    assert!(!network.rect.intersects(entry.rect));
                     assert!(!details.clicked());
+                    assert!(!entry.clicked());
                     assert!(!pin.clicked());
                     assert_eq!(network.clicked(), frame >= 2);
                     location = network.rect.center();

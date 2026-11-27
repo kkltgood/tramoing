@@ -12,6 +12,77 @@ pub fn enabled() -> bool {
         && std::env::var_os("TM_CAPTURE_PPM").is_some()
 }
 
+/// Hold a reveal at a reproducible intermediate frame for visual QA.
+pub fn connection_reveal(progress: f32) -> f32 {
+    if !enabled() {
+        return progress;
+    }
+    std::env::var("TM_CAPTURE_REVEAL_PROGRESS")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .unwrap_or(progress)
+}
+
+/// Exercise the repeated peer and long-address layouts without live sockets.
+pub fn connection_details(
+    details: Option<crate::engine::connections::Details>,
+) -> Option<crate::engine::connections::Details> {
+    if !enabled() {
+        return details;
+    }
+    let state = std::env::var("TM_CAPTURE_STATE").unwrap_or_default();
+    if !matches!(
+        state.as_str(),
+        "connections-duplicates" | "connections-long"
+    ) {
+        return details;
+    }
+    use tm_core::{
+        Connection, ConnectionEndpoint, ConnectionProtocol, ConnectionReport, ConnectionState,
+    };
+    let long = state == "connections-long";
+    let connections = (0..4)
+        .map(|i| Connection {
+            pid: 4012 + i / 2,
+            protocol: if long {
+                ConnectionProtocol::Tcp6
+            } else {
+                ConnectionProtocol::Tcp4
+            },
+            local: ConnectionEndpoint {
+                address: if long {
+                    "fe80::1234:5678:9abc:def0%en0"
+                } else {
+                    "127.0.0.1"
+                }
+                .into(),
+                port: 52148 + i as u16,
+            },
+            remote: Some(ConnectionEndpoint {
+                address: if long {
+                    "2001:db8:1234:5678:9abc:def0:1234:5678"
+                } else {
+                    "127.0.0.1"
+                }
+                .into(),
+                port: if long { 443 } else { 7897 },
+            }),
+            state: ConnectionState::Established,
+        })
+        .collect();
+    Some(crate::engine::connections::Details {
+        updated_at: Instant::now(),
+        total: 4,
+        established: 4,
+        listening: 0,
+        result: Ok(ConnectionReport {
+            connections,
+            warning: None,
+        }),
+    })
+}
+
 /// 诊断卡片的静态预览；不导出文件，也不伪造真实实例的任务结果。
 pub fn diagnostics_result(lang: crate::theme::Lang) -> Option<Result<std::path::PathBuf, String>> {
     if !enabled() {

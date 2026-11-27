@@ -218,18 +218,56 @@ fn num(field: Option<&str>) -> u64 {
 /// `127.0.0.1:8021` / `::1.8021` / `*:67` / `public1.alidns.com:443` → (ip, port)
 fn parse_endpoint(s: &str) -> (String, u16) {
     let s = s.trim();
-    if let Some((ip, port)) = s.rsplit_once(':') {
-        if let Ok(p) = port.trim().parse::<u16>() {
-            return (norm_ip(ip), p);
+    if matches!(s, "*" | "*:*" | "*.*") {
+        return (String::new(), 0);
+    }
+    // Bracketed IPv6 is unambiguous, including a zone identifier.
+    if let Some((ip, port)) = s.strip_prefix('[').and_then(|s| s.split_once("]:")) {
+        if let Some(port) = endpoint_port(port) {
+            return (norm_ip(ip), port);
         }
     }
-    // IPv6 的端口用点分隔：`::1.8021`、`*.*`
+    // nettop uses a dot for IPv6 ports: ::1.8021, fe80::1%en0.443, *.5353.
     if let Some((ip, port)) = s.rsplit_once('.') {
-        if let Ok(p) = port.trim().parse::<u16>() {
-            return (norm_ip(ip), p);
+        if ip == "*" || (ip.contains(':') && numeric_ip(ip)) {
+            if let Some(port) = endpoint_port(port) {
+                return (norm_ip(ip), port);
+            }
+        }
+    }
+    // A bare IP has no port. In particular ::1 must not become (":", 1),
+    // nor may 192.0.2.1 or ::ffff:192.0.2.1 lose their last address octet.
+    if numeric_ip(s) {
+        return (norm_ip(s), 0);
+    }
+    // IPv4 (or a hostname in nonnumeric fixtures) uses a colon. An unbracketed
+    // IPv6 address never uses this separator, even when its last group is decimal.
+    if let Some((ip, port)) = s.rsplit_once(':') {
+        if !ip.contains(':') {
+            if let Some(port) = endpoint_port(port) {
+                return (norm_ip(ip), port);
+            }
         }
     }
     (norm_ip(s), 0)
+}
+
+fn endpoint_port(port: &str) -> Option<u16> {
+    if port.trim() == "*" {
+        Some(0)
+    } else {
+        port.trim().parse().ok()
+    }
+}
+
+fn numeric_ip(ip: &str) -> bool {
+    ip.trim_start_matches('[')
+        .trim_end_matches(']')
+        .split('%')
+        .next()
+        .unwrap_or_default()
+        .parse::<std::net::IpAddr>()
+        .is_ok()
 }
 
 fn norm_ip(s: &str) -> String {
@@ -575,6 +613,29 @@ fn counter_delta(cur: u64, prev: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoints_distinguish_ipv6_ports_wildcards_and_bare_addresses() {
+        for (text, ip, port) in [
+            ("127.0.0.1:8021", "127.0.0.1", 8021),
+            ("::1.8021", "::1", 8021),
+            ("fe80::1%en0.443", "fe80::1%en0", 443),
+            ("[fe80::1%en0]:443", "fe80::1%en0", 443),
+            ("::ffff:192.0.2.1.443", "::ffff:192.0.2.1", 443),
+            ("*:67", "", 67),
+            ("*.5353", "", 5353),
+            ("*:*", "", 0),
+            ("*.*", "", 0),
+            ("[::]:*", "::", 0),
+            ("::", "::", 0),
+            ("::1", "::1", 0),
+            ("192.0.2.1", "192.0.2.1", 0),
+            ("::ffff:192.0.2.1", "::ffff:192.0.2.1", 0),
+            ("public1.alidns.com:443", "public1.alidns.com", 443),
+        ] {
+            assert_eq!(parse_endpoint(text), (ip.into(), port), "{text}");
+        }
+    }
 
     const HEADER: &str = "time,,interface,state,bytes_in,bytes_out,rx_dupe,rx_ooo,re-tx,rtt_avg,rcvsize,tx_win,tc_class,tc_mgt,cc_algo,P,C,R,W,arch,";
 

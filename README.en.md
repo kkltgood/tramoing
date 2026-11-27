@@ -24,6 +24,7 @@ These screenshots show a Windows demo instance. macOS shares the panel layout; p
 - **Local IP address:** centered in the panel footer, refreshed automatically, with click-to-copy.
 - **Traffic history:** local SQLite storage, configurable retention, CSV export, and per-app traffic alerts.
 - **Windows application firewall controls:** block or restore network access for a selected executable, including connections through local proxies. Requires the bundled administrator helper.
+- **App connections:** click an app row or its arrow to inspect TCP/UDP sockets, IPv4/IPv6 endpoints, states and PIDs, with a copy action. Refreshes about every two seconds while open. Windows UDP provides local endpoints only.
 - **Error reporting:** errors offer to export diagnostic logs through a dialog; reports stay on your device and are not uploaded automatically.
 - **Desktop integration:** light/dark/system themes, a language dropdown with system preference, Simplified Chinese and English, animated settings tabs, and optional launch at login. Language changes apply and save immediately; translation resources support adding more languages.
 - **In-app updates:** **Settings → General → Startup & updates** shows the time and result of the last check. Automatic and manual checks both download a newer compatible installer when the release provides a valid SHA-256. You choose when to install it.

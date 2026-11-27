@@ -121,6 +121,79 @@ impl AppResolver {
         })
     }
 
+    /// Resolve an old socket row only against a process generation that already
+    /// existed when that snapshot arrived. Do not ask a reused PID for its path.
+    pub(crate) fn resolve_snapshot(
+        &mut self,
+        pid: u32,
+        fallback: &str,
+        cutoff: (u64, u64),
+    ) -> Option<AppIdentity> {
+        self.resolve_snapshot_with(
+            pid,
+            fallback,
+            cutoff,
+            || procname::start_time(pid),
+            || identify(pid, fallback),
+        )
+    }
+
+    pub(crate) fn cached_snapshot(
+        &self,
+        pid: u32,
+        fallback: &str,
+        cutoff: (u64, u64),
+    ) -> Option<AppIdentity> {
+        let cached = self
+            .map
+            .get(&pid)
+            .filter(|cached| cached.fallback == fallback)?;
+        match cached.started {
+            Some(at) if at <= cutoff => Some(cached.identity.clone()),
+            Some(_) => None,
+            None => Self::snapshot_fallback(fallback),
+        }
+    }
+
+    fn snapshot_fallback(fallback: &str) -> Option<AppIdentity> {
+        let name = fallback.trim().trim_end_matches('.').trim();
+        (!name.is_empty()).then(|| AppIdentity::new(name, name))
+    }
+
+    fn resolve_snapshot_with(
+        &mut self,
+        pid: u32,
+        fallback: &str,
+        cutoff: (u64, u64),
+        mut start_time: impl FnMut() -> Option<(u64, u64)>,
+        load: impl FnOnce() -> AppIdentity,
+    ) -> Option<AppIdentity> {
+        let started = start_time();
+        if started.is_some_and(|at| at > cutoff) {
+            return None;
+        }
+        if started.is_none() {
+            // An exited/protected process can still be shown under its known
+            // snapshot identity, or the nettop-supplied name. Never query its
+            // current path/name without a verifiable process generation.
+            if let Some(cached) = self.map.get(&pid).filter(|cached| {
+                cached.fallback == fallback && cached.started.is_some_and(|at| at <= cutoff)
+            }) {
+                return Some(cached.identity.clone());
+            }
+            return Self::snapshot_fallback(fallback);
+        }
+        let identity = self.resolve_identity(pid, started, fallback, load);
+        // proc_pidpath has no process-handle variant. Check the generation again
+        // so a PID reused during path resolution cannot escape the cutoff check.
+        if start_time() == started {
+            Some(identity)
+        } else {
+            self.map.remove(&pid);
+            None
+        }
+    }
+
     fn resolve_identity(
         &mut self,
         pid: u32,
@@ -168,6 +241,57 @@ impl AppResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_identity_rejects_reused_pids_before_and_during_path_lookup() {
+        let mut resolver = AppResolver::new();
+        let cutoff = (100, 500);
+        assert!(resolver
+            .resolve_snapshot_with(
+                42,
+                "app",
+                cutoff,
+                || Some((101, 0)),
+                || { panic!("a newer PID must not be resolved") }
+            )
+            .is_none());
+        let mut generations = [Some((90, 0)), Some((102, 0))].into_iter();
+        assert!(resolver
+            .resolve_snapshot_with(
+                42,
+                "app",
+                cutoff,
+                || generations.next().unwrap(),
+                || { AppIdentity::new("/new/app", "app") }
+            )
+            .is_none());
+        assert_eq!(
+            resolver
+                .resolve_snapshot_with(
+                    43,
+                    "old",
+                    cutoff,
+                    || Some((90, 0)),
+                    || { AppIdentity::new("/old/app", "old") }
+                )
+                .unwrap()
+                .key,
+            "/old/app"
+        );
+        assert_eq!(
+            resolver
+                .resolve_snapshot_with(
+                    44,
+                    "fixture",
+                    cutoff,
+                    || None,
+                    || { panic!("unknown generation must use only the supplied fallback") }
+                )
+                .unwrap()
+                .key,
+            "fixture"
+        );
+    }
 
     #[test]
     fn extracts_outermost_bundle() {

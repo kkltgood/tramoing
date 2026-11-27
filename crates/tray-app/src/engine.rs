@@ -68,11 +68,14 @@ pub struct Snapshot {
     pub store_error: Option<String>,
 }
 
+pub mod connections;
+
 /// App 持有线程所有权。正常退出时通知停止、提交最后一批，再回收采集器。
 pub struct Engine {
     latest: Arc<Mutex<Option<Snapshot>>>,
     stop: Sender<()>,
     worker: Option<JoinHandle<()>>,
+    pub connections: connections::Requests,
 }
 
 impl Engine {
@@ -251,6 +254,8 @@ where
     // UI 只需要最新快照。隐藏窗口或主线程暂时阻塞时不积压整小时的应用列表。
     let latest = Arc::new(Mutex::new(None));
     let output = latest.clone();
+    let connections = connections::Requests::default();
+    let mut connection_worker = connections::Worker::new(connections.clone());
     let (stop, stop_rx) = mpsc::channel();
     let worker = thread::Builder::new()
         .name("sampler".into())
@@ -334,6 +339,22 @@ where
                     break;
                 }
                 tracker.push_at(Instant::now(), &[]);
+
+                connection_worker.refresh(|app| {
+                    // Owner-PID tables are independent of the privileged traffic helper.
+                    #[cfg(windows)]
+                    if !mock {
+                        return tm_windows::connections::for_app(app).map_err(|e| e.to_string());
+                    }
+                    if let Some(message) = &error {
+                        return Err(message.clone());
+                    }
+                    sampler
+                        .as_mut()
+                        .ok_or_else(|| "采集器暂不可用".to_owned())?
+                        .connections(app)
+                        .map_err(|e| e.to_string())
+                });
 
                 if last_flush.elapsed() >= FLUSH_EVERY {
                     if store.is_none() {
@@ -430,6 +451,7 @@ where
         latest,
         stop,
         worker: Some(worker),
+        connections,
     }
 }
 
@@ -519,6 +541,7 @@ mod tests {
             latest,
             stop,
             worker: Some(worker),
+            connections: Default::default(),
         };
         assert_eq!(engine.try_recv().unwrap().session_rx, 1000);
         assert!(matches!(

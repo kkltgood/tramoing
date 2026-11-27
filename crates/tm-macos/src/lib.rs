@@ -9,6 +9,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod appid;
+#[cfg(any(target_os = "macos", test))]
+mod connections;
 #[cfg(target_os = "macos")]
 pub mod dialog;
 pub mod flows;

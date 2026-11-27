@@ -384,3 +384,19 @@ Windows GPU 按 WDDM → 内置 LHM GPU → 可选 WMI 的顺序选择读数。W
 PawnIO 使用清单锁定的官方安装器与发布者 Authenticode 签名要求；构建和运行采集均不安装驱动。用户确认组件安装后才按需执行官方 `-install -silent`，跳过已经可用的兼容版本，识别 3010 重启状态，错误时保留其他功能并说明原因。已安装但驱动未就绪时应区分“需要重启/受策略限制”和“缺少下载文件”，避免反复下载安装。第三方说明和 NuGet 许可证随自有温度组件打包。
 
 发布前按需安装回归须覆盖：纯净机器、已有兼容/不兼容 .NET、已有/过旧/不可用 PawnIO、旧 self-contained 组件升级保留、官方源失败转备用、备用未发布、跨镜像续传、错误哈希、暂停/重启、UAC 取消、组件替换失败恢复。发布前实机矩阵还应覆盖 Intel/AMD 台式机与笔记本、Windows 10/11 x64、Windows 11 ARM64、无驱动/旧驱动/驱动受策略限制、启停温度、助手被结束、硬件查询卡住、WMI 运行/退出与 GPU 驱动不支持。普通权限的 smoke test 只证明进程协议和权限状态，不代表真实温度读取成功。
+
+## 应用连接详情开发与验证
+
+公共连接类型在 `tm-core::connections`，采样接口提供 `Sampler::connections`。macOS 保留最近 nettop 帧并按 socket 原始所属应用过滤；Windows 的 `connections::for_app` 按需读取四种 OWNER_PID 表，独立于流量助手。详情请求由 `engine::connections` 节流并在切换应用、返回或隐藏时失效；查询在采样线程进行，界面不调用系统连接 API。新增界面位于 `app/connections_ui.rs`。
+
+```sh
+cargo test --workspace --locked
+# macOS：本地回环 TCP/UDP，不访问外网
+cargo test -p tm-macos --test native_runtime live_connection_details --locked -- --ignored --nocapture --test-threads=1
+# Windows 真机：IPv4 / IPv6 TCP/UDP
+cargo test -p tm-windows connections::tests::native_ --locked -- --ignored --nocapture --test-threads=1
+```
+
+隔离 debug 演示实例设置 `TM_CAPTURE_STATE=connections` 可预览连接列表，`connections-expanded` 可预览展开详情，`connections-duplicates` 复现四条连接共享一个本机地址，`connections-long` 验证长 IPv6 明细；配合 `TM_DATA_DIR`、`TM_CAPTURE_PPM` 和 `--mock --show` 保存界面截图。演示地址使用文档地址段，不读取真实连接。
+
+连接分组展开和收起共用 200 毫秒过渡，箭头、明细高度及透明度同步变化。截图时可额外设置 `TM_CAPTURE_REVEAL_PROGRESS=0.5` 固定在半展开状态，检查裁切和列对齐；该参数仅在隔离 debug 截图模式生效。

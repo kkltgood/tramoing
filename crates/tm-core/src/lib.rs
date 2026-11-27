@@ -5,6 +5,7 @@
 //! 采集层（nettop / ETW）只要负责吐 [`ProcSample`] 就行。
 
 pub mod color;
+pub mod connections;
 pub mod identity;
 pub mod rate;
 pub mod taskbar;
@@ -13,6 +14,9 @@ pub mod types;
 pub mod window;
 
 pub use color::Rgb;
+pub use connections::{
+    Connection, ConnectionEndpoint, ConnectionProtocol, ConnectionReport, ConnectionState,
+};
 pub use rate::RateCalculator;
 pub use types::{
     format_bytes, format_speed, is_system_service, pretty_name, AppKey, AppRate, ProcSample,

@@ -5,13 +5,102 @@
 #![cfg(target_os = "macos")]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tm_macos::NettopSampler;
 use tm_sampler::Sampler;
+
+#[test]
+#[ignore = "requires live nettop and local IPv4/IPv6 sockets"]
+fn live_connection_details_include_real_pids_listeners_loopback_and_udp() {
+    use tm_core::{AppKey, ConnectionProtocol, ConnectionState};
+
+    let mut sampler = NettopSampler::spawn().expect("start nettop");
+    let pid = std::process::id();
+    let app = AppKey::new(tm_macos::identify(pid, "native_runtime").key);
+    for (address, protocol, udp_protocol) in [
+        (
+            "127.0.0.1:0",
+            ConnectionProtocol::Tcp4,
+            ConnectionProtocol::Udp4,
+        ),
+        (
+            "[::1]:0",
+            ConnectionProtocol::Tcp6,
+            ConnectionProtocol::Udp6,
+        ),
+    ] {
+        let listener = TcpListener::bind(address).unwrap();
+        let listener_address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.write_all(b"socket details").unwrap();
+        server.read_exact(&mut [0; 14]).unwrap();
+        let client_address = client.local_addr().unwrap();
+        let udp = UdpSocket::bind(address).unwrap();
+        let udp_address = udp.local_addr().unwrap();
+        let mut matched = false;
+        for _ in 0..6 {
+            sampler.sample().expect("current socket snapshot");
+            let report = sampler.connections(&app).expect("connection details");
+            let rows = &report.connections;
+            matched = rows.iter().any(|row| {
+                row.pid == pid
+                    && row.protocol == protocol
+                    && row.state == ConnectionState::Listen
+                    && row.local.port == listener_address.port()
+                    && row.remote.is_none()
+            }) && rows.iter().any(|row| {
+                row.pid == pid
+                    && row.protocol == protocol
+                    && row.state == ConnectionState::Established
+                    && row.local.port == client_address.port()
+                    && row.remote.as_ref().is_some_and(|remote| {
+                        remote.port == listener_address.port()
+                            && remote.address == listener_address.ip().to_string()
+                    })
+            }) && rows.iter().any(|row| {
+                row.pid == pid
+                    && row.protocol == udp_protocol
+                    && row.local.port == udp_address.port()
+                    && row.remote.is_none()
+            });
+            if matched {
+                break;
+            }
+        }
+        assert!(
+            matched,
+            "missing live {protocol:?} listener, stream or UDP socket"
+        );
+        drop(client);
+        drop(server);
+        drop(listener);
+        drop(udp);
+        let mut removed = false;
+        for _ in 0..6 {
+            sampler.sample().expect("snapshot after sockets closed");
+            let report = sampler.connections(&app).unwrap();
+            removed = !report.connections.iter().any(|row| {
+                (row.protocol == protocol
+                    && row.local.port == listener_address.port()
+                    && row.state == ConnectionState::Listen)
+                    || (row.protocol == udp_protocol && row.local.port == udp_address.port())
+            });
+            if removed {
+                break;
+            }
+        }
+        assert!(removed, "closed listener/UDP socket remained in details");
+    }
+    assert_eq!(
+        sampler.total_bytes(app.as_str()),
+        tm_macos::Bytes::default()
+    );
+}
 
 fn child_cpu_seconds() -> f64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();

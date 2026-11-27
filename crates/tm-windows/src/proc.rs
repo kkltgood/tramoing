@@ -21,6 +21,13 @@ pub fn executable_path(pid: u32) -> Option<String> {
     Process::open(pid)?.path()
 }
 
+/// Fresh identity from one handle; unlike PathCache, never falls back to a
+/// previous process when a PID has exited or cannot be queried.
+pub(crate) fn executable_identity(pid: u32) -> Option<(u64, String)> {
+    let process = Process::open(pid)?;
+    Some((process.created, process.path()?))
+}
+
 struct Process {
     handle: HANDLE,
     created: u64,

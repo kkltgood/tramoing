@@ -115,6 +115,10 @@ impl Sampler for WindowsSampler {
         }
     }
 
+    fn connections(&mut self, app: &AppKey) -> Result<tm_core::ConnectionReport, SamplerError> {
+        crate::connections::for_app(app)
+    }
+
     fn sampled_at(&self) -> Option<Instant> {
         self.sampled_at
     }

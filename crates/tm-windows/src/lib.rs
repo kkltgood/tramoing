@@ -25,6 +25,8 @@ pub mod temperature_protocol;
 mod temperature_sources;
 
 #[cfg(windows)]
+pub mod connections;
+#[cfg(windows)]
 pub mod firewall;
 #[cfg(windows)]
 pub mod network_control;
