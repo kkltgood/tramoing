@@ -27,7 +27,7 @@ pub(super) fn show(
         .frame(
             egui::Frame::NONE
                 .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.border))
+                .stroke(Stroke::new(1.0_f32, p.border))
                 .corner_radius(12)
                 .inner_margin(12)
                 .shadow(egui::epaint::Shadow {
@@ -48,8 +48,8 @@ pub(super) fn show(
             ui.visuals_mut().widgets.hovered.bg_fill = p.accent;
             ui.visuals_mut().widgets.active.bg_fill = p.accent;
             ui.visuals_mut().selection.bg_fill = mix(p.surface, p.accent, 0.22);
-            ui.visuals_mut().selection.stroke = Stroke::new(1.0, p.text);
-            ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
+            ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, p.text);
+            ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
             let (heading, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), egui::Sense::hover());
             ui.painter().text(
@@ -169,7 +169,7 @@ fn body(
                         .color(p.accent),
                     )
                     .fill(p.chip)
-                    .stroke(Stroke::new(0.7, p.border))
+                    .stroke(Stroke::new(0.7_f32, p.border))
                     .corner_radius(6)
                     .min_size(Vec2::new(64.0, 24.0)),
                 )
@@ -201,7 +201,7 @@ fn paint_close(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
                 rect.center() + egui::vec2(-3.5, -3.5 * sign),
                 rect.center() + egui::vec2(3.5, 3.5 * sign),
             ],
-            Stroke::new(1.2, color),
+            Stroke::new(1.2_f32, color),
         );
     }
 }

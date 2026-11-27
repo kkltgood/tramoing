@@ -5062,7 +5062,7 @@ fn paint_connection_chevron(painter: &egui::Painter, rect: egui::Rect, color: Co
             center + egui::vec2(2.0, 0.0),
             center + egui::vec2(-1.5, 3.5),
         ],
-        Stroke::new(1.2, color),
+        Stroke::new(1.2_f32, color),
     ));
 }
 

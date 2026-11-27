@@ -97,14 +97,14 @@ impl App {
 
 fn paint_info(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let center = rect.center();
-    painter.circle_stroke(center, 7.0, Stroke::new(1.0, color));
+    painter.circle_stroke(center, 7.0, Stroke::new(1.0_f32, color));
     painter.circle_filled(center + egui::vec2(0.0, -3.2), 0.8, color);
     painter.line_segment(
         [
             center + egui::vec2(0.0, -0.5),
             center + egui::vec2(0.0, 4.0),
         ],
-        Stroke::new(1.2, color),
+        Stroke::new(1.2_f32, color),
     );
 }
 
@@ -172,7 +172,7 @@ fn details_body(
     );
     ui.painter().line_segment(
         [overview.left_bottom(), overview.right_bottom()],
-        Stroke::new(0.7, p.border),
+        Stroke::new(0.7_f32, p.border),
     );
     ui.add_space(8.0);
     let id = ui.id().with(("connections-state", app.as_str()));
@@ -288,7 +288,7 @@ fn details_body(
     );
     ui.painter().line_segment(
         [footer.left_top(), footer.right_top()],
-        Stroke::new(0.7, p.border),
+        Stroke::new(0.7_f32, p.border),
     );
     if !groups.is_empty() {
         ui.painter().text(
@@ -403,7 +403,7 @@ fn group_row(ui: &mut egui::Ui, group: &Group<'_>, state: &mut DetailsUi, p: &Pa
         rect,
         8.0,
         background,
-        Stroke::new(0.7, mix(p.border, p.accent, 0.35 * openness)),
+        Stroke::new(0.7_f32, mix(p.border, p.accent, 0.35 * openness)),
         egui::StrokeKind::Inside,
     );
     surface::focus(ui.painter(), rect, &response, p);
@@ -420,7 +420,7 @@ fn group_row(ui: &mut egui::Ui, group: &Group<'_>, state: &mut DetailsUi, p: &Pa
         toggle,
         6.0,
         mix(p.chip, p.accent, 0.04 * openness),
-        Stroke::new(0.7, p.border),
+        Stroke::new(0.7_f32, p.border),
         egui::StrokeKind::Inside,
     );
     let divider = toggle.right() - 26.0;
@@ -446,7 +446,7 @@ fn group_row(ui: &mut egui::Ui, group: &Group<'_>, state: &mut DetailsUi, p: &Pa
             egui::pos2(divider, toggle.top() + 7.0),
             egui::pos2(divider, toggle.bottom() - 7.0),
         ],
-        Stroke::new(0.7, p.border),
+        Stroke::new(0.7_f32, p.border),
     );
     let center = egui::pos2(divider + 13.0, toggle.center().y);
     let rotation = egui::emath::Rot2::from_angle(openness * std::f32::consts::FRAC_PI_2);
@@ -458,7 +458,7 @@ fn group_row(ui: &mut egui::Ui, group: &Group<'_>, state: &mut DetailsUi, p: &Pa
     .map(|point| center + rotation * point);
     ui.painter().add(egui::Shape::line(
         points.to_vec(),
-        Stroke::new(1.3, p.subtext),
+        Stroke::new(1.3_f32, p.subtext),
     ));
     let meta = lang.format(
         "connections.group_meta",
@@ -637,7 +637,7 @@ fn record_table(ui: &mut egui::Ui, group: &Group<'_>, p: &Palette, lang: Lang) {
         );
         ui.painter().line_segment(
             [rect.left_top(), rect.right_top()],
-            Stroke::new(0.5, p.border),
+            Stroke::new(0.5_f32, p.border),
         );
         ui.painter()
             .galley(rect.min + egui::vec2(0.0, 8.0), address, p.text);
