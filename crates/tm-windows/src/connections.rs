@@ -99,7 +99,7 @@ impl TableKind {
 }
 
 /// Run only on a background thread. Paths are queried fresh on every request;
-/// exited or protected processes are omitted with an explicit partial warning.
+/// unverified processes are omitted and counted separately from table failures.
 pub fn for_app(app: &AppKey) -> Result<ConnectionReport, SamplerError> {
     let path = app.as_str();
     if !Path::new(path).is_absolute()
@@ -137,16 +137,12 @@ pub fn for_app(app: &AppKey) -> Result<ConnectionReport, SamplerError> {
     if completed == 0 {
         return Err(SamplerError::Source(failures.join("; ")));
     }
-    let (connections, skipped) =
+    let (connections, unverified_processes) =
         select_app(candidates, path, started, crate::proc::executable_identity);
-    if skipped > 0 {
-        failures.push(format!(
-            "Could not verify {skipped} protected, exited or newly started process identities; this snapshot may be incomplete"
-        ));
-    }
     Ok(ConnectionReport {
         connections,
         warning: (!failures.is_empty()).then(|| failures.join("; ")),
+        unverified_processes,
     })
 }
 
@@ -540,7 +536,9 @@ mod tests {
                 candidate(2),
                 candidate(3),
                 candidate(4),
+                candidate(4),
                 candidate(5),
+                candidate(6),
             ],
             r"C:\Apps\browser.exe",
             100,
@@ -552,6 +550,7 @@ mod tests {
                     3 => Some((101, r"C:\Apps\browser.exe".into())),
                     4 => None,
                     5 => Some((100, r"C:\Apps\browser.exe".into())),
+                    6 => Some((101, r"C:\Other\browser.exe".into())),
                     _ => panic!("PID zero has no application identity"),
                 }
             },
@@ -560,7 +559,9 @@ mod tests {
             connections.iter().map(|r| r.pid).collect::<Vec<_>>(),
             [1, 1, 5]
         );
-        assert_eq!(skipped, 2);
+        // Count each unverified system PID once, including identities whose
+        // path is unrelated but whose creation time invalidates attribution.
+        assert_eq!(skipped, 3);
         assert!(calls.values().all(|count| *count == 1));
     }
 

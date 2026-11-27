@@ -50,6 +50,7 @@ impl Snapshot {
         ConnectionReport {
             connections,
             warning: None,
+            unverified_processes: 0,
         }
     }
 }

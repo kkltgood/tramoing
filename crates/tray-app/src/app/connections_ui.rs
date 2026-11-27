@@ -1,4 +1,5 @@
 mod groups;
+mod help;
 #[cfg(test)]
 mod tests;
 
@@ -33,7 +34,9 @@ impl App {
         if icon_button(ui, back, "connections-back", p, paint_back_icon)
             .on_hover_text(lang.t("common.back"))
             .clicked()
-            || (self.view == View::Connections && ui.input(|i| i.key_pressed(egui::Key::Escape)))
+            || (self.view == View::Connections
+                && !egui::Popup::is_any_open(ui.ctx())
+                && ui.input(|i| i.key_pressed(egui::Key::Escape)))
         {
             self.goto(View::Main);
         }
@@ -64,43 +67,25 @@ impl App {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, lang.t("connections.help"))
         });
-        egui::Popup::from_toggle_button_response(&response)
-            .width(320.0)
-            .show(|ui| {
-                ui.label(RichText::new(lang.t("connections.help")).strong());
-                ui.label(lang.t("connections.note"));
-                if let Some(details) = &details {
-                    ui.label(lang.format(
-                        "connections.full_counts",
-                        &[
-                            ("established", &details.established.to_string()),
-                            ("listening", &details.listening.to_string()),
-                        ],
-                    ));
-                }
-                #[cfg(windows)]
-                {
-                    ui.label(lang.t("connections.udp_note"));
-                    if self.network_access.rule(app.as_str()).is_some() {
-                        ui.colored_label(
-                            p.warn,
-                            if self.network_access.verified
-                                && self
-                                    .network_access
-                                    .rule(app.as_str())
-                                    .is_some_and(|rule| rule.complete)
-                            {
-                                lang.t("ui.blocked_use_allow_to_restore_access")
-                            } else {
-                                lang.t("ui.network_rules_need_verification")
-                            },
-                        );
-                    }
-                }
-                ui.separator();
-                ui.label(RichText::new(lang.t("connections.app_path")).small());
-                ui.add(egui::Label::new(app.as_str()).wrap().selectable(true));
-            });
+        #[cfg(windows)]
+        let restriction = self.network_access.rule(app.as_str()).map(|rule| {
+            if self.network_access.verified && rule.complete {
+                lang.t("ui.blocked_use_allow_to_restore_access")
+            } else {
+                lang.t("ui.network_rules_need_verification")
+            }
+        });
+        #[cfg(not(windows))]
+        let restriction = None;
+        help::show(
+            &response,
+            header,
+            &app,
+            details.as_ref(),
+            restriction,
+            p,
+            lang,
+        );
         ui.add_space(14.0);
         #[cfg(not(windows))]
         let error = self.latest.as_ref().and_then(|s| s.error.as_deref());
@@ -151,6 +136,7 @@ fn details_body(
         }
     };
     let groups = groups::collect(&report.connections);
+    let incomplete = report.warning.is_some() || report.unverified_processes > 0;
     let (overview, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::hover());
     let count = if details.total > DISPLAY_LIMIT {
@@ -213,23 +199,53 @@ fn details_body(
         state.expanded = groups.first().map(Group::id);
     }
     let bounds = ui.max_rect();
+    let page_clip = ui.clip_rect();
     let height = (ui.available_height() - 28.0).max(1.0);
-    ui.style_mut().spacing.scroll.floating = false;
-    ui.style_mut().spacing.scroll.bar_width = 4.0;
-    ui.style_mut().spacing.scroll.bar_inner_margin = 5.0;
-    ui.style_mut().spacing.scroll.foreground_color = false;
+    let (list_rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    // Keep cards aligned with the page on both sides. The scrollbar uses part
+    // of the existing panel padding instead of taking width away from cards.
+    let mut list_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("connections-scroll")
+            .max_rect(list_rect.with_max_x(list_rect.right() + SCROLL_GUTTER)),
+    );
+    list_ui.set_clip_rect(
+        page_clip
+            .with_max_x(page_clip.right() + SCROLL_GUTTER)
+            .intersect(ui.ctx().content_rect()),
+    );
+    let scroll = &mut list_ui.spacing_mut().scroll;
+    scroll.floating = true;
+    scroll.floating_allocated_width = 0.0;
+    scroll.floating_width = 3.0;
+    scroll.bar_width = 6.0;
+    scroll.handle_min_length = 24.0;
+    scroll.foreground_color = false;
+    scroll.dormant_background_opacity = 0.0;
+    scroll.active_background_opacity = 0.0;
+    scroll.interact_background_opacity = 0.0;
+    scroll.dormant_handle_opacity = 1.0;
+    scroll.active_handle_opacity = 1.0;
+    scroll.interact_handle_opacity = 1.0;
+    let visuals = list_ui.visuals_mut();
+    visuals.widgets.inactive.bg_fill = mix(p.border, p.subtext, 0.35);
+    visuals.widgets.hovered.bg_fill = mix(p.border, p.accent, 0.65);
+    visuals.widgets.active.bg_fill = p.accent;
     egui::ScrollArea::vertical()
         .id_salt(("connections-list", app.as_str()))
-        // Reserve the scrollbar gutter while the body grows, so headers and
-        // columns do not shift sideways at the moment overflow starts.
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .max_height(height)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            if let Some(warning) = &report.warning {
+        .show(&mut list_ui, |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(page_clip));
+            ui.set_width(list_rect.width());
+            if incomplete {
                 ui.add(
                     egui::Label::new(
-                        RichText::new(lang.format("connections.partial", &[("error", warning)]))
+                        RichText::new(lang.t("connections.incomplete"))
                             .size(11.0)
                             .color(p.warn),
                     )
@@ -239,8 +255,15 @@ fn details_body(
             }
             if groups.is_empty() {
                 ui.add(
-                    egui::Label::new(RichText::new(lang.t("connections.empty")).color(p.subtext))
-                        .wrap(),
+                    egui::Label::new(
+                        RichText::new(lang.t(if incomplete {
+                            "connections.empty_incomplete"
+                        } else {
+                            "connections.empty"
+                        }))
+                        .color(p.subtext),
+                    )
+                    .wrap(),
                 );
             }
             let mut previous = None;
@@ -267,13 +290,15 @@ fn details_body(
         [footer.left_top(), footer.right_top()],
         Stroke::new(0.7, p.border),
     );
-    ui.painter().text(
-        footer.left_center() + egui::vec2(0.0, 3.0),
-        egui::Align2::LEFT_CENTER,
-        lang.t("connections.group_hint"),
-        egui::FontId::proportional(10.0),
-        p.unit,
-    );
+    if !groups.is_empty() {
+        ui.painter().text(
+            footer.left_center() + egui::vec2(0.0, 3.0),
+            egui::Align2::LEFT_CENTER,
+            lang.t("connections.group_hint"),
+            egui::FontId::proportional(10.0),
+            p.unit,
+        );
+    }
     ui.painter().text(
         footer.right_center() + egui::vec2(0.0, 3.0),
         egui::Align2::RIGHT_CENTER,

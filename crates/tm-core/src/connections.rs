@@ -71,8 +71,12 @@ pub struct Connection {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectionReport {
     pub connections: Vec<Connection>,
-    /// Partial collection failure; successful rows may still be shown.
+    /// Partial connection-table collection failure; successful rows may still be shown.
     pub warning: Option<String>,
+    /// Distinct nonzero PIDs in the system connection tables whose current
+    /// identity could not be verified. This is not a count of missing connections
+    /// for the selected application, since those PIDs could not be attributed.
+    pub unverified_processes: usize,
 }
 
 #[cfg(test)]

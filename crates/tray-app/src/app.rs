@@ -610,6 +610,10 @@ impl App {
                         "connections"
                         | "connections-expanded"
                         | "connections-duplicates"
+                        | "connections-help"
+                        | "connections-empty"
+                        | "connections-incomplete"
+                        | "connections-short"
                         | "connections-long",
                     ) => {
                         app.connection_app = Some(AppKey::from("/Applications/Google Chrome.app"));

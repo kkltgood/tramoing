@@ -399,4 +399,6 @@ cargo test -p tm-windows connections::tests::native_ --locked -- --ignored --noc
 
 隔离 debug 演示实例设置 `TM_CAPTURE_STATE=connections` 可预览连接列表，`connections-expanded` 可预览展开详情，`connections-duplicates` 复现四条连接共享一个本机地址，`connections-long` 验证长 IPv6 明细；配合 `TM_DATA_DIR`、`TM_CAPTURE_PPM` 和 `--mock --show` 保存界面截图。演示地址使用文档地址段，不读取真实连接。
 
+`connections-help` 打开说明卡片并注入系统进程身份无法核验的提示，`connections-empty` 与 `connections-incomplete` 分别预览完整空态和采集不完整的空态，`connections-short` 验证单条连接不溢出时隐藏滚动条；可配合隔离目录中的 `settings.conf` 检查中英文和深浅主题。说明卡片中的进程数是全系统未核验 PID 数，不是目标应用缺失的连接数。
+
 连接分组展开和收起共用 200 毫秒过渡，箭头、明细高度及透明度同步变化。截图时可额外设置 `TM_CAPTURE_REVEAL_PROGRESS=0.5` 固定在半展开状态，检查裁切和列对齐；该参数仅在隔离 debug 截图模式生效。

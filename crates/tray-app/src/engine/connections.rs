@@ -181,12 +181,16 @@ mod tests {
             rows.push(rows[0].clone());
             Ok(ConnectionReport {
                 connections: rows,
-                warning: None,
+                warning: Some("TCP/IPv6: unavailable".into()),
+                unverified_processes: 7,
             })
         });
         let details = requests.details(&AppKey::from("a")).unwrap();
         assert_eq!(details.total, 250);
-        let rows = details.result.unwrap().connections;
+        let report = details.result.unwrap();
+        assert_eq!(report.warning.as_deref(), Some("TCP/IPv6: unavailable"));
+        assert_eq!(report.unverified_processes, 7);
+        let rows = report.connections;
         assert_eq!(rows.len(), DISPLAY_LIMIT);
         assert_eq!(rows[0].local.port, 0);
         worker.refresh_at(now + REFRESH_INTERVAL, |_| Err("offline".into()));
@@ -229,6 +233,7 @@ mod tests {
             Ok(ConnectionReport {
                 connections,
                 warning: None,
+                unverified_processes: 0,
             })
         });
         let details = requests.details(&AppKey::from("app")).unwrap();

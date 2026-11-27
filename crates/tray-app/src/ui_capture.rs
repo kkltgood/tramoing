@@ -32,6 +32,45 @@ pub fn connection_details(
         return details;
     }
     let state = std::env::var("TM_CAPTURE_STATE").unwrap_or_default();
+    if state == "connections-short" {
+        return details.map(|mut details| {
+            if let Ok(report) = &mut details.result {
+                report.connections.truncate(1);
+                report.unverified_processes = 27;
+                details.total = report.connections.len();
+                details.established = details.total;
+                details.listening = 0;
+            }
+            details
+        });
+    }
+    if matches!(
+        state.as_str(),
+        "connections-empty" | "connections-incomplete"
+    ) {
+        return Some(crate::engine::connections::Details {
+            updated_at: Instant::now(),
+            total: 0,
+            established: 0,
+            listening: 0,
+            result: Ok(tm_core::ConnectionReport {
+                unverified_processes: if state == "connections-incomplete" {
+                    25
+                } else {
+                    0
+                },
+                ..Default::default()
+            }),
+        });
+    }
+    if state == "connections-help" {
+        return details.map(|mut details| {
+            if let Ok(report) = &mut details.result {
+                report.unverified_processes = 27;
+            }
+            details
+        });
+    }
     if !matches!(
         state.as_str(),
         "connections-duplicates" | "connections-long"
@@ -79,6 +118,7 @@ pub fn connection_details(
         result: Ok(ConnectionReport {
             connections,
             warning: None,
+            unverified_processes: 0,
         }),
     })
 }

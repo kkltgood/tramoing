@@ -166,6 +166,7 @@ impl Sampler for MockSampler {
         Ok(ConnectionReport {
             connections,
             warning: None,
+            unverified_processes: 0,
         })
     }
 
