@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 use tm_core::temperature::{hottest, valid, Temperatures};
 use windows_sys::Wdk::Graphics::Direct3D::*;
 
+const HELPER_INTERVAL: Duration = Duration::from_secs(2);
+const HELPER_RETRY: Duration = Duration::from_secs(1);
+
 // https://learn.microsoft.com/windows-hardware/drivers/ddi/d3dkmthk/ns-d3dkmthk-_d3dkmt_adapter_perfdata
 fn gpu_temperature() -> Option<f64> {
     unsafe {
@@ -185,20 +188,32 @@ impl Default for Sampler {
     }
 }
 impl Sampler {
+    fn accept_helper_result(
+        &mut self,
+        result: Result<crate::temperature_protocol::Snapshot, String>,
+        completed_at: Instant,
+    ) {
+        self.helper_reading = match result {
+            Ok(reading) => {
+                self.helper_error.clear();
+                self.helper_retry = completed_at + HELPER_INTERVAL;
+                Some(reading)
+            }
+            Err(error) => {
+                self.helper_error = format!("Built-in sensor helper unavailable: {error}");
+                // Retry on the next performance sample. A short IPC delay must not
+                // become a ten-second outage or let the worker's lease expire.
+                self.helper_retry = completed_at + HELPER_RETRY;
+                // Never keep displaying an old temperature after losing its source.
+                None
+            }
+        };
+    }
+
     pub fn sample(&mut self) -> Temperatures {
         if Instant::now() >= self.helper_retry {
-            self.helper_reading = match crate::temperature_service::request() {
-                Ok(reading) => {
-                    self.helper_error.clear();
-                    self.helper_retry = Instant::now() + Duration::from_secs(2);
-                    Some(reading)
-                }
-                Err(error) => {
-                    self.helper_error = format!("Built-in sensor helper unavailable: {error}");
-                    self.helper_retry = Instant::now() + Duration::from_secs(10);
-                    None
-                }
-            };
+            let result = crate::temperature_service::request();
+            self.accept_helper_result(result, Instant::now());
         }
         let native = self.helper_reading.as_ref().map(|r| r.temperatures());
         let driver_gpu = gpu_temperature();
@@ -233,5 +248,66 @@ impl Sampler {
             }
         }
         merge(native, result, &self.helper_error, driver_gpu)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::temperature_protocol::{Snapshot, Status};
+
+    fn ready(cpu: f64) -> Snapshot {
+        Snapshot {
+            cpu: Some(cpu),
+            gpu: None,
+            status: Status::Ready,
+            source: "test sensor".into(),
+        }
+    }
+
+    #[test]
+    fn transient_helper_failure_clears_old_temperature_and_recovers_next_sample() {
+        let mut sampler = Sampler::default();
+        let start = Instant::now();
+        sampler.accept_helper_result(Ok(ready(65.0)), start);
+        let failure_at = start + Duration::from_secs(2);
+        sampler.accept_helper_result(Err("读取温度采集消息超时".into()), failure_at);
+        assert!(sampler.helper_reading.is_none());
+        assert!(sampler.helper_error.contains("超时"));
+
+        let next_sample = failure_at + Duration::from_secs(1);
+        assert!(sampler.helper_retry <= next_sample);
+        sampler.accept_helper_result(Ok(ready(67.0)), next_sample);
+        assert_eq!(
+            sampler.helper_reading.as_ref().unwrap().temperatures().cpu,
+            Some(67.0)
+        );
+        assert!(sampler.helper_error.is_empty());
+    }
+
+    #[test]
+    fn repeated_helper_failures_do_not_restore_cached_values_or_lengthen_backoff() {
+        let mut sampler = Sampler::default();
+        let start = Instant::now();
+        sampler.accept_helper_result(Ok(ready(65.0)), start);
+        for second in 2..20 {
+            let at = start + Duration::from_secs(second);
+            sampler.accept_helper_result(Err("helper unavailable".into()), at);
+            assert!(sampler.helper_reading.is_none());
+            assert!(sampler.helper_retry <= at + Duration::from_secs(1));
+            assert!(sampler.helper_error.contains("helper unavailable"));
+        }
+        // A successful IPC response reporting a sensor failure is not a reading.
+        sampler.accept_helper_result(
+            Ok(Snapshot::unavailable(
+                Status::ProcessExited,
+                "worker exited",
+            )),
+            start + Duration::from_secs(20),
+        );
+        assert_eq!(
+            sampler.helper_reading.as_ref().unwrap().temperatures().cpu,
+            None
+        );
     }
 }

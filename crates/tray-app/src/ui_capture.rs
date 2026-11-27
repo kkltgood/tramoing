@@ -89,10 +89,10 @@ pub fn diagnostics_result(lang: crate::theme::Lang) -> Option<Result<std::path::
         return None;
     }
     match std::env::var("TM_CAPTURE_STATE").as_deref() {
-        Ok("settings-diagnostics-saved") => Some(Ok(tm_store::data_dir()
+        Ok("settings-diagnostics-saved" | "error-prompt-saved") => Some(Ok(tm_store::data_dir()
             .join("diagnostics")
             .join("Tramoing-diagnostics-20261125T095231Z-preview.txt"))),
-        Ok("settings-diagnostics-error") => Some(Err(lang
+        Ok("settings-diagnostics-error" | "error-prompt-failed") => Some(Err(lang
             .t("preview.could_not_write_the_report_check_the_destination")
             .into())),
         _ => None,
@@ -100,7 +100,11 @@ pub fn diagnostics_result(lang: crate::theme::Lang) -> Option<Result<std::path::
 }
 
 pub fn diagnostics_busy() -> bool {
-    enabled() && std::env::var("TM_CAPTURE_STATE").as_deref() == Ok("settings-diagnostics-busy")
+    enabled()
+        && matches!(
+            std::env::var("TM_CAPTURE_STATE").as_deref(),
+            Ok("settings-diagnostics-busy" | "error-prompt-busy")
+        )
 }
 
 /// 仅在隔离预览中打开一次指定的颜色面板。
@@ -165,7 +169,13 @@ pub fn preview_snapshot(
             }
         }
         Ok("empty") => None,
-        Ok("timeout") => Some(lang.t("preview.collector_reconnecting").into()),
+        Ok(
+            "timeout"
+            | "error-prompt"
+            | "error-prompt-saved"
+            | "error-prompt-busy"
+            | "error-prompt-failed",
+        ) => Some(lang.t("preview.collector_reconnecting").into()),
         Ok("disconnected") => Some(lang.t("preview.collector_disconnected").into()),
         _ => return snapshot,
     };

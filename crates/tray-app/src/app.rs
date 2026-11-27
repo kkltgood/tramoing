@@ -633,8 +633,20 @@ impl App {
                         app.view = View::Settings;
                         app.settings_tab = SettingsTab::Statistics;
                     }
-                    Ok("error-prompt") => {
-                        log::error!(target: "tramoing::preview", "采集连接暂时中断，正在尝试重新连接。");
+                    Ok(
+                        "error-prompt"
+                        | "error-prompt-recovered"
+                        | "error-prompt-saved"
+                        | "error-prompt-busy"
+                        | "error-prompt-failed",
+                    ) => {
+                        app.error_prompt = Some(crate::error_dialog::Prompt::new(vec![
+                            tm_diagnostics::ErrorNotice {
+                                target: "tramoing::sampler".into(),
+                                message: "采集持续中断，自动重连尚未恢复，请检查采集助手".into(),
+                            },
+                        ]));
+                        app.diagnostics_result = crate::ui_capture::diagnostics_result(lang);
                     }
                     Ok("update-ready") => {
                         let version = "1.2.3".to_owned();
@@ -910,7 +922,7 @@ impl App {
                 snapshot.windowed = Default::default();
                 let message = self.lang.t("ui.sampler_stopped_restart_the_app").to_owned();
                 if snapshot.error.as_ref() != Some(&message) {
-                    log::error!(target: "tramoing::sampler", "{message}");
+                    log::error!(target: "tramoing::sampler_stopped", "{message}");
                 }
                 snapshot.error = Some(message);
             }
@@ -1727,16 +1739,21 @@ impl App {
 
     fn show_error_prompt(&mut self, ctx: &egui::Context, p: &Palette, lang: Lang) {
         use crate::error_dialog::Action;
-        let Some(prompt) = &self.error_prompt else {
+        let Some(prompt) = &mut self.error_prompt else {
             return;
         };
-        match prompt.show(
-            ctx,
-            p,
-            lang,
-            self.diagnostics_job.is_some(),
-            self.diagnostics_result.as_ref(),
-        ) {
+        prompt.observe_sampler(
+            self.latest
+                .as_ref()
+                .and_then(|snapshot| snapshot.published_at),
+            self.latest
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.error.is_none()),
+        );
+        let busy = self.diagnostics_job.is_some();
+        #[cfg(debug_assertions)]
+        let busy = busy || crate::ui_capture::diagnostics_busy();
+        match prompt.show(ctx, p, lang, busy, self.diagnostics_result.as_ref()) {
             Action::None => {}
             Action::Export => self.export_diagnostics(ctx),
             Action::Dismiss => self.error_prompt = None,

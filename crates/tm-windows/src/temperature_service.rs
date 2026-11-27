@@ -18,10 +18,13 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
 use crate::network_control::{self, Server};
 use crate::temperature_protocol::{Request, Snapshot, Status, MAX_FRAME};
 
-const LEASE: Duration = Duration::from_secs(12);
+// Allow several request attempts even at the slowest (five-second) UI cadence.
+// This lease only controls worker lifetime; WATCHDOG independently rejects stale data.
+const LEASE: Duration = Duration::from_secs(20);
 const WATCHDOG: Duration = Duration::from_secs(15);
 const RETRY: Duration = Duration::from_secs(60);
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const REQUEST_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
 fn pipe_name() -> Result<String, String> {
     Ok(format!(
@@ -225,6 +228,7 @@ impl Supervisor {
     fn tick(&mut self) {
         if self.requested.is_none_or(|at| at.elapsed() > LEASE) {
             if self.worker.take().is_some() {
+                log::info!(target: "tramoing::temperature", "Sensor worker stopped: no temperature request within {} seconds", LEASE.as_secs());
                 self.retry = Instant::now();
             }
             self.reading = Snapshot::unavailable(Status::Starting, "Sensor worker idle");
@@ -293,10 +297,12 @@ impl Supervisor {
     }
 }
 
-/// Separate from ETW and firewall control. One short request renews a 12-second
+/// Separate from ETW and firewall control. One short request renews a 20-second
 /// lease, so hiding temperatures, closing the UI or a UI crash stops sampling.
 pub fn run() -> ! {
     let mut supervisor = Supervisor::new();
+    let mut request_warning_at: Option<Instant> = None;
+    let mut suppressed_requests = 0u64;
     loop {
         let server = pipe_name().and_then(|name| Server::create_named(&name));
         let server = match server {
@@ -330,7 +336,16 @@ pub fn run() -> ! {
                 network_control::read(handle, &mut [0; 1], deadline)
             };
             if let Err(error) = serve() {
-                log::debug!(target: "tramoing::temperature", "{error}");
+                let now = Instant::now();
+                if request_warning_at
+                    .is_none_or(|last| now.duration_since(last) >= REQUEST_WARNING_INTERVAL)
+                {
+                    log::warn!(target: "tramoing::temperature", "Temperature request failed (deadline {} ms, {} similar failures suppressed): {}", REQUEST_TIMEOUT.as_millis(), suppressed_requests, error.replace("网络控制", "温度采集"));
+                    request_warning_at = Some(now);
+                    suppressed_requests = 0;
+                } else {
+                    suppressed_requests = suppressed_requests.saturating_add(1);
+                }
             }
             unsafe { DisconnectNamedPipe(handle) };
         }
@@ -415,6 +430,25 @@ mod tests {
             },
             WAIT_OBJECT_0
         );
+    }
+
+    #[test]
+    fn transient_request_gap_does_not_restart_a_live_sensor_worker() {
+        let mut supervisor = Supervisor::new();
+        let worker = fake_worker("[void][Console]::ReadLine(); Start-Sleep -Seconds 60");
+        let pid = worker.child.id();
+        supervisor.worker = Some(worker);
+        // Includes a missed five-second poll, a one-second request deadline,
+        // the next five-second poll and some scheduling delay.
+        supervisor.requested = Some(Instant::now() - Duration::from_secs(13));
+        supervisor.tick();
+        assert_eq!(supervisor.worker.as_ref().unwrap().child.id(), pid);
+
+        supervisor.requested = Some(Instant::now() - LEASE - Duration::from_secs(1));
+        supervisor.tick();
+        assert!(supervisor.worker.is_none());
+        assert_eq!(supervisor.reading.temperatures().cpu, None);
+        assert_eq!(supervisor.reading.source, "Sensor worker idle");
     }
 
     #[test]

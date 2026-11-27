@@ -13,8 +13,83 @@ use tm_store::Store;
 const FLUSH_EVERY: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(4);
 const RESTART_AFTER: Duration = Duration::from_secs(15);
+const NOTIFY_AFTER: Duration = Duration::from_secs(30);
 pub const TREND_SAMPLES: usize = 60;
 type Deltas = Vec<(AppKey, u64, u64)>;
+
+struct SamplerIssue {
+    level: log::Level,
+    message: String,
+}
+
+/// 缺帧先显示恢复状态，留出一次自动重连的机会，再通知持续故障。
+/// 重建采样器不代表采集恢复；只有成功帧才能重置累计失采时间。
+struct SamplerHealth {
+    last_good: Instant,
+    attempt_started: Instant,
+    issue: Option<SamplerIssue>,
+    timeout_issue: bool,
+}
+
+impl SamplerHealth {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_good: now,
+            attempt_started: now,
+            issue: None,
+            timeout_issue: false,
+        }
+    }
+
+    fn started(&mut self, now: Instant) {
+        self.attempt_started = now;
+    }
+
+    fn recovered(&mut self, now: Instant) {
+        if self.issue.take().is_some() {
+            log::info!(target: "tramoing::sampler", "采集已恢复");
+        }
+        self.last_good = now;
+        self.timeout_issue = false;
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.issue.as_ref().map(|issue| issue.message.as_str())
+    }
+
+    fn record(&mut self, level: log::Level, message: String) {
+        if !self
+            .issue
+            .as_ref()
+            .is_some_and(|issue| issue.level == level && issue.message == message)
+        {
+            log::log!(target: "tramoing::sampler", level, "{message}");
+            self.issue = Some(SamplerIssue { level, message });
+        }
+    }
+
+    fn failed(&mut self, message: String) {
+        self.timeout_issue = false;
+        self.record(log::Level::Error, message);
+    }
+
+    fn timed_out(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_good);
+        // 等待新帧不能覆盖已报告的连接、权限或协议错误。
+        if elapsed >= STALE_AFTER && (self.issue.is_none() || self.timeout_issue) {
+            self.timeout_issue = true;
+            if elapsed >= NOTIFY_AFTER {
+                self.record(
+                    log::Level::Error,
+                    "采集持续中断，自动重连尚未恢复，请检查采集助手".into(),
+                );
+            } else {
+                self.record(log::Level::Warn, "采集暂时中断，正在重新连接".into());
+            }
+        }
+        now.duration_since(self.last_good.max(self.attempt_started)) >= RESTART_AFTER
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct SampleTimes {
@@ -53,6 +128,8 @@ pub struct WindowedRates {
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
+    /// UI recovery must be confirmed by a snapshot newer than its error notice.
+    pub published_at: Option<Instant>,
     pub rates: Vec<AppRate>,
     pub windowed: WindowedRates,
     pub total_rx: f64,
@@ -269,8 +346,7 @@ where
             let mut store_error = None;
             let mut last_flush = Instant::now() - FLUSH_EVERY;
             let mut last_prune = Instant::now();
-            let mut last_good = Instant::now();
-            let mut error = None;
+            let mut health = SamplerHealth::new(Instant::now());
             let mut day = (0, 0);
             let mut retry_at = Instant::now();
             let mut backoff = 1u64;
@@ -286,10 +362,10 @@ where
                             calc.reset_baseline();
                             calc.set_new_counters_start_at_zero(s.counters_start_at_zero());
                             sampler = Some(s);
-                            last_good = Instant::now();
+                            health.started(Instant::now());
                         }
                         Err(e) => {
-                            set_error(&mut error, e.to_string());
+                            health.failed(e.to_string());
                             retry_at = Instant::now() + Duration::from_secs(backoff);
                             backoff = (backoff * 2).min(30);
                         }
@@ -300,35 +376,33 @@ where
                 if let Some(s) = sampler.as_mut() {
                     match s.sample() {
                         Ok(samples) => {
-                            if error.is_some() {
-                                log::info!(target: "tramoing::sampler", "采集已恢复");
-                            }
                             if s.take_reset() {
                                 calc.reset_baseline();
                                 trend.clear();
                             }
-                            last_good = Instant::now();
-                            error = None;
+                            let received_at = Instant::now();
+                            health.recovered(received_at);
                             backoff = 1;
-                            let times = sample_times(s.sampled_at(), last_good, SystemTime::now());
+                            let times =
+                                sample_times(s.sampled_at(), received_at, SystemTime::now());
                             rates = Some(calc.update(times.source, &samples));
                             let deltas = calc.take_deltas();
                             tracker.push_at(times.observed, &deltas);
                             pending.add(times.wall, &deltas);
                         }
                         Err(SamplerError::Timeout) => {
-                            if last_good.elapsed() >= STALE_AFTER {
-                                set_error(&mut error, "采集暂时中断，正在重新连接".into());
+                            let restart = health.timed_out(Instant::now());
+                            if health.error().is_some() {
                                 calc.clear_rates();
                             }
-                            if last_good.elapsed() >= RESTART_AFTER {
+                            if restart {
                                 sampler = None;
                                 retry_at = Instant::now() + Duration::from_secs(backoff);
                                 backoff = (backoff * 2).min(30);
                             }
                         }
                         Err(e) => {
-                            set_error(&mut error, e.to_string());
+                            health.failed(e.to_string());
                             calc.clear_rates();
                             sampler = None;
                             retry_at = Instant::now() + Duration::from_secs(backoff);
@@ -346,8 +420,8 @@ where
                     if !mock {
                         return tm_windows::connections::for_app(app).map_err(|e| e.to_string());
                     }
-                    if let Some(message) = &error {
-                        return Err(message.clone());
+                    if let Some(message) = health.error() {
+                        return Err(message.to_owned());
                     }
                     sampler
                         .as_mut()
@@ -399,7 +473,7 @@ where
                 }
 
                 let (total_rx, total_tx) = calc.total_bps();
-                if error.is_some() {
+                if health.error().is_some() {
                     // 中断前后的点不连接，避免把缺失采样画成连续的流量。
                     trend.clear();
                 } else if rates.is_some() {
@@ -410,6 +484,7 @@ where
                 }
                 let (session_rx, session_tx) = calc.session_total();
                 let snapshot = Snapshot {
+                    published_at: Some(Instant::now()),
                     rates: rates.unwrap_or_else(|| calc.snapshot()),
                     windowed: WindowedRates {
                         min1: to_rates(tracker.rates(60)),
@@ -424,7 +499,7 @@ where
                     session_tx,
                     day_rx: day.0,
                     day_tx: day.1,
-                    error: error.clone(),
+                    error: health.error().map(str::to_owned),
                     mock,
                     store_error: store_error.clone(),
                 };
@@ -463,7 +538,7 @@ fn set_error(slot: &mut Option<String>, message: String) {
 }
 
 fn log_error(message: &str) {
-    log::error!(target: "tramoing::sampler", "{message}");
+    log::error!(target: "tramoing::store", "{message}");
 }
 
 fn to_rates(rows: Vec<(AppKey, f64, f64)>) -> Vec<AppRate> {
@@ -520,6 +595,76 @@ fn build_sampler(mock: bool) -> Result<Box<dyn Sampler>, SamplerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brief_sampler_stalls_warn_and_clear_on_the_next_successful_frame() {
+        let start = Instant::now();
+        let mut health = SamplerHealth::new(start);
+        for millis in [500, 1000, 3999] {
+            assert!(!health.timed_out(start + Duration::from_millis(millis)));
+            assert!(health.error().is_none());
+        }
+        assert!(!health.timed_out(start + Duration::from_secs(4)));
+        assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Warn);
+        health.recovered(start + Duration::from_secs(5));
+        assert!(health.error().is_none());
+
+        // 多次短暂停顿分别计时，不能累积成一次持续故障。
+        for seconds in [9, 14, 19, 24, 29, 34] {
+            assert!(!health.timed_out(start + Duration::from_secs(seconds)));
+            assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Warn);
+            health.recovered(start + Duration::from_secs(seconds + 1));
+            assert!(health.error().is_none());
+        }
+    }
+
+    #[test]
+    fn prolonged_sampler_stall_escalates_across_restarts_and_resets_after_data_returns() {
+        let start = Instant::now();
+        let mut health = SamplerHealth::new(start);
+        assert!(health.timed_out(start + Duration::from_secs(15)));
+        assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Warn);
+        health.started(start + Duration::from_secs(16));
+        assert!(!health.timed_out(start + Duration::from_millis(29_999)));
+        assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Warn);
+        assert!(!health.timed_out(start + Duration::from_secs(30)));
+        assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Error);
+        assert!(health.timed_out(start + Duration::from_secs(31)));
+        health.started(start + Duration::from_secs(33));
+        assert!(!health.timed_out(start + Duration::from_secs(34)));
+        assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Error);
+
+        health.recovered(start + Duration::from_secs(35));
+        assert!(health.error().is_none());
+        assert!(!health.timed_out(start + Duration::from_millis(38_999)));
+        assert!(health.error().is_none());
+        assert!(!health.timed_out(start + Duration::from_secs(39)));
+        assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Warn);
+    }
+
+    #[test]
+    fn actual_sampler_failure_is_reported_immediately_and_keeps_its_cause_during_retry() {
+        let start = Instant::now();
+        for failure in [
+            SamplerError::Source("无法访问采集助手；Win32 错误 5".into()),
+            SamplerError::Source("采集消息格式无效".into()),
+            SamplerError::Closed,
+            SamplerError::Spawn(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ] {
+            let mut health = SamplerHealth::new(start);
+            let message = failure.to_string();
+            health.failed(message.clone());
+            assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Error);
+            health.started(start + Duration::from_secs(1));
+            for seconds in [4, 15, 30, 60] {
+                health.timed_out(start + Duration::from_secs(seconds));
+                assert_eq!(health.error(), Some(message.as_str()));
+                assert_eq!(health.issue.as_ref().unwrap().level, log::Level::Error);
+            }
+            health.recovered(start + Duration::from_secs(61));
+            assert!(health.error().is_none());
+        }
+    }
 
     #[test]
     fn slow_ui_receives_only_the_latest_snapshot_and_observes_shutdown() {

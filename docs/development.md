@@ -33,7 +33,7 @@ CI 在 Windows 和 macOS 执行这些检查，并检查 Windows ARM64 以及 mac
 | `packaging` | Windows / macOS 打包和更新清单脚本 |
 | `scripts` | macOS 打包、Windows 诊断及原生运行验证 |
 
-诊断日志在打开窗口和数据库之前初始化；主程序和 Windows 助手分别写 `ui.log`、`helper.log`，每份最多 1 MiB 并保留三份备份。日志不依赖 SQLite，后台线程 panic 也经过同一个 hook。`--export-diagnostics` 在迁移、单实例锁和窗口创建之前执行；UI 导出运行在后台线程，系统检查有超时，Windows 检查脚本通过 `include_str!` 编入程序，不要求用户另行下载脚本。回归测试覆盖轮换、并发、子进程 panic、数据库损坏时导出及报告内容限制。ERROR 记录进入有界通知队列，5 分钟内相同来源和内容去重；界面线程展示确认弹框，导出失败仅更新当前界面，避免递归通知。启动失败使用原生提示；GUI 进程的 panic hook 在同步日志后启动 `--report-error` 独立报告进程，绕过安装、迁移和单实例锁，启动失败则保留崩溃标记供下次打开提示。命令行导出/自启操作不弹框。
+诊断日志在打开窗口和数据库之前初始化；主程序和 Windows 助手分别写 `ui.log`、`helper.log`，每份最多 1 MiB 并保留三份备份。日志不依赖 SQLite，后台线程 panic 也经过同一个 hook。`--export-diagnostics` 在迁移、单实例锁和窗口创建之前执行；UI 导出运行在后台线程，系统检查有超时，Windows 检查脚本通过 `include_str!` 编入程序，不要求用户另行下载脚本。回归测试覆盖轮换、并发、子进程 panic、数据库损坏时导出及报告内容限制。采集缺帧满 4 秒会清除过期速率并记录 WARN、显示恢复状态，满 15 秒重建采样器；累计 30 秒仍未收到成功帧才升级为 ERROR，计时跨重建保留。连接、权限、协议和启动错误仍立即报告；历史持久化错误单独使用 `tramoing::store` 来源。采集专属弹框会在成功采样后显示“采集已恢复”，并保留原错误供导出。ERROR 记录进入有界通知队列，5 分钟内相同来源和内容去重；界面线程展示确认弹框，导出失败仅更新当前界面，避免递归通知。启动失败使用原生提示；GUI 进程的 panic hook 在同步日志后启动 `--report-error` 独立报告进程，绕过安装、迁移和单实例锁，启动失败则保留崩溃标记供下次打开提示。命令行导出/自启操作不弹框。
 
 采样器向核心层提供累计值，核心层计算速率并按应用归并。采样线程保留最新快照供界面读取，每 5 秒将增量写入历史库。速率、窗口与历史使用同一源采样时间；积压帧按其年龄换算到本机日历时间，回填原秒桶和分钟。已经超出窗口的数据仍写入历史，但不会重新进入当前窗口或延长提醒；没有源时间戳时退回接收时间。导出和更新下载在独立后台任务中执行。
 
@@ -156,7 +156,7 @@ TM_DATA_DIR="$PWD/target/demo-data" \
 | `TM_CAPTURE_STATE=list\|empty\|timeout\|disconnected` | 配合截图模式验证无底部提示的列表、空状态和错误布局 |
 | `TM_CAPTURE_STATE=network-add\|network-add-invalid\|network-add-offline` | Windows 添加应用面板：默认表单、路径错误、联网助手离线；仅注入演示状态，不修改系统网络规则 |
 | `TM_CAPTURE_STATE=settings-general\|settings-statusbar\|settings-statistics` | 设置页三个页签；可配合 `TM_SETTINGS_SCROLL` 检查长内容，Windows 截图实例不创建任务栏统计项 |
-| `TM_CAPTURE_STATE=error-prompt` | 隔离演示实例注入可恢复错误，验证弹框及导出交互 |
+| `TM_CAPTURE_STATE=error-prompt\|error-prompt-recovered\|error-prompt-saved\|error-prompt-busy\|error-prompt-failed` | 隔离演示实例验证采集中断、恢复和日志导出状态，不触发真实故障 |
 | `TM_CAPTURE_STATE=update-ready\|update-download-failed` | 离线预览更新就绪与手动下载提示框，可配合临时设置切换语言和主题；不下载或安装软件 |
 | `TM_CAPTURE_STATE=settings-color-download\|settings-color-gpu` | 打开下载或 GPU 选色面板，检查深浅主题和中英文布局 |
 
@@ -377,7 +377,7 @@ Windows CPU 内置采集由 `sensors/Tramoing.Sensors` 实现，固定 LibreHard
 
 ARM64 系统（包括运行 x64 模拟程序）不显示内置组件下载入口、不构建该 worker，也不安装 PawnIO；可用的 WDDM/WMI 温度来源保留。下载和安装状态独立于温度读数：文件就绪不代表硬件受支持，仍需以实际采样状态为准。
 
-温度管道 `Tramoing-Temperature-<SID>-v1` 沿用网络控制的账户 ACL、远程连接拒绝、双端程序路径及助手提权验证，请求只有 Read 和重新检查固定组件的 Refresh，不能传入路径、参数或安装命令。助手在独立线程管理 worker，worker 先等待握手，再进入硬件库；Windows Job Object 确保助手终止时关闭子进程。协议是 4 字节长度加 UTF-8 JSON，worker 帧上限 8 KiB；采样约 2 秒，15 秒 watchdog、60 秒失败退避、12 秒 UI 请求租期。关闭显示不会保留最后一次有效温度。仅开启 LHM 的 CPU 和 GPU 硬件组，不扫描主板 EC、磁盘，也不写入风扇控制。CPU 与 GPU 独立采样，GPU 查询异常不清除正常 CPU 读数；任一温度有效即可返回 ready，另一项仍保持空值。
+温度管道 `Tramoing-Temperature-<SID>-v1` 沿用网络控制的账户 ACL、远程连接拒绝、双端程序路径及助手提权验证，请求只有 Read 和重新检查固定组件的 Refresh，不能传入路径、参数或安装命令。助手在独立线程管理 worker，worker 先等待握手，再进入硬件库；Windows Job Object 确保助手终止时关闭子进程。协议是 4 字节长度加 UTF-8 JSON，worker 帧上限 8 KiB；采样约 2 秒，15 秒 watchdog、60 秒 worker 失败退避、20 秒 UI 请求租期。温度 IPC 请求期限为 1 秒，读取失败立即清空读数并在下一次性能采样重试（最短 1 秒），不沿用失效温度；服务端请求失败警告每 30 秒最多记录一条，并记录租约回收原因。关闭显示不会保留最后一次有效温度。仅开启 LHM 的 CPU 和 GPU 硬件组，不扫描主板 EC、磁盘，也不写入风扇控制。CPU 与 GPU 独立采样，GPU 查询异常不清除正常 CPU 读数；任一温度有效即可返回 ready，另一项仍保持空值。
 
 Windows GPU 按 WDDM → 内置 LHM GPU → 可选 WMI 的顺序选择读数。WDDM 使用 D3DKMT_ADAPTER_PERFDATA（0.1°C 单位）；LHM 的 NVIDIA 路径使用 NVAPI，可补充旧系统/驱动没有 WDDM 温度的情形。CPU 或 GPU 仍缺少读数时，可选 WMI 桥在独立 PowerShell 进程查询已有 LHM/OHM，使用限长快照与 15 秒超时；内置 CPU 与内置 GPU/WDDM 已完整时停止 WMI。内置 GPU 与 CPU 共用现有的 Windows x64、管理员助手和 PawnIO 前置检查。ARM64 及在 ARM64 上模拟运行的 x64 程序不进入 LHM 的 CPUID 路径；当前内置 CPU 适配覆盖上游支持的 Intel/AMD，老 AMD Family 10h–16h 暂无适配，必须区分构建覆盖与传感器实机覆盖。
 
