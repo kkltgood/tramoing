@@ -22,6 +22,8 @@ mod diagnostics;
 mod engine;
 mod error_dialog;
 mod export;
+#[cfg(windows)]
+mod game_overlay;
 mod i18n;
 mod icon;
 mod icons;

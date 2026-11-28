@@ -1,6 +1,8 @@
 //! 托盘弹窗主体：状态栏图标 + 无边框弹出面板。
 
 mod connections_ui;
+#[cfg(windows)]
+mod game_overlay_ui;
 mod update_ui;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -164,6 +166,8 @@ enum SettingsTab {
     StatusBar,
     Statistics,
     General,
+    #[cfg(windows)]
+    GameOverlay,
 }
 
 impl SettingsTab {
@@ -172,6 +176,8 @@ impl SettingsTab {
             Self::StatusBar => 0,
             Self::Statistics => 1,
             Self::General => 2,
+            #[cfg(windows)]
+            Self::GameOverlay => 3,
         }
     }
 }
@@ -241,6 +247,14 @@ enum MenuItem {
 static TRAY_TX: OnceLock<Sender<TrayEvent>> = OnceLock::new();
 static CTX: OnceLock<egui::Context> = OnceLock::new();
 
+#[cfg(any(windows, test))]
+fn take_overlay_settings_save(pending: &mut bool, pointer_down: bool, force: bool) -> bool {
+    if pointer_down && !force {
+        return false;
+    }
+    std::mem::take(pending)
+}
+
 pub struct App {
     rx: engine::Engine,
     device_ip: crate::device_ip::Monitor,
@@ -260,6 +274,11 @@ pub struct App {
     speed_tray_retry: Instant,
     #[cfg(any(target_os = "macos", windows))]
     performance: crate::performance::Monitor,
+    #[cfg(windows)]
+    game_overlay: crate::game_overlay::Runtime,
+    /// Preview overlay settings continuously, but commit a pointer drag once.
+    #[cfg(windows)]
+    overlay_settings_pending: bool,
     #[cfg(target_os = "macos")]
     performance_tray: Option<tm_macos::StatusItem>,
     #[cfg(target_os = "macos")]
@@ -485,6 +504,10 @@ impl App {
             speed_tray_retry: Instant::now(),
             #[cfg(any(target_os = "macos", windows))]
             performance,
+            #[cfg(windows)]
+            game_overlay: crate::game_overlay::Runtime::new(ctx.clone()),
+            #[cfg(windows)]
+            overlay_settings_pending: false,
             #[cfg(target_os = "macos")]
             performance_tray: None,
             #[cfg(target_os = "macos")]
@@ -636,6 +659,11 @@ impl App {
                     Ok("settings-statistics") => {
                         app.view = View::Settings;
                         app.settings_tab = SettingsTab::Statistics;
+                    }
+                    #[cfg(windows)]
+                    Ok("settings-overlay" | "settings-overlay-color") => {
+                        app.view = View::Settings;
+                        app.settings_tab = SettingsTab::GameOverlay;
                     }
                     Ok(
                         "error-prompt"
@@ -876,6 +904,7 @@ impl App {
     /// 展开时再把窗口搬回来。
     #[cfg(windows)]
     fn park_window(&mut self, ctx: &egui::Context) {
+        self.flush_overlay_settings(false, true);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             PARKED_X, PARKED_Y,
         )));
@@ -1314,6 +1343,11 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(windows)]
+        {
+            self.flush_overlay_settings(false, true);
+            self.game_overlay.shutdown();
+        }
         // Remove native status items while the UI thread and its windows are
         // still alive, before Engine::drop waits for the final history flush.
         // A later installer timeout must not leave an Explorer ghost icon.
@@ -1350,6 +1384,8 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.sync_tray_theme();
         self.drain_engine();
+        #[cfg(windows)]
+        self.sync_game_overlay(ctx);
         #[cfg(windows)]
         if let Some(message) = self.network_access.tick(ctx, self.lang) {
             self.toast = Some((message, Instant::now()));
@@ -1590,6 +1626,10 @@ impl eframe::App for App {
         }
 
         self.draw(ctx);
+        // Draw first so a slider's final release position is included in this
+        // single save. Keyboard edits and ordinary toggles commit immediately.
+        #[cfg(windows)]
+        self.flush_overlay_settings(ctx.input(|input| input.pointer.any_down()), !self.visible);
         self.rx.connections.select(
             (self.visible && self.view == View::Connections)
                 .then(|| self.connection_app.clone())
@@ -1963,11 +2003,23 @@ impl App {
                         self.status_bar_options(ui, p, lang, &mut changed);
                     }
                     SettingsTab::Statistics => self.statistics_options(ui, p, lang, &mut changed),
+                    #[cfg(windows)]
+                    SettingsTab::GameOverlay => {
+                        self.game_overlay_options(ui, p, lang, &mut changed)
+                    }
                 }
             });
 
         self.settings_status(ui, p, lang, status_rect);
         if changed {
+            #[cfg(windows)]
+            if self.settings_tab == SettingsTab::GameOverlay {
+                // Runtime reads these fields on every update. No taskbar/theme
+                // reconfiguration or synchronous file write is needed mid-drag.
+                self.overlay_settings_pending = true;
+                ui.ctx().request_repaint();
+                return;
+            }
             self.apply_settings(ui.ctx());
         }
     }
@@ -2742,6 +2794,11 @@ impl App {
     /// 设置改动后立刻生效并落盘。
     fn apply_settings(&mut self, ctx: &egui::Context) {
         self.settings.save();
+        #[cfg(windows)]
+        {
+            // This full settings write includes any earlier overlay changes.
+            self.overlay_settings_pending = false;
+        }
         ctx.set_theme(theme_pref(self.settings.theme));
         self.lang = crate::i18n::resolve(self.settings.lang);
         self.retention
@@ -2764,6 +2821,13 @@ impl App {
         self.sync_tray_icon();
         #[cfg(windows)]
         self.sync_badge(ctx);
+    }
+
+    #[cfg(windows)]
+    fn flush_overlay_settings(&mut self, pointer_down: bool, force: bool) {
+        if take_overlay_settings_save(&mut self.overlay_settings_pending, pointer_down, force) {
+            self.settings.save();
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui, p: &Palette, lang: Lang) {
@@ -3985,6 +4049,8 @@ fn settings_tabs(ui: &mut egui::Ui, p: &Palette, lang: Lang, current: &mut Setti
         ),
         (SettingsTab::Statistics, lang.t("settings.statistics")),
         (SettingsTab::General, lang.t("settings.general")),
+        #[cfg(windows)]
+        (SettingsTab::GameOverlay, lang.t("overlay.tab")),
     ];
     let width = (bar.width() - 6.0) / options.len() as f32;
     // 先处理选择，再画一个连续滑动的选中背景；快速连点从当前位置续接。
@@ -5699,6 +5765,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlay_settings_drag_commits_final_release_value_once() {
+        let mut pending = false;
+        assert!(!take_overlay_settings_save(&mut pending, false, false));
+        let mut saved = Vec::new();
+        for (value, pointer_down) in [(20, true), (35, true), (60, true), (75, false)] {
+            // Settings are updated by the controls before the end-of-frame flush.
+            pending = true;
+            if take_overlay_settings_save(&mut pending, pointer_down, false) {
+                saved.push(value);
+            }
+        }
+        assert_eq!(saved, [75]);
+        assert!(!take_overlay_settings_save(&mut pending, false, false));
+
+        // Keyboard edits and switches have no held pointer and commit immediately.
+        pending = true;
+        assert!(take_overlay_settings_save(&mut pending, false, false));
+        assert!(!pending);
+    }
+
+    #[test]
+    fn overlay_settings_close_or_exit_preserves_an_unreleased_drag() {
+        let mut pending = true;
+        assert!(!take_overlay_settings_save(&mut pending, true, false));
+        assert!(take_overlay_settings_save(&mut pending, true, true));
+        assert!(!take_overlay_settings_save(&mut pending, false, true));
+    }
+
+    #[test]
     fn visibility_switch_preserves_the_last_panel_entry() {
         for (initial, other_visible, expected) in [
             (false, false, true),
@@ -6659,8 +6754,13 @@ mod tests {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE.inner_margin(PANEL_PADDING))
                             .show(ctx, |ui| {
-                                tab_at =
-                                    egui::pos2(ui.max_rect().center().x, ui.cursor().top() + 17.0);
+                                let tab_count = if cfg!(windows) { 4.0 } else { 3.0 };
+                                tab_at = egui::pos2(
+                                    ui.max_rect().left()
+                                        + 3.0
+                                        + (ui.available_width() - 6.0) / tab_count * 1.5,
+                                    ui.cursor().top() + 17.0,
+                                );
                                 tab_id = ui.id().with(("settings-tab", SettingsTab::General));
                                 settings_tabs(ui, &p, Lang::EN, &mut tab);
                                 ui.add_space(12.0);

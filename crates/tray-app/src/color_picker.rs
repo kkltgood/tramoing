@@ -110,13 +110,89 @@ pub fn controls(
         *current = None;
     }
 
+    show_active_picker(ui, state_id, p, lang, label, current, automatic);
+    *current != before
+}
+
+/// 紧凑入口；完整的色盘、十六进制输入和恢复默认操作仍在共用弹窗中。
+/// 调用方用稳定的 `push_id` 区分不同指标，并预留约 102 × 28 的矩形。
+#[cfg(windows)]
+pub fn compact_controls(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    p: &Palette,
+    lang: Lang,
+    label: &str,
+    current: &mut Option<Rgb>,
+    automatic: Rgb,
+) -> bool {
+    let before = *current;
+    let state_id = ui.id().with("color-picker");
+    let color = current.unwrap_or(automatic);
+    let hex = color.to_hex();
+    let chip = Rect::from_center_size(
+        rect.center(),
+        Vec2::new(rect.width(), CONTROL_H.min(rect.height())),
+    );
+    let response = ui
+        .interact(chip, ui.id().with("compact-color"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("{label} · {}", lang.t("color.choose_color")));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::ColorButton,
+            ui.is_enabled(),
+            format!("{label}: {hex}"),
+        )
+    });
+    ui.painter().rect(
+        chip,
+        7.0,
+        mix(p.surface, p.chip, 0.55),
+        Stroke::new(
+            0.8_f32,
+            if response.hovered() {
+                p.accent
+            } else {
+                p.border
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let dot = egui::pos2(chip.left() + 13.0, chip.center().y);
+    ui.painter().circle_filled(dot, 5.0, color32(color));
+    ui.painter()
+        .circle_stroke(dot, 5.0, Stroke::new(0.7_f32, p.border));
+    ui.painter().with_clip_rect(chip.shrink(3.0)).text(
+        egui::pos2(chip.left() + 25.0, chip.center().y),
+        egui::Align2::LEFT_CENTER,
+        hex,
+        FontId::monospace(11.0),
+        p.text,
+    );
+    surface::focus(ui.painter(), chip, &response, p);
+    if response.clicked() {
+        ui.data_mut(|data| data.insert_temp(state_id, PickerState::new(color)));
+    }
+    show_active_picker(ui, state_id, p, lang, label, current, automatic);
+    *current != before
+}
+
+fn show_active_picker(
+    ui: &mut egui::Ui,
+    state_id: Id,
+    p: &Palette,
+    lang: Lang,
+    label: &str,
+    current: &mut Option<Rgb>,
+    automatic: Rgb,
+) {
     #[cfg(debug_assertions)]
     if crate::ui_capture::open_color_picker(ui.ctx(), label, lang) {
         ui.data_mut(|data| {
             data.insert_temp(state_id, PickerState::new(current.unwrap_or(automatic)));
         });
     }
-
     let state = ui.data(|data| data.get_temp::<PickerState>(state_id));
     if let Some(mut state) = state {
         state.sync(current.unwrap_or(automatic));
@@ -138,7 +214,6 @@ pub fn controls(
             }
         });
     }
-    *current != before
 }
 
 #[allow(clippy::too_many_arguments)]

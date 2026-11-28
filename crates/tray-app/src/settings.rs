@@ -32,6 +32,155 @@ pub enum LangMode {
     Selected(Lang),
 }
 
+/// 游戏悬浮窗单独保存显示偏好，不改变任务栏或菜单栏的开关。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameOverlaySettings {
+    pub enabled: bool,
+    pub show_network: bool,
+    pub show_cpu: bool,
+    pub show_gpu: bool,
+    pub show_temperature: bool,
+    pub show_fps: bool,
+    /// 锁定时鼠标穿透；解除锁定后可拖动窗口。
+    pub locked: bool,
+    /// 虚拟桌面物理像素锚点，用于保留显示器选择；允许负坐标。
+    pub x: i32,
+    pub y: i32,
+    /// 屏幕可移动范围的相对位置，单位为 0.01%，10000 表示贴右/下边缘。
+    pub x_percent: u16,
+    pub y_percent: u16,
+    pub font_size: u16,
+    pub opacity: u8,
+    /// 悬浮窗专用配色；None 使用深色背景默认色，不继承任务栏自定义色。
+    pub colors: DisplayColors,
+    pub fps_color: Option<Rgb>,
+}
+
+impl Default for GameOverlaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_network: true,
+            show_cpu: true,
+            show_gpu: true,
+            show_temperature: true,
+            show_fps: true,
+            locked: true,
+            x: 24,
+            y: 24,
+            x_percent: 200,
+            y_percent: 200,
+            font_size: 16,
+            opacity: 80,
+            colors: DisplayColors::default(),
+            fps_color: None,
+        }
+    }
+}
+
+impl GameOverlaySettings {
+    fn parse_setting(&mut self, key: &str, value: &str) {
+        let boolean = match key {
+            "enabled" => Some(&mut self.enabled),
+            "show_network" => Some(&mut self.show_network),
+            "show_cpu" => Some(&mut self.show_cpu),
+            "show_gpu" => Some(&mut self.show_gpu),
+            "show_temperature" => Some(&mut self.show_temperature),
+            "show_fps" => Some(&mut self.show_fps),
+            "locked" => Some(&mut self.locked),
+            _ => None,
+        };
+        if let Some(destination) = boolean {
+            if let Some(value) = parse_bool(value) {
+                *destination = value;
+            }
+            return;
+        }
+        match key {
+            "x" | "y" => {
+                if let Ok(value) = value.parse::<i32>() {
+                    if key == "x" {
+                        self.x = value;
+                    } else {
+                        self.y = value;
+                    }
+                }
+            }
+            "font_size" => {
+                if let Ok(value @ 12..=32) = value.parse::<u16>() {
+                    self.font_size = value;
+                }
+            }
+            "x_percent" | "y_percent" => {
+                if let Ok(value @ 0..=10_000) = value.parse::<u16>() {
+                    if key == "x_percent" {
+                        self.x_percent = value;
+                    } else {
+                        self.y_percent = value;
+                    }
+                }
+            }
+            "opacity" => {
+                if let Ok(value @ 20..=100) = value.parse::<u8>() {
+                    self.opacity = value;
+                }
+            }
+            "color_download" | "color_upload" | "color_cpu" | "color_gpu" | "color_fps" => {
+                let color = if value.eq_ignore_ascii_case("auto") {
+                    Some(None)
+                } else {
+                    Rgb::from_hex(value).map(Some)
+                };
+                if let Some(color) = color {
+                    match key {
+                        "color_download" => self.colors.download = color,
+                        "color_upload" => self.colors.upload = color,
+                        "color_cpu" => self.colors.cpu = color,
+                        "color_gpu" => self.colors.gpu = color,
+                        _ => self.fps_color = color,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn serialize(&self) -> String {
+        let mut text = String::new();
+        for (key, enabled) in [
+            ("enabled", self.enabled),
+            ("show_network", self.show_network),
+            ("show_cpu", self.show_cpu),
+            ("show_gpu", self.show_gpu),
+            ("show_temperature", self.show_temperature),
+            ("show_fps", self.show_fps),
+            ("locked", self.locked),
+        ] {
+            text.push_str(&format!(
+                "game_overlay_{key}={}\n",
+                if enabled { "on" } else { "off" }
+            ));
+        }
+        text.push_str(&format!(
+            "game_overlay_x={}\ngame_overlay_y={}\ngame_overlay_x_percent={}\ngame_overlay_y_percent={}\ngame_overlay_font_size={}\ngame_overlay_opacity={}\n",
+            self.x, self.y, self.x_percent, self.y_percent, self.font_size, self.opacity
+        ));
+        for (key, color) in [
+            ("download", self.colors.download),
+            ("upload", self.colors.upload),
+            ("cpu", self.colors.cpu),
+            ("gpu", self.colors.gpu),
+            ("fps", self.fps_color),
+        ] {
+            text.push_str(&format!(
+                "game_overlay_color_{key}={}\n",
+                serialize_color(color)
+            ));
+        }
+        text
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UpdateCheckResult {
@@ -71,6 +220,7 @@ pub struct Settings {
     pub performance_temperature: bool,
     /// 性能采样间隔，只提供 1 / 2 / 5 秒。
     pub performance_interval: u64,
+    pub game_overlay: GameOverlaySettings,
     /// 两个平台共用的四项显示色；未配置时继续跟随系统明暗主题。
     pub display_colors: DisplayColors,
     /// 启动后自动检查新版本。
@@ -103,6 +253,7 @@ impl Default for Settings {
             performance_color: true,
             performance_temperature: true,
             performance_interval: 2,
+            game_overlay: GameOverlaySettings::default(),
             display_colors: DisplayColors::default(),
             update_check: true,
             last_check: 0,
@@ -200,6 +351,10 @@ impl Settings {
                 continue;
             };
             let (k, v) = (k.trim(), v.trim());
+            if let Some(key) = k.strip_prefix("game_overlay_") {
+                s.game_overlay.parse_setting(key, v);
+                continue;
+            }
             match k {
                 "tray_mode" => {
                     if let Some(visibility) = parse_legacy_tray(v) {
@@ -388,7 +543,7 @@ impl Settings {
              gpu_color={}\n\
              update_check={}\n\
              last_check={}\n\
-             last_check_result={}\n",
+             last_check_result={}\n{}",
             self.max_apps,
             serde_json::to_string(&self.pinned_apps).expect("application keys are strings"),
             self.retention_days,
@@ -416,6 +571,7 @@ impl Settings {
             self.last_check,
             serde_json::to_string(&self.last_check_result)
                 .expect("update check results are strings"),
+            self.game_overlay.serialize(),
         )
     }
 }
@@ -553,6 +709,7 @@ mod tests {
             performance_color: false,
             performance_temperature: false,
             performance_interval: 5,
+            game_overlay: GameOverlaySettings::default(),
             display_colors: DisplayColors {
                 download: Some(Rgb(255, 123, 0)),
                 upload: Some(Rgb(1, 2, 3)),
@@ -897,6 +1054,157 @@ mod tests {
             );
         }
         assert!(!Settings::parse("performance_enabled=maybe").performance_enabled);
+    }
+
+    #[test]
+    fn game_overlay_is_opt_in_and_independent_from_taskbar_preferences() {
+        for performance in ["on", "off"] {
+            let legacy = Settings::parse(&format!(
+                "performance_enabled={performance}\nperformance_temperature=off\ntray_badge=off"
+            ));
+            assert_eq!(legacy.game_overlay, GameOverlaySettings::default());
+            let enabled =
+                Settings::parse(&format!("{}game_overlay_enabled=on\n", legacy.serialize()));
+            assert!(enabled.game_overlay.enabled);
+            assert_eq!(enabled.performance_enabled, legacy.performance_enabled);
+            assert_eq!(
+                enabled.performance_temperature,
+                legacy.performance_temperature
+            );
+            assert_eq!(enabled.tray_badge, legacy.tray_badge);
+            assert_eq!(enabled.tray_icon, legacy.tray_icon);
+            assert_eq!(enabled.display_colors, legacy.display_colors);
+        }
+        // A click-through overlay does not replace the entry needed to reopen settings.
+        let settings = Settings::parse(
+            "game_overlay_enabled=on\ntray_icon=off\ntray_badge=off\nperformance_enabled=off",
+        );
+        assert!(settings.tray_icon);
+        assert!(settings.game_overlay.enabled && settings.game_overlay.locked);
+    }
+
+    #[test]
+    fn game_overlay_restores_each_preference_and_negative_monitor_positions() {
+        for (font_size, opacity) in [(12, 20), (32, 100)] {
+            let settings = Settings {
+                game_overlay: GameOverlaySettings {
+                    enabled: true,
+                    show_network: false,
+                    show_cpu: false,
+                    show_gpu: false,
+                    show_temperature: false,
+                    show_fps: false,
+                    locked: false,
+                    x: -3840,
+                    y: -1080,
+                    x_percent: 1250,
+                    y_percent: 8750,
+                    font_size,
+                    opacity,
+                    colors: DisplayColors::default(),
+                    fps_color: None,
+                },
+                ..Settings::default()
+            };
+            let saved = settings.serialize();
+            assert_eq!(saved.matches("game_overlay_enabled=").count(), 1);
+            assert_eq!(Settings::parse(&saved), settings);
+            let disabled = Settings::parse(&format!("{saved}game_overlay_enabled=off\n"));
+            assert!(!disabled.game_overlay.enabled);
+            assert_eq!(disabled.game_overlay.x, -3840);
+            assert_eq!(disabled.game_overlay.x_percent, 1250);
+            assert_eq!(disabled.game_overlay.y_percent, 8750);
+            assert!(!disabled.game_overlay.show_network);
+            assert_eq!(disabled.game_overlay.opacity, opacity);
+        }
+    }
+
+    #[test]
+    fn game_overlay_rejects_invalid_values_and_preserves_last_valid_values() {
+        let invalid = "game_overlay_enabled=maybe\n\
+            game_overlay_show_network=invalid\ngame_overlay_show_cpu=invalid\n\
+            game_overlay_show_gpu=invalid\ngame_overlay_show_temperature=invalid\n\
+            game_overlay_show_fps=invalid\ngame_overlay_locked=invalid\n\
+            game_overlay_x=2147483648\ngame_overlay_y=-2147483649\n\
+            game_overlay_x_percent=-1\ngame_overlay_y_percent=10001\n\
+            game_overlay_x_percent=65536\ngame_overlay_y_percent=2.5\n\
+            game_overlay_font_size=11\ngame_overlay_font_size=33\n\
+            game_overlay_opacity=19\ngame_overlay_opacity=101\n\
+            game_overlay_font_size=-1\ngame_overlay_opacity=256\n\
+            game_overlay_font_size=NaN\ngame_overlay_opacity=0.5\n";
+        assert_eq!(Settings::parse(invalid), Settings::default());
+        let valid = "game_overlay_enabled=1\ngame_overlay_show_network=0\n\
+            game_overlay_show_cpu=false\ngame_overlay_show_gpu=off\n\
+            game_overlay_show_temperature=0\ngame_overlay_show_fps=false\n\
+            game_overlay_locked=off\ngame_overlay_x=-2147483648\n\
+            game_overlay_y=2147483647\ngame_overlay_font_size=24\n\
+            game_overlay_x_percent=0\ngame_overlay_y_percent=10000\n\
+            game_overlay_opacity=55\n";
+        let expected = Settings::parse(valid);
+        assert_eq!(Settings::parse(&format!("{valid}{invalid}")), expected);
+        assert_eq!(Settings::parse(&expected.serialize()), expected);
+        assert_eq!(expected.game_overlay.x, i32::MIN);
+        assert_eq!(expected.game_overlay.y, i32::MAX);
+        assert_eq!(expected.game_overlay.x_percent, 0);
+        assert_eq!(expected.game_overlay.y_percent, 10_000);
+    }
+
+    #[test]
+    fn game_overlay_colors_roundtrip_without_changing_taskbar_colors() {
+        let taskbar =
+            "download_color=#101010\nupload_color=#202020\ncpu_color=#303030\ngpu_color=#404040\n";
+        let overlay = "game_overlay_color_download=#aAbBcC\ngame_overlay_color_upload=#000000\n\
+            game_overlay_color_cpu=#123456\ngame_overlay_color_gpu=#ff8800\n\
+            game_overlay_color_fps=#ffffff\n";
+        let expected = DisplayColors {
+            download: Some(Rgb(170, 187, 204)),
+            upload: Some(Rgb(0, 0, 0)),
+            cpu: Some(Rgb(18, 52, 86)),
+            gpu: Some(Rgb(255, 136, 0)),
+        };
+        for text in [format!("{taskbar}{overlay}"), format!("{overlay}{taskbar}")] {
+            let settings = Settings::parse(&text);
+            assert_eq!(settings.game_overlay.colors, expected);
+            assert_eq!(settings.game_overlay.fps_color, Some(Rgb(255, 255, 255)));
+            assert_eq!(
+                settings.display_colors,
+                Settings::parse(taskbar).display_colors
+            );
+            assert!(!settings.game_overlay.enabled);
+            let saved = settings.serialize();
+            assert!(saved.contains("game_overlay_color_download=#AABBCC\n"));
+            assert!(saved.contains("game_overlay_color_upload=#000000\n"));
+            assert_eq!(Settings::parse(&saved), settings);
+        }
+        assert_eq!(
+            Settings::parse(taskbar).game_overlay.colors,
+            DisplayColors::default()
+        );
+    }
+
+    #[test]
+    fn game_overlay_colors_ignore_invalid_values_and_reset_individually() {
+        for key in ["download", "upload", "cpu", "gpu", "fps"] {
+            let saved = format!("game_overlay_color_{key}=#123456\n");
+            for invalid in ["red", "123456", "#123", "#12345678", "#xyzxyz", ""] {
+                assert_eq!(
+                    Settings::parse(&format!("{saved}game_overlay_color_{key}={invalid}")),
+                    Settings::parse(&saved)
+                );
+            }
+            assert_eq!(
+                Settings::parse(&format!("{saved}game_overlay_color_{key}=AUTO")),
+                Settings::default()
+            );
+        }
+        let settings = Settings::parse(
+            "game_overlay_color_cpu=#112233\ngame_overlay_color_gpu=#445566\n\
+             game_overlay_color_cpu=auto\ngame_overlay_color_fps=#778899",
+        );
+        assert_eq!(settings.game_overlay.colors.cpu, None);
+        assert_eq!(settings.game_overlay.colors.gpu, Some(Rgb(68, 85, 102)));
+        assert_eq!(settings.game_overlay.fps_color, Some(Rgb(119, 136, 153)));
+        assert_eq!(Settings::parse(&settings.serialize()), settings);
     }
 
     #[test]

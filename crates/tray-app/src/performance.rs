@@ -25,6 +25,20 @@ struct Worker {
 }
 
 impl Worker {
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn request_stop(&self) {
+        let _ = self.command.send(Command::Stop);
+    }
+
+    fn detach(mut self) {
+        // Drop still sends Stop, but must not join a sensor query on the UI.
+        self.request_stop();
+        self.thread.take();
+    }
+
     fn spawn(
         interval: Duration,
         mut sample: impl FnMut() -> Reading + Send + 'static,
@@ -67,7 +81,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.command.send(Command::Stop);
+        self.request_stop();
         if let Some(worker) = self.thread.take() {
             let _ = worker.join();
         }
@@ -76,6 +90,8 @@ impl Drop for Worker {
 
 pub struct Monitor {
     worker: Option<Worker>,
+    retiring: Option<Worker>,
+    nonblocking_stop: bool,
     interval: Duration,
     wake: Arc<dyn Fn() + Send + Sync>,
     pub error: Option<String>,
@@ -86,6 +102,8 @@ impl Monitor {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             worker: None,
+            retiring: None,
+            nonblocking_stop: false,
             interval: Duration::from_secs(2),
             wake: Arc::new(wake),
             error: None,
@@ -94,9 +112,48 @@ impl Monitor {
     }
 
     pub fn configure(&mut self, enabled: bool, seconds: u64, temperatures: bool) {
+        self.configure_with(enabled, seconds, temperatures, false, Self::spawn_worker);
+    }
+
+    /// Opt-in UI lifecycle: retire an in-flight query without waiting for it.
+    /// Call again to start the latest configuration after that worker exits.
+    #[cfg(any(windows, test))]
+    pub fn configure_nonblocking(&mut self, enabled: bool, seconds: u64, temperatures: bool) {
+        self.configure_with(enabled, seconds, temperatures, true, Self::spawn_worker);
+    }
+
+    fn configure_with(
+        &mut self,
+        enabled: bool,
+        seconds: u64,
+        temperatures: bool,
+        nonblocking: bool,
+        spawn: impl FnOnce(Duration, bool, Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Worker>,
+    ) {
+        // Once selected, this mode also applies to Drop and any later configure.
+        // The default taskbar monitor keeps its existing synchronous lifecycle.
+        self.nonblocking_stop |= nonblocking;
+        if self.nonblocking_stop {
+            if self.worker.as_ref().is_some_and(|worker| {
+                !enabled || self.temperatures != temperatures || worker.is_finished()
+            }) {
+                debug_assert!(self.retiring.is_none());
+                let worker = self.worker.take().unwrap();
+                worker.request_stop();
+                self.retiring = Some(worker);
+            }
+            if self.retiring.as_ref().is_some_and(Worker::is_finished) {
+                self.retiring = None;
+            }
+        }
         if !enabled {
             self.worker = None;
             self.error = None;
+            return;
+        }
+        // At most one active or retiring sampler. Rapid toggles cannot build
+        // a backlog of native queries or start a second WMI fallback process.
+        if self.retiring.is_some() {
             return;
         }
         let interval = Duration::from_secs(match seconds {
@@ -115,6 +172,23 @@ impl Monitor {
             return;
         }
         self.interval = interval;
+        match spawn(interval, temperatures, self.wake.clone()) {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.error = None;
+            }
+            Err(error) => {
+                log::warn!(target: "tramoing::performance", "{error}");
+                self.error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn spawn_worker(
+        interval: Duration,
+        temperatures: bool,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Worker> {
         #[cfg(target_os = "macos")]
         let mut cpu = tm_macos::utilization::CpuSampler::default();
         #[cfg(windows)]
@@ -126,7 +200,7 @@ impl Monitor {
         let mut last_source = String::new();
         let mock = std::env::var_os("TM_FORCE_MOCK").is_some();
         let started = Instant::now();
-        match Worker::spawn(
+        Worker::spawn(
             interval,
             move || {
                 let (cpu, gpu) = if mock {
@@ -168,26 +242,13 @@ impl Monitor {
                     at: Instant::now(),
                 }
             },
-            self.wake.clone(),
-        ) {
-            Ok(worker) => {
-                self.worker = Some(worker);
-                self.error = None;
-            }
-            Err(error) => {
-                log::warn!(target: "tramoing::performance", "{error}");
-                self.error = Some(error.to_string());
-            }
-        }
+            wake,
+        )
     }
 
     pub fn reading(&self) -> Option<Reading> {
         let worker = self.worker.as_ref()?;
-        if worker
-            .thread
-            .as_ref()
-            .is_none_or(|thread| thread.is_finished())
-        {
+        if worker.is_finished() {
             return None;
         }
         worker
@@ -196,6 +257,19 @@ impl Monitor {
             .unwrap()
             .clone()
             .filter(|reading| reading.at.elapsed() <= self.interval * 3 + Duration::from_secs(2))
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        if self.nonblocking_stop {
+            if let Some(worker) = self.worker.take() {
+                worker.detach();
+            }
+            if let Some(worker) = self.retiring.take() {
+                worker.detach();
+            }
+        }
     }
 }
 
@@ -230,6 +304,160 @@ pub fn menu_reading(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_reading(cpu: f64) -> Reading {
+        Reading {
+            cpu: Some(cpu),
+            gpu: None,
+            temperatures: Temperatures::default(),
+            at: Instant::now(),
+        }
+    }
+
+    struct Finished(mpsc::Sender<()>);
+
+    impl Drop for Finished {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn blocked_worker(
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        finished: mpsc::Sender<()>,
+    ) -> Worker {
+        let finished = Finished(finished);
+        Worker::spawn(
+            Duration::from_secs(5),
+            move || {
+                let _keep_alive = &finished;
+                let _ = entered.send(());
+                // Bound a regression failure instead of hanging the test suite.
+                let _ = release.recv_timeout(Duration::from_secs(5));
+                test_reading(17.0)
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap()
+    }
+
+    fn wait_finished(worker: &Worker) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "worker failed to exit");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn overlay_stop_is_immediate_and_rapid_toggles_wait_for_one_retiring_worker() {
+        let (entered, entries) = mpsc::channel();
+        let (release, releases) = mpsc::channel();
+        let (finished, finishes) = mpsc::channel();
+        let mut monitor = Monitor::new(|| {});
+        monitor.configure_with(true, 1, true, true, move |_, _, _| {
+            Ok(blocked_worker(entered, releases, finished))
+        });
+        entries.recv_timeout(Duration::from_secs(2)).unwrap();
+        // A previously published sample must disappear as soon as stopped.
+        *monitor.worker.as_ref().unwrap().latest.lock().unwrap() = Some(test_reading(9.0));
+        assert_eq!(monitor.reading().unwrap().cpu, Some(9.0));
+
+        let before = Instant::now();
+        monitor.configure_nonblocking(false, 1, false);
+        assert!(before.elapsed() < Duration::from_secs(1));
+        assert!(monitor.reading().is_none());
+        assert!(monitor.worker.is_none());
+        assert!(!monitor.retiring.as_ref().unwrap().is_finished());
+        for i in 0..100 {
+            monitor.configure_with(i % 2 == 0, 2, i % 3 == 0, true, |_, _, _| {
+                panic!("a retiring sampler must prevent every replacement")
+            });
+            assert!(monitor.reading().is_none());
+            assert!(monitor.worker.is_none());
+            assert!(monitor.retiring.is_some());
+        }
+
+        release.send(()).unwrap();
+        finishes.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_finished(monitor.retiring.as_ref().unwrap());
+        // A final publish by the old worker cannot restore its visible reading.
+        assert!(monitor.reading().is_none());
+        let (published, publications) = mpsc::channel();
+        monitor.configure_with(true, 5, false, true, move |interval, temperatures, _| {
+            assert_eq!(interval, Duration::from_secs(5));
+            assert!(!temperatures);
+            Worker::spawn(
+                interval,
+                || test_reading(42.0),
+                Arc::new(move || {
+                    let _ = published.send(());
+                }),
+            )
+        });
+        publications.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(monitor.retiring.is_none());
+        assert_eq!(monitor.reading().unwrap().cpu, Some(42.0));
+        assert_eq!(monitor.interval, Duration::from_secs(5));
+        assert!(!monitor.temperatures);
+        monitor.configure_nonblocking(false, 5, false);
+        if let Some(worker) = &monitor.retiring {
+            wait_finished(worker);
+        }
+    }
+
+    #[test]
+    fn overlay_temperature_change_and_drop_do_not_wait_for_inflight_query() {
+        // Cover both active and already-retiring workers at final UI teardown.
+        for change_temperature in [false, true] {
+            let (entered, entries) = mpsc::channel();
+            let (release, releases) = mpsc::channel();
+            let (finished, finishes) = mpsc::channel();
+            let mut monitor = Monitor::new(|| {});
+            monitor.configure_with(true, 1, true, true, move |_, _, _| {
+                Ok(blocked_worker(entered, releases, finished))
+            });
+            entries.recv_timeout(Duration::from_secs(2)).unwrap();
+            let before = Instant::now();
+            if change_temperature {
+                monitor.configure_with(true, 1, false, true, |_, _, _| {
+                    panic!("temperature change must wait for the prior sampler")
+                });
+                assert!(monitor.worker.is_none());
+                assert!(monitor.retiring.is_some());
+                assert!(monitor.reading().is_none());
+            }
+            drop(monitor);
+            assert!(before.elapsed() < Duration::from_secs(1));
+            assert!(finishes.try_recv().is_err());
+            release.send(()).unwrap();
+            finishes.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(entries.try_recv().is_err(), "Stop prevents another sample");
+        }
+    }
+
+    #[test]
+    fn overlay_restarts_a_finished_worker_without_affecting_default_mode() {
+        for nonblocking in [false, true] {
+            let mut monitor = Monitor::new(|| {});
+            monitor.configure_with(true, 1, false, nonblocking, |_, _, wake| {
+                Worker::spawn(Duration::from_secs(5), || test_reading(1.0), wake)
+            });
+            let worker = monitor.worker.as_ref().unwrap();
+            worker.request_stop();
+            wait_finished(worker);
+            let mut restarted = false;
+            monitor.configure_with(true, 1, false, nonblocking, |_, _, wake| {
+                restarted = true;
+                Worker::spawn(Duration::from_secs(5), || test_reading(2.0), wake)
+            });
+            assert_eq!(restarted, nonblocking);
+            assert!(monitor.retiring.is_none());
+            monitor.worker.as_ref().unwrap().request_stop();
+            wait_finished(monitor.worker.as_ref().unwrap());
+        }
+    }
 
     #[test]
     fn temperatures_can_be_hidden_without_hiding_utilization() {

@@ -107,6 +107,8 @@ mod win {
 
         // Sensor calls cannot block ETW or firewall control.
         std::thread::spawn(|| tm_windows::temperature_service::run());
+        // Graphics tracing has its own opt-in lease and cannot block network sampling.
+        std::thread::spawn(|| tm_windows::fps::run());
 
         std::thread::spawn(|| loop {
             match tm_windows::network_control::Server::create() {

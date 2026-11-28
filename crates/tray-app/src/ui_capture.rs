@@ -153,6 +153,7 @@ pub fn open_color_picker(ctx: &egui::Context, label: &str, lang: crate::theme::L
         return false;
     }
     let target = match std::env::var("TM_CAPTURE_STATE").as_deref() {
+        Ok("settings-overlay-color") => lang.t("overlay.frame_rate_label"),
         Ok("settings-color-download") => lang.t("network.download"),
         Ok("settings-color-gpu") => "GPU",
         _ => return false,

@@ -17,6 +17,11 @@
 //! 系统调用部分只在 `cfg(windows)` 下编译。
 
 pub mod agg;
+#[cfg(windows)]
+pub mod fps;
+#[cfg(any(windows, test))]
+mod fps_counter;
+pub mod fps_protocol;
 pub mod network;
 pub mod network_policy;
 pub mod proto;
@@ -35,6 +40,8 @@ pub mod network_control;
 pub mod badge;
 #[cfg(windows)]
 pub mod etw;
+#[cfg(windows)]
+pub mod game_overlay;
 #[cfg(windows)]
 pub mod icon;
 #[cfg(windows)]
