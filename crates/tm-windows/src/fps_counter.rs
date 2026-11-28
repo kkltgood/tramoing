@@ -14,6 +14,7 @@ pub(crate) struct Counter {
 }
 
 impl Counter {
+    #[cfg(windows)]
     pub fn diagnostics(&self, now: i64, frequency: i64) -> String {
         let newest = self
             .chains

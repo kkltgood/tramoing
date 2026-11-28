@@ -27,6 +27,7 @@ pub struct Reading {
     pub error: Option<String>,
 }
 
+#[cfg(windows)]
 impl Reading {
     pub(crate) fn empty(pid: u32, status: Status) -> Self {
         Self {
