@@ -422,7 +422,7 @@ fn slider_row(
         ] {
             widget.bg_fill = p.chip;
             widget.weak_bg_fill = p.chip;
-            widget.bg_stroke = Stroke::new(0.8, if highlighted { p.accent } else { p.border });
+            widget.bg_stroke = Stroke::new(0.8_f32, if highlighted { p.accent } else { p.border });
             widget.corner_radius = CornerRadius::same(7);
         }
         let numeric = numeric_ui.put(
